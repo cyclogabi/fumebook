@@ -1,0 +1,68 @@
+/*
+ * Cascade-layer order. `nmr-reset` and `blueprint` are only populated by
+ * components/nmr-room.css (loaded lazily with the NMR room); they are declared
+ * here so they slot between Tailwind's preflight (`base`) and its utilities.
+ */
+@layer theme, base, nmr-reset, blueprint, components, utilities;
+
+@import "tailwindcss";
+
+/* Fumebook pastel pink: the app's accent colour (`bg-fume-500`, `text-fume-700`, …). */
+@theme {
+  --color-fume-50: #fff1f6;
+  --color-fume-100: #ffe3ee;
+  --color-fume-200: #ffc8dc;
+  --color-fume-300: #ffa6c6;
+  --color-fume-400: #f78fb8;
+  --color-fume-500: #ec6b9f;
+  --color-fume-600: #d94f88;
+  --color-fume-700: #b53a6d;
+}
+
+@theme inline {
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  /* zinc-100: the "desk" the A4 sheet lies on */
+  background: #f4f4f5;
+  color: #18181b;
+  font-family: var(--font-geist-sans), system-ui, sans-serif;
+  /* Blueprint (loaded with the NMR room) restyles `body`; pin the app's values. */
+  font-size: 1rem;
+  line-height: 1.5;
+}
+
+/* ---- Print: clean A4 document ------------------------------------------ */
+@page {
+  size: A4;
+  margin: 14mm;
+}
+
+@media print {
+  html,
+  body {
+    height: auto !important;
+    display: block !important;
+    background: #fff !important;
+    color: #000;
+  }
+
+  /* Keep light tints (e.g. the limiting-reagent row, TLC plates) as authored. */
+  * {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  /* Never split a table row or a plate across pages. */
+  tr,
+  img {
+    break-inside: avoid;
+  }
+
+  /* Dev-mode overlays must not appear on paper. */
+  nextjs-portal {
+    display: none !important;
+  }
+}

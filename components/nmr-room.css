@@ -1,0 +1,85 @@
+/*
+ * Styles for the NMR Analysis Room (NMRium = Blueprint + react-science).
+ *
+ * Loaded lazily together with NMRium, so none of this is shipped to a notebook
+ * page that never opens the room. Layer order is declared in app/globals.css:
+ *
+ *   theme < base (Tailwind preflight) < nmr-reset < blueprint < components < utilities
+ *
+ * NMRium's own (emotion / CSS-in-JS) styles are unlayered and therefore always
+ * win over everything below; Blueprint's classes win over the reset.
+ */
+
+/* Blueprint's stylesheets must be supplied by the host app. */
+@import "@blueprintjs/core/lib/css/blueprint.css" layer(blueprint);
+@import "@blueprintjs/select/lib/css/blueprint-select.css" layer(blueprint);
+@import "@blueprintjs/icons/lib/css/blueprint-icons.css" layer(blueprint);
+
+/*
+ * 1. Isolate NMRium from Tailwind's preflight.
+ *
+ * `.nmr-isolate` wraps <NMRium />; `.bp6-portal` covers Blueprint popovers and
+ * dialogs, which render into <body> outside the wrapper. :where() keeps the
+ * specificity at zero so any real style still overrides these resets.
+ */
+@layer nmr-reset {
+  .nmr-isolate,
+  .bp6-portal {
+    font-family:
+      -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu,
+      Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
+    font-size: 14px;
+    font-weight: 400;
+    line-height: 1.28581;
+    letter-spacing: 0;
+    text-transform: none;
+    color: #1c2127;
+    text-align: left;
+    tab-size: 8;
+  }
+
+  :where(.nmr-isolate, .bp6-portal),
+  :where(.nmr-isolate, .bp6-portal) :where(*),
+  :where(.nmr-isolate, .bp6-portal) ::before,
+  :where(.nmr-isolate, .bp6-portal) ::after {
+    box-sizing: border-box;
+    /* Undo preflight's `border: 0 solid currentColor` (it makes a bare border-width visible). */
+    border: initial;
+  }
+
+  /* Restore the browser's default look for native controls and rules. */
+  :where(.nmr-isolate, .bp6-portal)
+    :where(button, input, select, textarea, optgroup, fieldset, legend, hr, progress) {
+    all: revert;
+    box-sizing: border-box;
+  }
+
+  /* Preflight makes every replaced element a block; NMRium expects inline. */
+  :where(.nmr-isolate, .bp6-portal) :where(img, svg, video, canvas, audio, iframe, embed, object) {
+    display: revert;
+    vertical-align: revert;
+  }
+  :where(.nmr-isolate, .bp6-portal) :where(img, video) {
+    max-width: revert;
+    height: revert;
+  }
+}
+
+/*
+ * 2. Keep Blueprint's few global element rules (p, small, strong, a) from
+ *    leaking into the notebook once this stylesheet has been loaded.
+ */
+@layer components {
+  :where(p):not(.nmr-isolate *, .bp6-portal *) {
+    margin: 0;
+  }
+  :where(small):not(.nmr-isolate *, .bp6-portal *) {
+    font-size: 80%;
+  }
+  :where(strong):not(.nmr-isolate *, .bp6-portal *) {
+    font-weight: bolder;
+  }
+  :where(a):not(.nmr-isolate *, .bp6-portal *) {
+    color: inherit;
+  }
+}
