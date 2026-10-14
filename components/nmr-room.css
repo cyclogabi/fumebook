@@ -83,3 +83,15 @@
     color: inherit;
   }
 }
+
+/*
+ * 3. NMRium's floating publication string ("Display publication string" in the ranges panel)
+ *    draws its text in an <svg height={bounding.height}>, and a freshly created view has
+ *    publicationStringBounding.height === 0. An <svg> with a zero height isn't rendered at
+ *    all, so toggling the button looked like it did nothing. Let it fill its (min 50px) box
+ *    instead, and don't clip a string that wraps onto more lines than the box is tall.
+ */
+.nmr-isolate .react-draggable svg[height="0"] {
+  height: 100%;
+  overflow: visible;
+}

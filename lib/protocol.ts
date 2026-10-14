@@ -23,6 +23,13 @@ export function toReagentRows(parsed: ParsedProtocol): ReagentRow[] {
     row.eq = positive(raw.equiv) ?? (role === "Limiting" ? 1 : null);
     // Molecular weight follows from mass / amount when both were stated.
     if (row.mass !== null && row.n !== null && row.n > 0) row.mw = row.mass / row.n;
+    // Solvent rows only carry a volume (and density): no MW / mass / amount / equivalents.
+    if (role === "Solvent") {
+      row.mw = null;
+      row.mass = null;
+      row.n = null;
+      row.eq = null;
+    }
     rows.push(row);
   }
 

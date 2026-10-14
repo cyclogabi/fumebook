@@ -46,7 +46,7 @@ export default function ProductYieldCard({ product, rows, onChange }: Props) {
   return (
     <section
       aria-label="Isolated product and yield"
-      className={`mt-6 break-inside-avoid rounded-lg border border-zinc-200 bg-zinc-50/60 p-4 print:mt-4 print:rounded-none print:border-0 print:bg-transparent print:p-0 ${
+      className={`break-inside-avoid rounded-lg border border-zinc-200 bg-zinc-50/60 p-4 print:rounded-none print:border-0 print:bg-transparent print:p-0 ${
         isEmpty ? "print:hidden" : ""
       }`}
     >

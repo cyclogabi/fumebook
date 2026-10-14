@@ -1,26 +1,64 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import BackupModal, { type ImportMode } from "./BackupModal";
 import Dashboard from "./Dashboard";
 import ExperimentEditor from "./ExperimentEditor";
 import FumebookLogo from "./FumebookLogo";
+import ImportConflictModal from "./ImportConflictModal";
+import LibraryModal from "./LibraryModal";
+import OnboardingModal from "./OnboardingModal";
 import ParseProtocolModal from "./ParseProtocolModal";
 import Sidebar from "./Sidebar";
 import Toast, { type ToastMessage } from "./Toast";
 import {
+  backupFilename,
+  buildExperimentBundle,
+  buildFullBackup,
   describeMerge,
   describeReplace,
-  downloadBackup,
-  downloadExperiment,
+  experimentFilename,
   mergeExperiments,
+  parseBackup,
+  preRestoreFilename,
+  restoreAttachments,
+  type ExperimentAttachments,
+  type ValidBackup,
 } from "@/lib/backup";
+import { installClipboardBridge } from "@/lib/clipboard";
+import { pickJsonFile, saveJsonFile, saveJsonToBackupsFolder } from "@/lib/fileDialogs";
+import { mergeLibraryCompounds } from "@/lib/library";
 import { toReagentRows } from "@/lib/protocol";
 import type { ParsedProtocol } from "@/lib/protocolSchema";
+import { readInitials, saveProfile, useSavedInitials, useSavedStartNumber } from "@/lib/initials";
 import { useExperiments } from "@/lib/storage";
-import type { Experiment } from "@/lib/types";
+import { ID_PREFIX, nextExperimentId, type Experiment } from "@/lib/types";
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+const messageOf = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+/** Toasts that carry a file path stay long enough to read (and copy) it. */
+const PATH_TOAST_MS = 20_000;
+
+/** "2 TLC photos, a molecule picture and an NMR workspace", for the confirmation toasts. */
+function describeAttachments(
+  tlc: number,
+  attachments: { moleculeImageBase64: string | null; nmrWorkspace: string | null } | null,
+): string {
+  const parts: string[] = [];
+  if (tlc > 0) parts.push(plural(tlc, "TLC photo"));
+  if (attachments?.moleculeImageBase64) parts.push("a molecule picture");
+  if (attachments?.nmrWorkspace) parts.push("an NMR workspace");
+  if (parts.length === 0) return "";
+  return parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
+}
+
+/** An experiment file chosen in "Import Experiment" whose ID is already in the notebook. */
+interface PendingImport {
+  experiment: Experiment;
+  attachments: ExperimentAttachments | null;
+  fileName: string;
+}
 
 export default function ElnApp() {
   const { experiments, storageError, create, update, remove, replaceAll } = useExperiments();
@@ -28,38 +66,194 @@ export default function ElnApp() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [parseOpen, setParseOpen] = useState(false);
+  const [libraryOpen, setLibraryOpen] = useState(false);
+  const [profileOpen, setProfileOpen] = useState(false);
   const [toast, setToast] = useState<ToastMessage | null>(null);
   const toastSeq = useRef(0);
+  const [pendingImport, setPendingImport] = useState<PendingImport | null>(null);
+  /** Bumped after an import so an open editor reloads the pictures / NMR / scheme it read earlier. */
+  const [importEpoch, setImportEpoch] = useState(0);
+  /** One export / import at a time: a second click while a dialog is open does nothing. */
+  const busyRef = useRef(false);
+
+  const initials = useSavedInitials();
+  const startNumber = useSavedStartNumber();
+  const needsInitials = initials === "";
+
+  // Desktop: send every navigator.clipboard call (Ketcher paste, NMRium copy) through Tauri.
+  useEffect(() => {
+    installClipboardBridge();
+  }, []);
 
   const loaded = experiments !== null;
   const selected = experiments?.find((e) => e.id === selectedId) ?? null;
 
-  const notify = useCallback((kind: ToastMessage["kind"], message: string) => {
+  // The experiments as they are right now, for handlers that wait on a dialog or the disk first.
+  const experimentsRef = useRef<Experiment[]>([]);
+  useEffect(() => {
+    experimentsRef.current = experiments ?? [];
+  }, [experiments]);
+
+  const notify = useCallback((kind: ToastMessage["kind"], message: string, durationMs?: number) => {
     toastSeq.current += 1;
-    setToast({ id: toastSeq.current, kind, message });
+    setToast({ id: toastSeq.current, kind, message, durationMs });
   }, []);
   const dismissToast = useCallback(() => setToast(null), []);
 
-  // --- Backup / restore -------------------------------------------------------
+  // --- Export / import (experiments + molecule pictures + TLC photos + NMR + library) ----------
 
-  function handleExportAll() {
-    if (!experiments || experiments.length === 0) return;
+  /** Run `task` unless another export / import is in progress. */
+  async function exclusively(task: () => Promise<void>) {
+    if (busyRef.current) return;
+    busyRef.current = true;
     try {
-      const filename = downloadBackup(experiments);
-      notify("success", `Exported ${plural(experiments.length, "experiment")} to ${filename}.`);
-    } catch {
-      notify("error", "The backup could not be created.");
+      await task();
+    } finally {
+      busyRef.current = false;
     }
   }
 
+  /** Export Full Backup: native "Save As" dialog, then every experiment + attachments + library + profile. */
+  function handleExportAll() {
+    const current = experimentsRef.current;
+    if (current.length === 0) return;
+    void exclusively(async () => {
+      try {
+        const backup = await buildFullBackup(current);
+        const saved = await saveJsonFile(backupFilename(), JSON.stringify(backup, null, 2));
+        if (!saved) return; // cancelled in the dialog
+        notify(
+          "success",
+          `Exported ${plural(current.length, "experiment")} and ${plural(backup.library.length, "library compound")} to ${saved.path}`,
+          PATH_TOAST_MS,
+        );
+      } catch (err) {
+        notify("error", `The backup could not be saved: ${messageOf(err)}`);
+      }
+    });
+  }
+
+  /** Export Experiment: native "Save As" dialog, then the complete ExperimentBundle. */
   function handleExportOne() {
     if (!selected) return;
+    const experiment = selected;
+    void exclusively(async () => {
+      try {
+        const bundle = await buildExperimentBundle(experiment);
+        const saved = await saveJsonFile(experimentFilename(experiment), JSON.stringify(bundle, null, 2));
+        if (!saved) return;
+        const contents = describeAttachments(bundle.tlcImages.length, bundle);
+        notify(
+          "success",
+          `Exported ${experiment.id}${contents ? ` with ${contents}` : ""} to ${saved.path}`,
+          PATH_TOAST_MS,
+        );
+      } catch (err) {
+        notify("error", `${experiment.id} could not be exported: ${messageOf(err)}`);
+      }
+    });
+  }
+
+  /** Import Experiment: pick a .json (bundle or plain experiment); ask first if the ID is taken. */
+  function handleImportExperiment() {
+    setDrawerOpen(false);
+    void exclusively(async () => {
+      try {
+        const picked = await pickJsonFile();
+        if (!picked) return;
+        const parsed = parseBackup(picked.text);
+        if (!parsed.ok) {
+          notify("error", `${picked.name}: ${parsed.error}`);
+          return;
+        }
+        const isFullBackup =
+          parsed.kind === "backup" &&
+          (parsed.experiments.length > 1 || (parsed.library?.length ?? 0) > 0 || parsed.profile !== null);
+        if (isFullBackup) {
+          notify(
+            "error",
+            `${picked.name} is a full backup (${plural(parsed.experiments.length, "experiment")}). Use “Import Full Backup” to restore it.`,
+          );
+          return;
+        }
+        const [experiment] = parsed.experiments;
+        if (!experiment) {
+          const why = parsed.skipped[0]?.reason;
+          notify("error", `${picked.name} has no valid experiment${why ? `: ${why}` : "."}`);
+          return;
+        }
+        const attachments = parsed.attachments[experiment.id] ?? null;
+        const taken = experimentsRef.current.some(
+          (e) => e.id.toUpperCase() === experiment.id.toUpperCase(),
+        );
+        if (taken) {
+          setPendingImport({ experiment, attachments, fileName: picked.name });
+          return;
+        }
+        await addImportedExperiment(experiment, attachments, "add", picked.name);
+      } catch (err) {
+        notify("error", `The experiment could not be imported: ${messageOf(err)}`);
+      }
+    });
+  }
+
+  /**
+   * Put one imported experiment into the notebook and its files on disk: the experiment JSON
+   * (TLC photos included), `molecule.png` and the NMR workspace in `attachments/[id]/`.
+   * "overwrite" replaces the experiment with the same ID, "new-id" adds it under a fresh ID.
+   */
+  async function addImportedExperiment(
+    incoming: Experiment,
+    attachments: ExperimentAttachments | null,
+    how: "add" | "overwrite" | "new-id",
+    fileName: string,
+  ) {
+    const current = experimentsRef.current;
+    const existing = current.find((e) => e.id.toUpperCase() === incoming.id.toUpperCase());
+    const targetId =
+      how === "new-id"
+        ? nextExperimentId(current, readInitials() ?? ID_PREFIX)
+        : (existing?.id ?? incoming.id);
+    const experiment: Experiment = { ...incoming, id: targetId };
+
     try {
-      const filename = downloadExperiment(selected);
-      notify("success", `Exported ${selected.id} to ${filename}.`);
-    } catch {
-      notify("error", `${selected.id} could not be exported.`);
+      if (attachments) await restoreAttachments(targetId, attachments, how === "overwrite");
+    } catch (err) {
+      notify("error", `${targetId} was not imported: its pictures / NMR data could not be written (${messageOf(err)}).`);
+      return;
     }
+
+    const saved = await replaceAll((cur) =>
+      how === "overwrite"
+        ? cur.map((e) => (e.id.toUpperCase() === targetId.toUpperCase() ? experiment : e))
+        : [...cur, experiment],
+    );
+    setImportEpoch((n) => n + 1);
+    select(targetId);
+
+    const contents = describeAttachments(experiment.tlcImages.length, attachments);
+    const what = `${how === "overwrite" ? "Overwrote" : "Imported"} ${targetId}${
+      how === "new-id" ? ` (from ${incoming.id})` : ""
+    }${contents ? ` with ${contents}` : ""} from ${fileName}.`;
+    notify(
+      saved ? "success" : "error",
+      saved
+        ? what
+        : `${what} But it could not be written to storage, so it is NOT saved. Export it again or free some disk space.`,
+    );
+  }
+
+  function resolveImportConflict(how: "overwrite" | "new-id" | null) {
+    const pending = pendingImport;
+    setPendingImport(null);
+    if (!pending || !how) return;
+    void exclusively(async () => {
+      try {
+        await addImportedExperiment(pending.experiment, pending.attachments, how, pending.fileName);
+      } catch (err) {
+        notify("error", `The experiment could not be imported: ${messageOf(err)}`);
+      }
+    });
   }
 
   function openImport() {
@@ -67,31 +261,102 @@ export default function ElnApp() {
     setImportOpen(true);
   }
 
-  function handleImport(mode: ImportMode, incoming: Experiment[]) {
-    const current = experiments ?? [];
-    let next: Experiment[];
-    let message: string;
+  function openLibrary() {
+    setDrawerOpen(false);
+    setLibraryOpen(true);
+  }
 
-    if (mode === "merge") {
-      const result = mergeExperiments(current, incoming);
-      next = result.experiments;
-      message = describeMerge(result);
-    } else {
-      next = incoming;
-      message = describeReplace(incoming.length, current.length);
-    }
+  /**
+   * Import Full Backup: restore the experiments, write every `molecule.png` and NMR workspace back
+   * to `attachments/[id]/`, merge the Personal Library into `library.json` and restore the profile.
+   * A "Replace All" first saves a safety copy of the current notebook and stops if that fails.
+   */
+  async function handleImport(mode: ImportMode, parsed: ValidBackup, options: { safetyBackup: boolean }) {
+    await exclusively(async () => {
+      const current = experimentsRef.current;
+      const notes: string[] = [];
 
-    const saved = replaceAll(next);
-    setImportOpen(false);
-    // The open experiment may no longer exist after a replace.
-    if (selectedId && !next.some((e) => e.id === selectedId)) setSelectedId(null);
+      if (mode === "replace" && options.safetyBackup && current.length > 0) {
+        try {
+          const safety = await buildFullBackup(current);
+          const saved = await saveJsonToBackupsFolder(preRestoreFilename(), JSON.stringify(safety, null, 2));
+          notes.push(`Safety copy of the previous notebook: ${saved.path}`);
+        } catch (err) {
+          notify(
+            "error",
+            `Nothing was imported: the safety copy could not be saved (${messageOf(err)}). Untick the safety copy to continue without it.`,
+          );
+          return;
+        }
+      }
 
-    notify(
-      saved ? "success" : "error",
-      saved
-        ? message
-        : `${message} But browser storage is full, so they are NOT saved and will be lost on reload. Export a backup now.`,
-    );
+      // Molecule pictures and NMR workspaces go to disk first; the experiment list follows.
+      const existingIds = new Map(current.map((e) => [e.id.toUpperCase(), e.id]));
+      try {
+        for (const experiment of parsed.experiments) {
+          const attachments = parsed.attachments[experiment.id];
+          if (!attachments) continue;
+          const targetId = existingIds.get(experiment.id.toUpperCase()) ?? experiment.id;
+          await restoreAttachments(targetId, attachments, mode === "replace");
+        }
+      } catch (err) {
+        notify("error", `The import stopped: pictures / NMR data could not be written (${messageOf(err)}).`);
+        return;
+      }
+
+      let message = "";
+      const saving = replaceAll((cur) => {
+        if (mode === "merge") {
+          const result = mergeExperiments(cur, parsed.experiments);
+          message = describeMerge(result);
+          return result.experiments;
+        }
+        message = describeReplace(parsed.experiments.length, cur.length);
+        return parsed.experiments;
+      });
+      setImportOpen(false);
+      setImportEpoch((n) => n + 1);
+      // The open experiment may no longer exist after a replace.
+      if (mode === "replace" && selectedId && !parsed.experiments.some((e) => e.id === selectedId)) {
+        setSelectedId(null);
+      }
+
+      const tlc = parsed.experiments.reduce((sum, e) => sum + e.tlcImages.length, 0);
+      const pictures = Object.values(parsed.attachments).filter((a) => a.moleculeImageBase64).length;
+      const nmr = Object.values(parsed.attachments).filter((a) => a.nmrWorkspace).length;
+      const restored = [
+        tlc > 0 ? plural(tlc, "TLC photo") : "",
+        pictures > 0 ? plural(pictures, "molecule picture") : "",
+        nmr > 0 ? plural(nmr, "NMR workspace") : "",
+      ].filter(Boolean);
+      if (restored.length > 0) notes.push(`Restored ${restored.join(", ")}.`);
+
+      let failed = false;
+      if (parsed.library && parsed.library.length > 0) {
+        try {
+          const { added } = await mergeLibraryCompounds(parsed.library);
+          notes.push(`Library: ${plural(added, "compound")} added.`);
+        } catch (err) {
+          failed = true;
+          notes.push(`The Personal Library could not be restored: ${messageOf(err)}`);
+        }
+      }
+      if (parsed.profile && (mode === "replace" || !readInitials())) {
+        if (saveProfile(parsed.profile.initials ?? "", parsed.profile.startNumber)) {
+          notes.push(`Profile restored (${parsed.profile.initials}, numbering from ${parsed.profile.startNumber}).`);
+        }
+      }
+
+      const saved = await saving;
+      const text = [message, ...notes].join(" ");
+      notify(
+        saved && !failed ? "success" : "error",
+        saved
+          ? text
+          : `${text} But the experiments could not be written to storage, so they are NOT saved and will be lost on reload. Export a backup now.`,
+        PATH_TOAST_MS,
+      );
+    });
   }
 
   function select(id: string | null) {
@@ -130,105 +395,142 @@ export default function ElnApp() {
   }
 
   return (
-    <div className="flex min-h-screen flex-col bg-zinc-100 text-zinc-900 print:block print:min-h-0 print:bg-white">
-      {/* Header */}
-      <header className="sticky top-0 z-40 flex h-14 shrink-0 items-center gap-3 border-b border-zinc-200 bg-white px-4 print:hidden">
-        <button
-          type="button"
-          onClick={() => setDrawerOpen((o) => !o)}
-          aria-label="Toggle experiment list"
-          className="rounded-md p-1.5 text-zinc-600 hover:bg-zinc-100 lg:hidden"
-        >
-          <svg viewBox="0 0 20 20" className="size-5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
-            <path d="M3 5h14M3 10h14M3 15h14" />
-          </svg>
-        </button>
-
-        <button
-          type="button"
-          onClick={() => select(null)}
-          className="flex items-center gap-2 text-left"
-        >
-          <FumebookLogo className="size-8" />
-          <span className="text-base font-bold tracking-tight text-fume-600">Fumebook</span>
-        </button>
-
-        <div className="ml-auto flex items-center gap-2">
+    <>
+      {/* `inert` while the profile dialog is up: no clicks, no Tab, no shortcuts reach the app behind it. */}
+      <div
+        inert={needsInitials || profileOpen}
+        className="flex min-h-screen flex-col bg-zinc-100 text-zinc-900 print:block print:min-h-0 print:bg-white"
+      >
+        {/* Header */}
+        <header className="sticky top-0 z-40 flex h-14 shrink-0 items-center gap-3 border-b border-zinc-200 bg-white px-4 print:hidden">
           <button
             type="button"
-            onClick={() => setParseOpen(true)}
-            disabled={!loaded}
-            title="Paste experimental text from a paper and fill in the reagents automatically"
-            className="rounded-md border border-fume-300 bg-fume-50 px-4 py-2 text-sm font-semibold text-fume-700 shadow-sm transition-colors hover:bg-fume-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-fume-500 disabled:opacity-50"
+            onClick={() => setDrawerOpen((o) => !o)}
+            aria-label="Toggle experiment list"
+            className="rounded-md p-1.5 text-zinc-600 hover:bg-zinc-100 lg:hidden"
           >
-            ✨ Parse Protocol
+            <svg viewBox="0 0 20 20" className="size-5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+              <path d="M3 5h14M3 10h14M3 15h14" />
+            </svg>
           </button>
+
           <button
             type="button"
-            onClick={handleNew}
-            disabled={!loaded}
-            className="flex items-center justify-center gap-2 rounded-lg border border-cyan-300 bg-[#E0FFFF] px-4 py-2 font-medium text-zinc-900 shadow-sm hover:bg-[#C6F2F2] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-400 disabled:opacity-50"
+            onClick={() => select(null)}
+            className="flex items-center gap-2 text-left"
           >
-            + New Experiment
+            <FumebookLogo className="size-8" />
+            <span className="text-base font-bold tracking-tight text-fume-600">Fumebook</span>
           </button>
-        </div>
-      </header>
 
-      {storageError && (
-        <div role="alert" className="border-b border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-800 print:hidden">
-          {storageError}
-        </div>
-      )}
+          <div className="ml-auto flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setProfileOpen(true)}
+              disabled={!initials}
+              aria-label="Profile and settings"
+              title={`Profile & settings: ${initials || "…"}, numbering from ${startNumber}`}
+              className="grid size-9 shrink-0 place-items-center rounded-full border border-zinc-300 bg-white font-mono text-xs font-bold tracking-wide text-zinc-600 shadow-sm hover:bg-zinc-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-fume-500 disabled:opacity-50"
+            >
+              {initials || "··"}
+            </button>
+            <button
+              type="button"
+              onClick={() => setParseOpen(true)}
+              disabled={!loaded}
+              title="Paste experimental text from a paper and fill in the reagents automatically"
+              className="rounded-md border border-fume-300 bg-fume-50 px-4 py-2 text-sm font-semibold text-fume-700 shadow-sm transition-colors hover:bg-fume-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-fume-500 disabled:opacity-50"
+            >
+              ✨ Parse Protocol
+            </button>
+            <button
+              type="button"
+              onClick={handleNew}
+              disabled={!loaded}
+              className="flex items-center justify-center gap-2 rounded-lg border border-cyan-300 bg-[#E0FFFF] px-4 py-2 font-medium text-zinc-900 shadow-sm hover:bg-[#C6F2F2] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-400 disabled:opacity-50"
+            >
+              + New Experiment
+            </button>
+          </div>
+        </header>
 
-      <div className="flex flex-1 print:block">
-        {loaded && (
-          <Sidebar
-            experiments={experiments}
-            selectedId={selected?.id ?? null}
-            open={drawerOpen}
-            onSelect={select}
-            onClose={() => setDrawerOpen(false)}
-            onExportBackup={handleExportAll}
-            onImportBackup={openImport}
-          />
+        {storageError && (
+          <div role="alert" className="border-b border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-800 print:hidden">
+            {storageError}
+          </div>
         )}
 
-        <main className="min-w-0 flex-1 px-4 py-6 sm:px-8 sm:py-8 print:p-0">
-          {!loaded ? (
-            <p className="text-sm text-zinc-400">Loading notebook…</p>
-          ) : selected ? (
-            // key: reset editor-local state (focus, drafts) when switching experiments
-            <ExperimentEditor
-              key={selected.id}
-              experiment={selected}
-              onUpdate={(change) => update(selected.id, change)}
-              onDelete={handleDelete}
-              onExport={handleExportOne}
-            />
-          ) : (
-            <Dashboard
+        <div className="flex flex-1 print:block">
+          {loaded && (
+            <Sidebar
               experiments={experiments}
-              onOpen={select}
-              onNew={handleNew}
-              onParse={() => setParseOpen(true)}
+              selectedId={selected?.id ?? null}
+              open={drawerOpen}
+              onSelect={select}
+              onClose={() => setDrawerOpen(false)}
+              onExportBackup={handleExportAll}
               onImportBackup={openImport}
+              onImportExperiment={handleImportExperiment}
+              onOpenLibrary={openLibrary}
             />
           )}
-        </main>
-      </div>
 
-      <BackupModal
-        open={importOpen}
-        experiments={experiments ?? []}
-        onClose={() => setImportOpen(false)}
-        onImport={handleImport}
-      />
-      <ParseProtocolModal
-        open={parseOpen}
-        onClose={() => setParseOpen(false)}
-        onParsed={handleParsed}
-      />
-      <Toast toast={toast} onDismiss={dismissToast} />
-    </div>
+          <main className="min-w-0 flex-1 px-4 py-6 sm:px-8 sm:py-8 print:p-0">
+            {!loaded ? (
+              <p className="text-sm text-zinc-400">Loading notebook…</p>
+            ) : selected ? (
+              // key: reset editor-local state (focus, drafts) when switching experiments, and
+              // reload pictures / NMR / scheme after an import changed them on disk
+              <ExperimentEditor
+                key={`${selected.id}:${importEpoch}`}
+                experiment={selected}
+                onUpdate={(change) => update(selected.id, change)}
+                onDelete={handleDelete}
+                onExport={handleExportOne}
+                onOpenLibrary={openLibrary}
+              />
+            ) : (
+              <Dashboard
+                experiments={experiments}
+                onOpen={select}
+                onNew={handleNew}
+                onParse={() => setParseOpen(true)}
+                onImportBackup={openImport}
+              />
+            )}
+          </main>
+        </div>
+
+        <BackupModal
+          open={importOpen}
+          experiments={experiments ?? []}
+          onClose={() => setImportOpen(false)}
+          onImport={handleImport}
+        />
+        <ImportConflictModal
+          conflict={
+            pendingImport && {
+              id: pendingImport.experiment.id,
+              title: pendingImport.experiment.title,
+              fileName: pendingImport.fileName,
+            }
+          }
+          newId={nextExperimentId(experiments ?? [], initials || ID_PREFIX)}
+          onOverwrite={() => resolveImportConflict("overwrite")}
+          onImportAsNew={() => resolveImportConflict("new-id")}
+          onCancel={() => resolveImportConflict(null)}
+        />
+        <LibraryModal open={libraryOpen} onClose={() => setLibraryOpen(false)} />
+        <ParseProtocolModal
+          open={parseOpen}
+          onClose={() => setParseOpen(false)}
+          onParsed={handleParsed}
+        />
+        <Toast toast={toast} onDismiss={dismissToast} />
+      </div>
+      {/* Above everything: blocks the app until the profile (initials + starting number) exists,
+          and doubles as the profile / settings dialog. */}
+      <OnboardingModal editing={profileOpen} onClose={() => setProfileOpen(false)} />
+    </>
   );
 }

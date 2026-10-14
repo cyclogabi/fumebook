@@ -1,9 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
+import MoleculeSection, { type MoleculeSectionHandle } from "./MoleculeSection";
 import NmrRoom from "./NmrRoom";
 import ProductYieldCard from "./ProductYieldCard";
-import ReactionCanvas from "./ReactionCanvas";
 import RichTextarea from "./RichTextarea";
 import ReagentTable from "./ReagentTable";
 import ReferencesSection from "./ReferencesSection";
@@ -15,8 +15,10 @@ interface Props {
   experiment: Experiment;
   onUpdate: (change: ExperimentUpdate) => void;
   onDelete: () => void;
-  /** Download just this experiment as GH#####.json. */
+  /** Save just this experiment, attachments included, as [ID]_experiment.fumebook.json (native Save dialog). */
   onExport: () => void;
+  /** Open the Personal Library dialog. */
+  onOpenLibrary: () => void;
 }
 
 export function formatDate(iso: string): string {
@@ -26,13 +28,22 @@ export function formatDate(iso: string): string {
     : d.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
 }
 
-export default function ExperimentEditor({ experiment, onUpdate, onDelete, onExport }: Props) {
-  // NMR room state is intentionally local and never written to the experiment.
+export default function ExperimentEditor({
+  experiment,
+  onUpdate,
+  onDelete,
+  onExport,
+  onOpenLibrary,
+}: Props) {
+  // Only whether the room is open lives here; its workspace is autosaved separately
+  // (Documents/Fumebook/attachments/<id>/workspace.nmrium), not in the experiment JSON.
   const [nmrOpen, setNmrOpen] = useState(false);
+  // Lets the reagent table drop a library compound's structure into the sketcher.
+  const moleculeRef = useRef<MoleculeSectionHandle>(null);
 
   return (
     <div className="mx-auto w-full max-w-4xl print:max-w-none">
-      {nmrOpen && <NmrRoom onClose={() => setNmrOpen(false)} />}
+      {nmrOpen && <NmrRoom experimentId={experiment.id} onClose={() => setNmrOpen(false)} />}
 
       {/* Action bar (screen only) */}
       <div className="mb-3 flex items-center justify-between print:hidden">
@@ -51,10 +62,10 @@ export default function ExperimentEditor({ experiment, onUpdate, onDelete, onExp
           <button
             type="button"
             onClick={onExport}
-            title={`Download ${experiment.id} as a JSON file`}
+            title={`Save ${experiment.id} (with its molecule picture, TLC photos and NMR spectra) as a .json file`}
             className="rounded-md border border-zinc-300 bg-white px-3 py-1.5 text-sm font-medium text-zinc-700 shadow-sm hover:bg-zinc-50"
           >
-            Export JSON
+            Export Experiment (.json)
           </button>
           <button
             type="button"
@@ -89,10 +100,16 @@ export default function ExperimentEditor({ experiment, onUpdate, onDelete, onExp
         </header>
 
         <div className="space-y-8 print:space-y-5">
-          <ReactionCanvas
-            value={experiment.reactionSchemeRxn}
-            onChange={(reactionSchemeRxn) => onUpdate({ reactionSchemeRxn })}
-            fileName={experiment.id}
+          <MoleculeSection
+            ref={moleculeRef}
+            experimentId={experiment.id}
+            reactionScheme={experiment.reactionSchemeRxn}
+            onReactionSchemeChange={(reactionSchemeRxn) => onUpdate({ reactionSchemeRxn })}
+            mode={experiment.moleculeMode}
+            onModeChange={(moleculeMode) => onUpdate({ moleculeMode })}
+            hasImage={experiment.moleculeImage}
+            onHasImageChange={(moleculeImage) => onUpdate({ moleculeImage })}
+            onOpenLibrary={onOpenLibrary}
           />
 
           <section>
@@ -106,34 +123,12 @@ export default function ExperimentEditor({ experiment, onUpdate, onDelete, onExp
               onRows={(fn) => onUpdate((exp) => ({ reagents: fn(exp.reagents) }))}
               onUnits={(units) => onUpdate({ units })}
               onColumns={(columns) => onUpdate({ columns })}
-            />
-
-            <ProductYieldCard
-              product={experiment.product}
-              rows={experiment.reagents}
-              onChange={(patch) =>
-                onUpdate((exp) => ({ product: { ...exp.product, ...patch } }))
+              onInsertStructure={async (compound) =>
+                (await moleculeRef.current?.insertCompound(compound)) ??
+                "The sketcher is not ready yet."
               }
             />
-
-            <button
-              type="button"
-              onClick={() => setNmrOpen(true)}
-              className="mt-4 flex items-center gap-2 rounded-lg border border-cyan-300 bg-[#E0FFFF] px-4 py-2 font-semibold text-zinc-900 shadow-sm hover:bg-[#C6F2F2] print:hidden"
-            >
-              🔬 Enter NMR Room
-            </button>
           </section>
-
-          <ReferencesSection
-            references={experiment.references}
-            onAdd={(reference) =>
-              onUpdate((exp) => ({ references: [...exp.references, reference] }))
-            }
-            onRemove={(id) =>
-              onUpdate((exp) => ({ references: exp.references.filter((r) => r.id !== id) }))
-            }
-          />
 
           <RichTextarea
             label="Procedure"
@@ -149,13 +144,6 @@ export default function ExperimentEditor({ experiment, onUpdate, onDelete, onExp
             placeholder="Work-up and purification: extraction, column conditions, yield…"
             minRows={3}
           />
-          <RichTextarea
-            label="Comments"
-            value={experiment.commentsText}
-            onChange={(commentsText) => onUpdate({ commentsText })}
-            placeholder="Observations, deviations, ideas for next time…"
-            minRows={2}
-          />
 
           <TlcDropzone
             images={experiment.tlcImages}
@@ -164,6 +152,41 @@ export default function ExperimentEditor({ experiment, onUpdate, onDelete, onExp
             }
             onRemove={(index) =>
               onUpdate((exp) => ({ tlcImages: exp.tlcImages.filter((_, i) => i !== index) }))
+            }
+          />
+
+          <ProductYieldCard
+            product={experiment.product}
+            rows={experiment.reagents}
+            onChange={(patch) =>
+              onUpdate((exp) => ({ product: { ...exp.product, ...patch } }))
+            }
+          />
+          <div className="print:hidden">
+            <button
+              type="button"
+              onClick={() => setNmrOpen(true)}
+              className="flex items-center gap-2 rounded-lg border border-cyan-300 bg-[#E0FFFF] px-4 py-2 font-semibold text-zinc-900 shadow-sm hover:bg-[#C6F2F2]"
+            >
+              🔬 Enter NMR Room
+            </button>
+          </div>
+
+          <RichTextarea
+            label="Comments"
+            value={experiment.commentsText}
+            onChange={(commentsText) => onUpdate({ commentsText })}
+            placeholder="Observations, deviations, ideas for next time…"
+            minRows={2}
+          />
+
+          <ReferencesSection
+            references={experiment.references}
+            onAdd={(reference) =>
+              onUpdate((exp) => ({ references: [...exp.references, reference] }))
+            }
+            onRemove={(id) =>
+              onUpdate((exp) => ({ references: exp.references.filter((r) => r.id !== id) }))
             }
           />
         </div>

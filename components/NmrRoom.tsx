@@ -1,7 +1,8 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
+import type { NmrSaveStatus } from "./NmrWorkspace";
 
 /**
  * NMRium touches `window`/`document` at import time, so it is only ever loaded
@@ -17,17 +18,20 @@ const NMRium = dynamic(() => import("./NmrWorkspace"), {
 });
 
 interface Props {
+  /** The workspace autosaves under this experiment (Documents/Fumebook/attachments/<id>/). */
+  experimentId: string;
   onClose: () => void;
 }
 
 /**
  * Full-screen NMR processing room.
  *
- * Deliberately stateless: nothing from NMRium is persisted (raw FIDs are far too
- * large for localStorage). Each time the room opens it mounts a fresh NMRium
- * workspace; users save their work with NMRium's own export tools.
+ * NMRium's workspace (spectra, peak picks, assignments, ...) is autosaved per
+ * experiment and restored the next time the room opens (see NmrWorkspace.tsx).
  */
-export default function NmrRoom({ onClose }: Props) {
+export default function NmrRoom({ experimentId, onClose }: Props) {
+  const [saveStatus, setSaveStatus] = useState<NmrSaveStatus | null>(null);
+
   // Prevent the notebook behind the overlay from scrolling.
   useEffect(() => {
     const previous = document.body.style.overflow;
@@ -53,8 +57,17 @@ export default function NmrRoom({ onClose }: Props) {
           ← Back to Notebook
         </button>
         <h2 className="text-sm font-semibold text-zinc-800">🔬 NMR Analysis Room</h2>
-        <p className="ml-auto hidden text-xs text-zinc-500 sm:block">
-          Work here is not saved to the notebook. Use NMRium&apos;s export tools to keep it.
+        <p
+          role="status"
+          className={`ml-auto hidden text-xs sm:block ${
+            saveStatus?.kind === "error" ? "font-medium text-red-600" : "text-zinc-500"
+          }`}
+        >
+          {saveStatus?.kind === "error"
+            ? saveStatus.message
+            : saveStatus
+              ? `Autosaved ${saveStatus.at.toLocaleTimeString()}`
+              : "Changes to this workspace are saved automatically."}
         </p>
       </nav>
 
@@ -63,7 +76,7 @@ export default function NmrRoom({ onClose }: Props) {
         {/* `nmr-isolate` shields NMRium from Tailwind's preflight (see nmr-room.css). */}
         <div className="nmr-isolate absolute inset-0">
           {/* Loads the full "default" workspace (see NmrWorkspace.tsx). */}
-          <NMRium />
+          <NMRium key={experimentId} experimentId={experimentId} onSaveStatus={setSaveStatus} />
         </div>
       </div>
     </div>

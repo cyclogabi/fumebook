@@ -11,6 +11,8 @@ interface Props {
   onClose: () => void;
   onExportBackup: () => void;
   onImportBackup: () => void;
+  onImportExperiment: () => void;
+  onOpenLibrary: () => void;
 }
 
 /** Sort GH experiments newest first by their numeric suffix. */
@@ -27,6 +29,8 @@ export default function Sidebar({
   onClose,
   onExportBackup,
   onImportBackup,
+  onImportExperiment,
+  onOpenLibrary,
 }: Props) {
   const [query, setQuery] = useState("");
 
@@ -64,6 +68,17 @@ export default function Sidebar({
             }`}
           >
             Dashboard
+          </button>
+          <button
+            type="button"
+            onClick={onOpenLibrary}
+            title="Your saved compounds (SMILES / MOLfile)"
+            className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-sm font-medium text-zinc-600 hover:bg-zinc-50"
+          >
+            <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+              <path d="M3 2.5h7a2 2 0 0 1 2 2v9H5a2 2 0 0 1-2-2v-9ZM3 11.5a2 2 0 0 1 2-2h7" />
+            </svg>
+            Personal Library
           </button>
           <input
             type="search"
@@ -117,26 +132,37 @@ export default function Sidebar({
           <div className="grid grid-cols-2 gap-2">
             <button
               type="button"
+              onClick={onImportExperiment}
+              title="Import one experiment (.json) with its molecule picture, TLC photos and NMR spectra"
+              className="col-span-2 flex items-center justify-center gap-1.5 rounded-md border border-zinc-300 bg-white px-2 py-1.5 text-xs font-medium text-zinc-700 shadow-sm hover:bg-zinc-50"
+            >
+              <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                <path d="M8 10.5v-8M4.5 6 8 2.5 11.5 6M3 13h10" />
+              </svg>
+              Import Experiment (.json)
+            </button>
+            <button
+              type="button"
               onClick={onExportBackup}
               disabled={experiments.length === 0}
-              title="Download all experiments as a JSON backup"
+              title="Save all experiments, pictures, TLC photos, NMR data and your library to one JSON file"
               className="flex items-center justify-center gap-1.5 rounded-md border border-zinc-300 bg-white px-2 py-1.5 text-xs font-medium text-zinc-700 shadow-sm hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-50"
             >
               <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
                 <path d="M8 2v8M4.5 7 8 10.5 11.5 7M3 13h10" />
               </svg>
-              Export Backup
+              Export Full Backup
             </button>
             <button
               type="button"
               onClick={onImportBackup}
-              title="Restore experiments from a JSON backup"
+              title="Restore experiments, pictures, NMR data and the library from a full backup"
               className="flex items-center justify-center gap-1.5 rounded-md border border-zinc-300 bg-white px-2 py-1.5 text-xs font-medium text-zinc-700 shadow-sm hover:bg-zinc-50"
             >
               <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
                 <path d="M8 10.5v-8M4.5 6 8 2.5 11.5 6M3 13h10" />
               </svg>
-              Import Backup
+              Import Full Backup
             </button>
           </div>
         </div>

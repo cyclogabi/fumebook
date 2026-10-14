@@ -110,6 +110,13 @@ function propagateFromLimiting(rows: ReagentRow[], limId: string): void {
   }
 }
 
+function clearSolventFields(r: ReagentRow): void {
+  r.mw = null;
+  r.mass = null;
+  r.n = null;
+  r.eq = null;
+}
+
 // --- Public API ------------------------------------------------------------
 
 /** Apply a single numeric edit to one row and recalculate dependents. */
@@ -122,6 +129,14 @@ export function editField(
   const next = rows.map((r) => ({ ...r }));
   const row = next.find((r) => r.id === id);
   if (!row) return rows;
+
+  // Solvent rows only hold a volume and a density; everything else stays cleared.
+  if (row.role === "Solvent") {
+    if (field !== "vol" && field !== "density") return rows;
+    row[field] = value;
+    clearSolventFields(row);
+    return next;
+  }
 
   const isLimiting = row.role === "Limiting";
   const prevN = row.n;
@@ -181,6 +196,14 @@ export function setRole(rows: ReagentRow[], id: string, role: Role): ReagentRow[
   if (!row || row.role === role) return rows;
 
   row.role = role;
+  if (role === "Solvent") {
+    // Keep a volume (derive it from a mass + density if that's all there was), drop the rest.
+    if (!has(row.vol) && has(row.mass) && positive(row.density)) {
+      row.vol = row.mass / (row.density * 1000);
+    }
+    clearSolventFields(row);
+    return next;
+  }
   if (role !== "Limiting") return next;
 
   for (const r of next) {
@@ -199,6 +222,37 @@ export function setRole(rows: ReagentRow[], id: string, role: Role): ReagentRow[
     }
   }
   return next;
+}
+
+/**
+ * Scale a concentration in mol/L to a readable value and unit (M, mM, µM, nM),
+ * keeping the number between 1 and 999 where possible, e.g. 0.025 -> "25 mM".
+ */
+export function formatConcentration(molar: number): string {
+  if (!Number.isFinite(molar) || molar <= 0) return "";
+  const scales: [number, number, string][] = [
+    [1, 1, "M"],
+    [1e-3, 1e3, "mM"],
+    [1e-6, 1e6, "µM"],
+  ];
+  let value = molar * 1e9;
+  let unit = "nM";
+  for (const [min, factor, u] of scales) {
+    if (molar >= min) {
+      value = molar * factor;
+      unit = u;
+      break;
+    }
+  }
+  // Rounding to 3 significant digits can reach 1000 (e.g. 0.9996 M): bump up a unit.
+  let text = String(parseFloat(value.toPrecision(3)));
+  if (parseFloat(text) >= 1000 && unit !== "M") {
+    const up = { nM: "µM", "µM": "mM", mM: "M" }[unit]!;
+    text = String(parseFloat((value / 1000).toPrecision(3)));
+    unit = up;
+  }
+  if (/e/i.test(text)) text = String(Math.round(parseFloat(text)));
+  return `${text} ${unit}`;
 }
 
 /** Concentration (mol/L) of the limiting reagent in the total solvent volume. */

@@ -9,6 +9,10 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@tauri-apps/plugin-clipboard-manager": "^2.4.2",
+    "@tauri-apps/plugin-dialog": "^2.8.3",
+    "@tauri-apps/plugin-fs": "^2.6.0",
+    "@zakodium/nmrium-core-plugins": "^0.7.110",
     "ketcher-react": "^3.18.0",
     "ketcher-standalone": "^3.18.0",
     "next": "16.4.0",

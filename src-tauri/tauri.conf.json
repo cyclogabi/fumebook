@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Fumebook",
   "version": "0.1.0",
-  "identifier": "com.tauri.dev",
+  "identifier": "com.fumebook.dev",
   "build": {
     "frontendDist": "../out",
     "devUrl": "http://localhost:3000",
@@ -16,11 +16,12 @@
         "width": 800,
         "height": 600,
         "resizable": true,
-        "fullscreen": false
+        "fullscreen": false,
+        "dragDropEnabled": false
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' https://api.groq.com https://pubchem.ncbi.nlm.nih.gov ipc: http://ipc.localhost; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-eval' 'unsafe-inline';"
+      "csp": "default-src 'self'; connect-src 'self' https://api.groq.com https://pubchem.ncbi.nlm.nih.gov ipc: http://ipc.localhost; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; worker-src 'self' blob:; frame-src 'self' blob: data:;"
     }
   },
   "bundle": {

@@ -1,21 +1,47 @@
 /**
- * Backup / restore of the notebook.
+ * Backup / restore of the notebook, attachments included.
  *
- * File format (one envelope for full backups AND single-experiment exports,
- * so both can be restored through the same Import dialog):
+ * Two file formats, both plain JSON, both read by the same parser:
  *
- *   { "version": 1, "exportedAt": "<ISO date>", "experiments": [ ...Experiment ] }
+ *  - ExperimentBundle ("fumebook-experiment"): ONE experiment with everything that belongs to it.
+ *  - FullBackupBundle ("fumebook-backup"): every ExperimentBundle plus the Personal Library and the
+ *    profile (initials + starting number).
  *
- * Everything the app stores lives inside each experiment (reagent rows, display
- * units and column visibility, product / yield, drawn scheme, TLC images), so
- * exporting the experiments exports all settings too.
+ * An experiment's own JSON (`experiments/[id].json`) holds the reagents, texts, product / yield,
+ * references, Ketcher scheme, units / columns and the TLC photos (base64 data URLs). The other
+ * attachments live in `attachments/[id]/` and are embedded here so a bundle is self-contained:
  *
- * Imported data is validated strictly against the shapes in ./types before it is
- * allowed anywhere near storage, then normalised with the same code that loads
- * localStorage.
+ *   moleculeImageBase64  <- attachments/[id]/molecule.png   (data URL)
+ *   nmrWorkspace         <- attachments/[id]/workspace.nmrium (the NMRium workspace JSON, as text:
+ *                           exactly what NmrWorkspace wrote, so restoring it is byte-for-byte)
+ *   tlcImages            <- the experiment's TLC photos (they are not files: the app keeps them in
+ *                           the experiment JSON, so a bundle moves them out of `experiment` into
+ *                           this array instead of storing them twice)
+ *
+ * Older files are still understood: the v1 envelope `{ version: 1, experiments: [Experiment] }` (no
+ * attachments) and a bare experiment JSON.
+ *
+ * Imported data is validated strictly against the shapes in ./types before it is allowed anywhere
+ * near storage, then normalised with the same code that loads the experiment files.
  */
 
-import { normaliseExperiment } from "./storage";
+import {
+  blobToDataUrl,
+  loadMoleculeImage,
+  loadNmrState,
+  normaliseExperiment,
+  removeAttachments,
+  saveMoleculeImage,
+  saveNmrState,
+} from "./storage";
+import {
+  isValidInitials,
+  isValidStartNumber,
+  readInitials,
+  readStartNumber,
+  START_NUMBER_DEFAULT,
+} from "./initials";
+import { loadLibrary, normaliseCompounds, type LibraryCompound } from "./library";
 import {
   COLUMN_KEYS,
   PRODUCT_MASS_UNITS,
@@ -25,20 +51,99 @@ import {
   type UnitKind,
 } from "./types";
 
-export const BACKUP_VERSION = 1;
-/** Refuse absurdly large files before reading them into memory (localStorage holds ~5 MB). */
-export const MAX_BACKUP_BYTES = 100 * 1024 * 1024;
+export const BACKUP_VERSION = 2;
+/** Refuse absurd files before parsing them (bundles carry images and NMR spectra, so this is generous). */
+export const MAX_BACKUP_BYTES = 500 * 1024 * 1024;
 
-export interface BackupFile {
-  version: number;
-  exportedAt: string;
-  experiments: Experiment[];
+export const EXPERIMENT_FORMAT = "fumebook-experiment";
+export const BACKUP_FORMAT = "fumebook-backup";
+
+/** The files an experiment owns besides its JSON (the TLC photos stay in the experiment). */
+export interface ExperimentAttachments {
+  /** `data:image/png;base64,...` of `molecule.png`, or null if there is none. */
+  moleculeImageBase64: string | null;
+  /** The saved NMRium workspace (JSON text), or null if there is none. */
+  nmrWorkspace: string | null;
 }
 
-// --- Building & downloading ---------------------------------------------------
+export interface ExperimentBundle extends ExperimentAttachments {
+  format: typeof EXPERIMENT_FORMAT;
+  version: number;
+  exportedAt: string;
+  /** The experiment; its `tlcImages` are empty here, the photos are in `tlcImages` below. */
+  experiment: Experiment;
+  /** TLC plate photos (data URLs). */
+  tlcImages: string[];
+}
 
-export function buildBackup(experiments: Experiment[], now = new Date()): BackupFile {
-  return { version: BACKUP_VERSION, exportedAt: now.toISOString(), experiments };
+export interface BackupProfile {
+  initials: string | null;
+  startNumber: number;
+}
+
+export interface FullBackupBundle {
+  format: typeof BACKUP_FORMAT;
+  version: number;
+  exportedAt: string;
+  experiments: ExperimentBundle[];
+  library: LibraryCompound[];
+  profile: BackupProfile;
+}
+
+const messageOf = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+// --- Building ------------------------------------------------------------------
+
+/** One experiment with its molecule picture, TLC photos and NMR workspace embedded. */
+export async function buildExperimentBundle(
+  experiment: Experiment,
+  now = new Date(),
+): Promise<ExperimentBundle> {
+  let moleculeImageBase64: string | null = null;
+  let nmrWorkspace: string | null = null;
+  try {
+    const png = await loadMoleculeImage(experiment.id);
+    moleculeImageBase64 = png ? await blobToDataUrl(png) : null;
+  } catch (err) {
+    throw new Error(`The molecule picture of ${experiment.id} could not be read: ${messageOf(err)}`);
+  }
+  try {
+    nmrWorkspace = await loadNmrState(experiment.id);
+  } catch (err) {
+    throw new Error(`The NMR workspace of ${experiment.id} could not be read: ${messageOf(err)}`);
+  }
+  return {
+    format: EXPERIMENT_FORMAT,
+    version: BACKUP_VERSION,
+    exportedAt: now.toISOString(),
+    experiment: { ...experiment, moleculeImage: moleculeImageBase64 !== null, tlcImages: [] },
+    moleculeImageBase64,
+    tlcImages: experiment.tlcImages,
+    nmrWorkspace,
+  };
+}
+
+/** Every experiment (with attachments), the whole Personal Library and the profile. */
+export async function buildFullBackup(
+  experiments: Experiment[],
+  now = new Date(),
+): Promise<FullBackupBundle> {
+  const bundles: ExperimentBundle[] = [];
+  for (const experiment of experiments) bundles.push(await buildExperimentBundle(experiment, now));
+  let library: LibraryCompound[];
+  try {
+    library = await loadLibrary();
+  } catch (err) {
+    throw new Error(`The Personal Library could not be read: ${messageOf(err)}`);
+  }
+  return {
+    format: BACKUP_FORMAT,
+    version: BACKUP_VERSION,
+    exportedAt: now.toISOString(),
+    experiments: bundles,
+    library,
+    profile: { initials: readInitials(), startNumber: readStartNumber() },
+  };
 }
 
 /** Local calendar date, YYYY-MM-DD (not UTC, so late-evening exports get today's date). */
@@ -47,37 +152,19 @@ function localDate(now: Date): string {
   return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
 }
 
-export const backupFilename = (now = new Date(), suffix = "") =>
-  `eln_backup_${localDate(now)}${suffix}.json`;
+/** fumebook_backup_YYYY-MM-DD.json */
+export const backupFilename = (now = new Date()) => `fumebook_backup_${localDate(now)}.json`;
 
-export const experimentFilename = (experiment: Experiment) =>
-  `${experiment.id.replace(/[^A-Za-z0-9_.-]/g, "_")}.json`;
-
-function downloadJson(filename: string, data: unknown): void {
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = filename;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+/** fumebook_backup_YYYY-MM-DD_pre-restore_HHMMSS.json: unique, so a second one never overwrites the first. */
+export function preRestoreFilename(now = new Date()): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const time = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+  return `fumebook_backup_${localDate(now)}_pre-restore_${time}.json`;
 }
 
-/** Download every experiment as eln_backup_YYYY-MM-DD.json. Returns the file name. */
-export function downloadBackup(experiments: Experiment[], suffix = ""): string {
-  const filename = backupFilename(new Date(), suffix);
-  downloadJson(filename, buildBackup(experiments));
-  return filename;
-}
-
-/** Download a single experiment as GH#####.json. Returns the file name. */
-export function downloadExperiment(experiment: Experiment): string {
-  const filename = experimentFilename(experiment);
-  downloadJson(filename, buildBackup([experiment]));
-  return filename;
-}
+/** GH001_experiment.fumebook.json */
+export const experimentFilename = (experiment: Pick<Experiment, "id">) =>
+  `${experiment.id.replace(/[^A-Za-z0-9_.-]/g, "_")}_experiment.fumebook.json`;
 
 // --- Validation -----------------------------------------------------------------
 
@@ -176,25 +263,84 @@ export function experimentProblem(raw: unknown): string | null {
   return null;
 }
 
+const IMAGE_DATA_URL = /^data:image\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+$/i;
+const BARE_BASE64 = /^[A-Za-z0-9+/=\s]+$/;
+
+/** An embedded picture as a data URL (bare base64 is taken to be PNG), or null if it is neither. */
+function imageDataUrl(value: string): string | null {
+  const text = value.trim();
+  if (IMAGE_DATA_URL.test(text)) return text;
+  if (BARE_BASE64.test(text)) return `data:image/png;base64,${text}`;
+  return null;
+}
+
+/** The attachments of one bundle entry, or the reason they are unusable. */
+function readAttachments(raw: Obj): { ok: true; value: ExperimentAttachments } | { ok: false; problem: string } {
+  let moleculeImageBase64: string | null = null;
+  const image = raw.moleculeImageBase64;
+  if (image !== undefined && image !== null && image !== "") {
+    if (!isStr(image)) return { ok: false, problem: "moleculeImageBase64 must be text" };
+    moleculeImageBase64 = imageDataUrl(image);
+    if (moleculeImageBase64 === null) return { ok: false, problem: "moleculeImageBase64 is not a valid image" };
+  }
+
+  let nmrWorkspace: string | null = null;
+  const nmr = raw.nmrWorkspace;
+  if (nmr !== undefined && nmr !== null && nmr !== "") {
+    // Stored as JSON text; an embedded object is accepted too (hand-made files).
+    nmrWorkspace = isStr(nmr) ? nmr : isObj(nmr) ? JSON.stringify(nmr) : null;
+    if (nmrWorkspace === null) return { ok: false, problem: "nmrWorkspace must be the workspace JSON" };
+    try {
+      JSON.parse(nmrWorkspace);
+    } catch {
+      return { ok: false, problem: "nmrWorkspace is not valid JSON" };
+    }
+  }
+  return { ok: true, value: { moleculeImageBase64, nmrWorkspace } };
+}
+
 export interface SkippedEntry {
   /** e.g. "Entry 3 (GH00007)" */
   label: string;
   reason: string;
 }
 
+/** What kind of file was read. */
+export type BackupKind = "backup" | "experiment" | "plain";
+
 export type ParsedBackup =
   | {
       ok: true;
+      kind: BackupKind;
       version: number;
       exportedAt: string | null;
-      /** Valid, normalised experiments (duplicate IDs inside the file collapsed, last one wins). */
+      /** Valid, normalised experiments (duplicate IDs inside the file collapsed, last one wins). TLC photos included. */
       experiments: Experiment[];
+      /** Molecule picture and NMR workspace per experiment ID. Only bundles have them; older files have none. */
+      attachments: Record<string, ExperimentAttachments>;
+      /** The Personal Library in a full backup, otherwise null. */
+      library: LibraryCompound[] | null;
+      /** initials + starting number in a full backup, otherwise null. */
+      profile: BackupProfile | null;
       skipped: SkippedEntry[];
       duplicatesInFile: number;
     }
   | { ok: false; error: string };
 
-/** Parse and validate the text of a backup file. Never throws. */
+export type ValidBackup = Extract<ParsedBackup, { ok: true }>;
+
+function readProfile(raw: unknown): BackupProfile | null {
+  if (!isObj(raw)) return null;
+  const initials = isValidInitials(raw.initials as string) ? (raw.initials as string) : null;
+  if (initials === null) return null;
+  const start = raw.startNumber;
+  return {
+    initials,
+    startNumber: isValidStartNumber(start) ? start : START_NUMBER_DEFAULT,
+  };
+}
+
+/** Parse and validate the text of a backup / experiment file. Never throws. */
 export function parseBackup(text: string): ParsedBackup {
   let data: unknown;
   try {
@@ -203,56 +349,133 @@ export function parseBackup(text: string): ParsedBackup {
     return { ok: false, error: "This file is not valid JSON." };
   }
 
-  if (!isObj(data) || !("experiments" in data) || !("version" in data)) {
-    return {
-      ok: false,
-      error: 'This does not look like an ELN backup (expected "version" and "experiments").',
-    };
-  }
-  if (typeof data.version !== "number" || !Number.isInteger(data.version) || data.version < 1) {
-    return { ok: false, error: "The backup has an invalid version number." };
-  }
-  if (data.version > BACKUP_VERSION) {
-    return {
-      ok: false,
-      error: `This backup uses format v${data.version}, which is newer than this app understands (v${BACKUP_VERSION}). Update the app to import it.`,
-    };
-  }
-  if (!Array.isArray(data.experiments)) {
-    return { ok: false, error: 'The backup\'s "experiments" must be a list.' };
+  if (!isObj(data)) {
+    return { ok: false, error: "This does not look like a Fumebook export or backup." };
   }
 
-  const byId = new Map<string, Experiment>();
+  let kind: BackupKind;
+  let entries: unknown[];
+  let version = 1;
+  if (Array.isArray(data.experiments)) {
+    kind = "backup";
+    entries = data.experiments;
+    if (typeof data.version !== "number" || !Number.isInteger(data.version) || data.version < 1) {
+      return { ok: false, error: "The backup has an invalid version number." };
+    }
+    version = data.version;
+  } else if (isObj(data.experiment)) {
+    kind = "experiment";
+    entries = [data];
+    if (typeof data.version === "number") version = data.version;
+  } else if (isStr(data.id) && Array.isArray(data.reagents)) {
+    kind = "plain";
+    entries = [data];
+  } else {
+    return {
+      ok: false,
+      error:
+        'This does not look like a Fumebook export or backup (expected an experiment, or "version" and "experiments").',
+    };
+  }
+  if (version > BACKUP_VERSION) {
+    return {
+      ok: false,
+      error: `This file uses format v${version}, which is newer than this app understands (v${BACKUP_VERSION}). Update the app to import it.`,
+    };
+  }
+
+  const byId = new Map<string, { experiment: Experiment; attachments: ExperimentAttachments | null }>();
   const skipped: SkippedEntry[] = [];
   let duplicatesInFile = 0;
 
-  data.experiments.forEach((raw: unknown, index) => {
-    const idHint = isObj(raw) && isStr(raw.id) ? ` (${raw.id.slice(0, 40)})` : "";
+  entries.forEach((raw: unknown, index) => {
+    const body = isObj(raw) && isObj(raw.experiment) ? raw.experiment : raw;
+    const idHint = isObj(body) && isStr(body.id) ? ` (${body.id.slice(0, 40)})` : "";
     const label = `Entry ${index + 1}${idHint}`;
 
-    const problem = experimentProblem(raw);
+    let attachments: ExperimentAttachments | null = null;
+    let candidate: unknown = body;
+    if (isObj(raw) && isObj(raw.experiment)) {
+      // A bundle: its TLC photos live beside the experiment (older writers left them inside it).
+      const tlcImages = raw.tlcImages !== undefined ? raw.tlcImages : raw.experiment.tlcImages;
+      candidate = { ...raw.experiment, tlcImages };
+      const read = readAttachments(raw);
+      if (!read.ok) {
+        skipped.push({ label, reason: read.problem });
+        return;
+      }
+      attachments = read.value;
+    }
+
+    const problem = experimentProblem(candidate);
     if (problem) {
       skipped.push({ label, reason: problem });
       return;
     }
-    const experiment = normaliseExperiment(raw as Partial<Experiment>);
+    const experiment = normaliseExperiment(candidate as Partial<Experiment>);
     if (!experiment) {
       skipped.push({ label, reason: "could not be read" });
       return;
     }
+    // A bundle is authoritative about its picture: no image in it means none for the experiment.
+    if (attachments) experiment.moleculeImage = attachments.moleculeImageBase64 !== null;
+
     const key = experiment.id.toUpperCase();
     if (byId.has(key)) duplicatesInFile += 1;
-    byId.set(key, experiment);
+    byId.set(key, { experiment, attachments });
   });
+
+  const experiments: Experiment[] = [];
+  const attachmentsById: Record<string, ExperimentAttachments> = {};
+  for (const { experiment, attachments } of byId.values()) {
+    experiments.push(experiment);
+    if (attachments) attachmentsById[experiment.id] = attachments;
+  }
 
   return {
     ok: true,
-    version: data.version,
+    kind,
+    version,
     exportedAt: isStr(data.exportedAt) ? data.exportedAt : null,
-    experiments: [...byId.values()],
+    experiments,
+    attachments: attachmentsById,
+    library: kind === "backup" && Array.isArray(data.library) ? normaliseCompounds(data.library) : null,
+    profile: kind === "backup" ? readProfile(data.profile) : null,
     skipped,
     duplicatesInFile,
   };
+}
+
+// --- Writing attachments back ------------------------------------------------------
+
+/** A `data:` URL as a Blob. Decoded by hand: no `fetch` of a data URL, which a strict CSP may forbid. */
+export function dataUrlToBlob(dataUrl: string): Blob {
+  const match = /^data:([^;,]*)(;base64)?,([\s\S]*)$/i.exec(dataUrl.trim());
+  if (!match) throw new Error("Not a data URL.");
+  const [, mime, base64, payload] = match;
+  const binary = base64 ? atob(payload.replace(/\s+/g, "")) : decodeURIComponent(payload);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i) & 0xff;
+  return new Blob([bytes], { type: mime || "image/png" });
+}
+
+/**
+ * Write one experiment's picture and NMR workspace to `attachments/[id]/` (`molecule.png`,
+ * `workspace.nmrium`). With `replace`, whatever the experiment had there is removed first, so the
+ * folder ends up holding exactly what the bundle held. Throws if anything could not be written.
+ */
+export async function restoreAttachments(
+  id: string,
+  attachments: ExperimentAttachments,
+  replace: boolean,
+): Promise<void> {
+  if (replace) await removeAttachments(id);
+  if (attachments.moleculeImageBase64) {
+    await saveMoleculeImage(id, dataUrlToBlob(attachments.moleculeImageBase64));
+  }
+  if (attachments.nmrWorkspace) {
+    await saveNmrState(id, attachments.nmrWorkspace);
+  }
 }
 
 // --- Merge / replace -------------------------------------------------------------

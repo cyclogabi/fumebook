@@ -61,7 +61,7 @@ export default function Dashboard({ experiments, onOpen, onNew, onParse, onImpor
               onClick={onImportBackup}
               className="rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-700 shadow-sm hover:bg-zinc-50"
             >
-              Import Backup
+              Import Full Backup
             </button>
           </div>
         </div>

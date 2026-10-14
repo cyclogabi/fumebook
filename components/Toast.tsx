@@ -7,6 +7,8 @@ export interface ToastMessage {
   id: number;
   kind: "success" | "error";
   message: string;
+  /** How long it stays, in ms (default 6 s, 10 s for errors). */
+  durationMs?: number;
 }
 
 interface Props {
@@ -18,12 +20,13 @@ interface Props {
 export default function Toast({ toast, onDismiss }: Props) {
   const id = toast?.id;
   const kind = toast?.kind;
+  const durationMs = toast?.durationMs;
 
   useEffect(() => {
     if (id === undefined) return;
-    const timer = setTimeout(onDismiss, kind === "error" ? 10_000 : 6_000);
+    const timer = setTimeout(onDismiss, durationMs ?? (kind === "error" ? 10_000 : 6_000));
     return () => clearTimeout(timer);
-  }, [id, kind, onDismiss]);
+  }, [id, kind, durationMs, onDismiss]);
 
   if (!toast) return null;
   const isError = toast.kind === "error";
@@ -31,7 +34,7 @@ export default function Toast({ toast, onDismiss }: Props) {
   return (
     <div
       role={isError ? "alert" : "status"}
-      className={`fixed bottom-4 right-4 z-[200] flex max-w-sm items-start gap-3 rounded-lg border px-4 py-3 text-sm shadow-lg print:hidden ${
+      className={`fixed bottom-4 right-4 z-[200] flex max-w-md items-start gap-3 rounded-lg border px-4 py-3 text-sm shadow-lg print:hidden ${
         isError
           ? "border-red-200 bg-red-50 text-red-800"
           : "border-emerald-200 bg-emerald-50 text-emerald-900"

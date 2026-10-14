@@ -8,8 +8,10 @@ import {
   searchDictionary,
   type ChemicalEntry,
 } from "@/lib/chemicalDictionary";
+import { describeProperties, searchLibrary, type LibraryCompound } from "@/lib/library";
 import { fetchMolecularWeight, fetchSuggestions } from "@/lib/pubchem";
 
+const NO_LIBRARY: readonly LibraryCompound[] = [];
 const DEBOUNCE_MS = 300;
 const MIN_CHARS = 2; // PubChem lookups; the local dictionary answers from the first character
 const MENU_MIN_WIDTH = 300;
@@ -18,8 +20,9 @@ const MENU_MAX_HEIGHT = 360;
 type SearchStatus = "idle" | "loading" | "ready" | "error";
 type MwStatus = "idle" | "loading" | "error";
 
-/** One row in the dropdown: a local quick pick or a PubChem suggestion. */
+/** One row in the dropdown: a Personal Library compound, a local quick pick or a PubChem suggestion. */
 type Item =
+  | { kind: "library"; key: string; compound: LibraryCompound }
   | { kind: "local"; key: string; entry: ChemicalEntry }
   | { kind: "pubchem"; key: string; raw: string; label: string };
 
@@ -37,14 +40,26 @@ interface Props {
    * and role in one update so the stoichiometry is recalculated once.
    */
   onPickLocal: (entry: ChemicalEntry) => void;
+  /** The user's Personal Library. Matches are offered first; a book button lists all of it. */
+  library?: readonly LibraryCompound[];
+  /**
+   * A library compound was chosen. The parent fills name, MW and density in one update;
+   * `withStructure` is true when the user also asked for the structure to go into the sketcher.
+   * Without this prop the library is not offered at all.
+   */
+  onPickLibrary?: (compound: LibraryCompound, withStructure: boolean) => void;
+  /** Show the "+ Sketch" action on library entries (a sketcher is available to receive it). */
+  canSketch?: boolean;
 }
 
 /**
  * Reagent-name combobox.
  *
- * Two sources feed one dropdown:
+ * Three sources feed one dropdown:
+ *  0. the user's Personal Library (their own compounds, with MW / density) - pinned first,
+ *     and browsable in full through the book button next to the field;
  *  1. a local dictionary of common reagents / solvents (instant, offline,
- *     matches names *and* abbreviations such as DCM or Et3N) - pinned on top;
+ *     matches names *and* abbreviations such as DCM or Et3N) - pinned next;
  *  2. PubChem autocomplete (debounced) - names are re-cased from PubChem's
  *     ALL CAPS to clean Title Case.
  * Choosing a local entry hands everything to `onPickLocal`; choosing a PubChem
@@ -59,8 +74,12 @@ export default function ReagentNameInput({
   onNameChange,
   onMolecularWeight,
   onPickLocal,
+  library = NO_LIBRARY,
+  onPickLibrary,
+  canSketch = false,
 }: Props) {
   const listboxId = useId();
+  const wrapRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -75,10 +94,19 @@ export default function ReagentNameInput({
   const [activeIndex, setActiveIndex] = useState(-1);
   const [mwStatus, setMwStatus] = useState<MwStatus>("idle");
   const [anchor, setAnchor] = useState<DOMRect | null>(null);
+  /** The book button was pressed: the menu lists the whole library instead of search results. */
+  const [browse, setBrowse] = useState(false);
 
   const query = value.trim();
+  const browsing = browse && open;
+  const libraryEnabled = onPickLibrary !== undefined;
 
   const items = useMemo<Item[]>(() => {
+    const libraryItems: Item[] = (
+      !libraryEnabled ? [] : browsing ? library : searchLibrary(library, query)
+    ).map((compound) => ({ kind: "library", key: `library:${compound.id}`, compound }));
+    // Browsing shows the library only; typing shows library, dictionary and PubChem together.
+    if (browsing) return libraryItems;
     const local: Item[] = searchDictionary(query).map((entry) => ({
       kind: "local",
       key: `local:${entry.commonName}`,
@@ -93,14 +121,19 @@ export default function ReagentNameInput({
         raw,
         label: formatChemicalName(raw),
       }));
-    return [...local, ...remote];
-  }, [query, suggestions]);
+    return [...libraryItems, ...local, ...remote];
+  }, [query, suggestions, library, libraryEnabled, browsing]);
 
-  const localCount = items.filter((i) => i.kind === "local").length;
+  // "local" here means pinned: library compounds and dictionary quick picks, everything but PubChem.
+  const localCount = items.filter((i) => i.kind !== "pubchem").length;
   const remoteCount = items.length - localCount;
+  const hasLibraryItems = items.some((i) => i.kind === "library");
 
-  const statusMessage =
-    remoteCount > 0
+  const statusMessage = browsing
+    ? library.length === 0
+      ? "Your library is empty. Add compounds with Personal Library in the sidebar."
+      : null
+    : remoteCount > 0
       ? null
       : searchStatus === "loading"
         ? "Searching PubChem…"
@@ -138,8 +171,10 @@ export default function ReagentNameInput({
     if (!open) return;
     const onPointerDown = (e: PointerEvent) => {
       const target = e.target as Node;
-      if (inputRef.current?.contains(target) || menuRef.current?.contains(target)) return;
+      // wrapRef covers the input and the library button, so the button can toggle the menu itself.
+      if (wrapRef.current?.contains(target) || menuRef.current?.contains(target)) return;
       setOpen(false);
+      setBrowse(false);
     };
     const reposition = () => {
       if (inputRef.current) setAnchor(inputRef.current.getBoundingClientRect());
@@ -183,17 +218,25 @@ export default function ReagentNameInput({
     }
   }
 
+  function close() {
+    setOpen(false);
+    setBrowse(false);
+  }
+
   function handleChange(next: string) {
     onNameChange(next);
     settledRef.current = false;
     setActiveIndex(-1);
+    setBrowse(false); // typing goes back to search results
 
     // Typing invalidates a pending MW lookup from an earlier selection.
     mwAbortRef.current?.abort();
     setMwStatus("idle");
 
-    // Local quick picks are instant, so they can open the menu straight away.
-    const hasLocal = searchDictionary(next.trim()).length > 0;
+    // Library and dictionary picks are instant, so they can open the menu straight away.
+    const hasLocal =
+      searchDictionary(next.trim()).length > 0 ||
+      (libraryEnabled && searchLibrary(library, next).length > 0);
 
     cancelSearch();
     if (next.trim().length < MIN_CHARS) {
@@ -203,7 +246,7 @@ export default function ReagentNameInput({
         measure();
         setOpen(true);
       } else {
-        setOpen(false);
+        close();
       }
       return;
     }
@@ -219,15 +262,36 @@ export default function ReagentNameInput({
   function closeAfterPick() {
     cancelSearch();
     settledRef.current = true;
-    setOpen(false);
+    close();
     setActiveIndex(-1);
     setSearchStatus("idle");
     mwAbortRef.current?.abort();
     setMwStatus("idle");
   }
 
-  async function choose(item: Item) {
+  /** Open (or close) the menu with the whole library in it. */
+  function toggleBrowse() {
+    if (browsing) {
+      close();
+      return;
+    }
+    cancelSearch();
+    setSearchStatus("idle");
+    setActiveIndex(-1);
+    setBrowse(true);
+    measure();
+    setOpen(true);
+    inputRef.current?.focus();
+  }
+
+  async function choose(item: Item, withStructure = false) {
     closeAfterPick();
+
+    if (item.kind === "library") {
+      // The parent applies name, MW and density in one update (stoichiometry is recalculated once).
+      onPickLibrary?.(item.compound, withStructure);
+      return;
+    }
 
     if (item.kind === "local") {
       onPickLocal(item.entry);
@@ -269,14 +333,15 @@ export default function ReagentNameInput({
       case "Enter":
         if (open) {
           e.preventDefault();
-          if (activeIndex >= 0 && items[activeIndex]) void choose(items[activeIndex]);
-          else setOpen(false);
+          // Shift+Enter on a library compound also adds its structure to the sketcher.
+          if (activeIndex >= 0 && items[activeIndex]) void choose(items[activeIndex], e.shiftKey);
+          else close();
         }
         break;
       case "Escape":
         if (open) {
           e.preventDefault();
-          setOpen(false);
+          close();
         }
         break;
     }
@@ -294,7 +359,7 @@ export default function ReagentNameInput({
   })();
 
   return (
-    <div className="relative">
+    <div ref={wrapRef} className="relative">
       <input
         ref={inputRef}
         value={value}
@@ -317,15 +382,38 @@ export default function ReagentNameInput({
             setOpen(true);
           }
         }}
-        onBlur={() => setOpen(false)}
-        className={`${className} ${mwStatus !== "idle" ? "pr-6" : ""}`}
+        onBlur={close}
+        className={`${className} ${
+          libraryEnabled ? (mwStatus !== "idle" ? "pr-12" : "pr-7") : mwStatus !== "idle" ? "pr-6" : ""
+        }`}
       />
+
+      {/* Personal Library: list every saved compound (screen only) */}
+      {libraryEnabled && (
+        <button
+          type="button"
+          // Keep focus in the input so its blur handler doesn't close the menu before the click.
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={toggleBrowse}
+          title="Pick from your Personal Library"
+          aria-label="Pick from Personal Library"
+          aria-haspopup="listbox"
+          aria-expanded={browsing && menuVisible}
+          className={`absolute right-0.5 top-1/2 -translate-y-1/2 rounded p-1 hover:bg-fume-50 hover:text-fume-700 print:hidden ${
+            browsing ? "text-fume-700" : "text-zinc-300"
+          }`}
+        >
+          <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            <path d="M3 2.5h7a2 2 0 0 1 2 2v9H5a2 2 0 0 1-2-2v-9ZM3 11.5a2 2 0 0 1 2-2h7" />
+          </svg>
+        </button>
+      )}
 
       {/* Molecular-weight lookup feedback (screen only) */}
       {mwStatus === "loading" && (
         <svg
           viewBox="0 0 16 16"
-          className="pointer-events-none absolute right-1.5 top-1/2 size-3.5 -translate-y-1/2 animate-spin text-fume-500 print:hidden"
+          className={`pointer-events-none absolute ${libraryEnabled ? "right-7" : "right-1.5"} top-1/2 size-3.5 -translate-y-1/2 animate-spin text-fume-500 print:hidden`}
           fill="none"
           stroke="currentColor"
           strokeWidth="2"
@@ -341,7 +429,7 @@ export default function ReagentNameInput({
           role="status"
           title="No molecular weight found on PubChem for this name. Enter MW manually."
           aria-label="No molecular weight found on PubChem. Enter MW manually."
-          className="absolute right-1.5 top-1/2 grid size-4 -translate-y-1/2 cursor-help place-items-center rounded-full bg-amber-100 text-[10px] font-bold leading-none text-amber-700 print:hidden"
+          className={`absolute ${libraryEnabled ? "right-7" : "right-1.5"} top-1/2 grid size-4 -translate-y-1/2 cursor-help place-items-center rounded-full bg-amber-100 text-[10px] font-bold leading-none text-amber-700 print:hidden`}
         >
           !
         </span>
@@ -382,14 +470,48 @@ export default function ReagentNameInput({
                       id={`${listboxId}-opt-${i}`}
                       role="option"
                       aria-selected={active}
-                      title={item.kind === "local" ? describeEntry(item.entry) : undefined}
+                      title={
+                        item.kind === "local"
+                          ? describeEntry(item.entry)
+                          : item.kind === "library"
+                            ? describeProperties(item.compound) || "No MW or density saved for this compound"
+                            : undefined
+                      }
                       onMouseEnter={() => setActiveIndex(i)}
                       onClick={() => void choose(item)}
                       className={`flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm text-zinc-600 ${
                         active ? "bg-fume-50 text-zinc-900" : ""
                       } ${item.kind === "pubchem" && searchStatus === "loading" ? "opacity-60" : ""}`}
                     >
-                      {item.kind === "local" ? (
+                      {item.kind === "library" ? (
+                        <>
+                          <span className="min-w-0 flex-1 truncate">
+                            <span className="text-zinc-800">
+                              <Highlight text={item.compound.name} query={browsing ? "" : query} />
+                            </span>
+                            <span className="ml-2 text-xs text-zinc-400">
+                              {describeProperties(item.compound)}
+                            </span>
+                          </span>
+                          {canSketch && (
+                            <button
+                              type="button"
+                              tabIndex={-1}
+                              title="Fill the row and also add this structure to the sketcher (Shift+Enter)"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void choose(item, true);
+                              }}
+                              className="shrink-0 rounded border border-fume-200 px-1.5 py-0.5 text-[10px] font-semibold text-fume-700 hover:bg-fume-100"
+                            >
+                              + Sketch
+                            </button>
+                          )}
+                          <span className="shrink-0 rounded bg-fume-50 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-fume-700">
+                            Library
+                          </span>
+                        </>
+                      ) : item.kind === "local" ? (
                         <>
                           <span className="min-w-0 flex-1 truncate">
                             <span className="text-zinc-800">
@@ -430,9 +552,11 @@ export default function ReagentNameInput({
               )}
             </ul>
             <p className="border-t border-zinc-100 bg-zinc-50 px-3 py-1 text-[10px] tracking-wide text-zinc-400">
-              {localCount > 0
-                ? "Quick picks fill name, MW, density & role"
-                : "PubChem · click to fill name & MW"}
+              {hasLibraryItems || browsing
+                ? `Library picks fill name, MW & density${canSketch ? " · + Sketch also adds the structure" : ""}`
+                : localCount > 0
+                  ? "Quick picks fill name, MW, density & role"
+                  : "PubChem · click to fill name & MW"}
             </p>
           </div>,
           document.body,

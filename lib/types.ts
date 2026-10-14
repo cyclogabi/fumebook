@@ -7,6 +7,8 @@
  * so switching mL -> L never loses precision or mutates the data.
  */
 
+import { readInitials, readStartNumber } from "./initials";
+
 export const ROLES = ["Limiting", "Reagent", "Solvent", "Catalyst"] as const;
 export type Role = (typeof ROLES)[number];
 
@@ -73,6 +75,10 @@ export interface Reference {
   url: string;
 }
 
+/** How the molecule / reaction scheme section is filled: drawn in Ketcher or an uploaded picture. */
+export const MOLECULE_MODES = ["draw", "image"] as const;
+export type MoleculeMode = (typeof MOLECULE_MODES)[number];
+
 export interface Experiment {
   id: string; // e.g. "GH00001"
   title: string;
@@ -80,8 +86,16 @@ export interface Experiment {
   /**
    * Reaction scheme drawn in Ketcher, stored as an Rxnfile (or a Molfile when
    * only molecules are drawn, i.e. no reaction arrow). Empty string = blank canvas.
+   * Kept when switching to "image" mode, so the drawing is still there when switching back.
    */
   reactionSchemeRxn: string;
+  /** Which of the two the user chose for this experiment. */
+  moleculeMode: MoleculeMode;
+  /**
+   * True once a picture was saved for this experiment
+   * (desktop: `Documents/Fumebook/attachments/[id]/molecule.png`). The bytes are not in this JSON.
+   */
+  moleculeImage: boolean;
   procedureText: string;
   purificationText: string;
   commentsText: string;
@@ -104,8 +118,10 @@ export const DEFAULT_COLUMNS: Columns = {
   density: true,
 };
 
+/** Only used if no initials are saved (the onboarding dialog normally makes that impossible). */
 export const ID_PREFIX = "GH";
-const DEFAULT_ID_WIDTH = 5;
+/** Experiment IDs are the user's initials plus this many digits: GH001. */
+const ID_DIGITS = 3;
 
 export function uid(): string {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
@@ -126,38 +142,50 @@ export function newRow(role: Role = "Reagent"): ReagentRow {
 }
 
 /**
- * Next experiment ID: take the highest existing GH number and add one,
- * keeping the zero-padding width of that ID (GH00009 -> GH00010).
+ * Next experiment ID for `initials`: among the existing IDs that are those initials followed
+ * by a number, take the highest number and add one, but never go below `startNumber` (the
+ * number the user said their notebook starts at); padded to at least 3 digits.
+ *
+ * - no experiments yet, start number 56 -> GH056
+ * - highest GH012, start number 1 -> GH013
+ * - highest GH012, start number 56 -> GH056 (a later start number still wins)
+ * - highest GH060, start number 56 -> GH061
+ *
+ * Other people's IDs (a backup merged in with different initials) are ignored.
  */
-export function nextExperimentId(existing: Experiment[]): string {
-  const pattern = new RegExp(`^${ID_PREFIX}(\\d+)$`, "i");
+export function nextExperimentId(
+  existing: Experiment[],
+  initials: string,
+  startNumber: number = readStartNumber(),
+): string {
+  const escaped = initials.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`^${escaped}(\\d+)$`, "i");
   let maxNum = 0;
-  let width = DEFAULT_ID_WIDTH;
   for (const exp of existing) {
     const match = pattern.exec(exp.id);
     if (!match) continue;
-    const num = parseInt(match[1], 10);
-    if (num >= maxNum) {
-      maxNum = num;
-      width = Math.max(match[1].length, 1);
-    }
+    maxNum = Math.max(maxNum, parseInt(match[1], 10));
   }
+  const format = (n: number) => `${initials}${String(n).padStart(ID_DIGITS, "0")}`;
   const taken = new Set(existing.map((e) => e.id.toUpperCase()));
-  let next = maxNum + 1;
-  let id = `${ID_PREFIX}${String(next).padStart(width, "0")}`;
-  while (taken.has(id.toUpperCase())) {
-    next += 1;
-    id = `${ID_PREFIX}${String(next).padStart(width, "0")}`;
-  }
-  return id;
+  let next = Math.max(maxNum + 1, Math.floor(startNumber) || 1);
+  while (taken.has(format(next).toUpperCase())) next += 1;
+  return format(next);
 }
 
-export function newExperiment(existing: Experiment[]): Experiment {
+/** `initials` and `startNumber` default to the ones saved in the profile. */
+export function newExperiment(
+  existing: Experiment[],
+  initials: string = readInitials() ?? ID_PREFIX,
+  startNumber: number = readStartNumber(),
+): Experiment {
   return {
-    id: nextExperimentId(existing),
+    id: nextExperimentId(existing, initials, startNumber),
     title: "",
     dateCreated: new Date().toISOString(),
     reactionSchemeRxn: "",
+    moleculeMode: "draw",
+    moleculeImage: false,
     procedureText: "",
     purificationText: "",
     commentsText: "",

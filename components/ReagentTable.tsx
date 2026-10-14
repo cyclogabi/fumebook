@@ -2,12 +2,14 @@
 
 import NumberInput, { cellInput } from "./NumberInput";
 import ReagentNameInput from "./ReagentNameInput";
+import { useEffect, useRef, useState } from "react";
 import type { ChemicalEntry } from "@/lib/chemicalDictionary";
+import { useLibrary, type LibraryCompound } from "@/lib/library";
 import {
   concentration,
   displayValue,
   editField,
-  formatNumber,
+  formatConcentration,
   setRole,
   toCanonical,
   type EditableField,
@@ -32,15 +34,23 @@ interface Props {
   onRows: (fn: (rows: ReagentRow[]) => ReagentRow[]) => void;
   onUnits: (units: Units) => void;
   onColumns: (columns: Columns) => void;
+  /**
+   * Add a library compound's structure to the sketcher. Resolves to an error message, or null when
+   * it was added. Without it the library picker only fills the row.
+   */
+  onInsertStructure?: (compound: LibraryCompound) => Promise<string | null>;
 }
+
+/** How long the "added to the sketcher" confirmation stays under the table. */
+const STATUS_MS = 4000;
 
 const COLUMN_LABELS: Record<ColumnKey, string> = {
   mw: "MW",
   eq: "Eq",
   n: "n",
-  mass: "Mass",
-  vol: "Vol",
-  density: "Density",
+  mass: "m",
+  vol: "v",
+  density: "d",
 };
 
 /**
@@ -64,6 +74,20 @@ function applyLocalPick(rows: ReagentRow[], id: string, entry: ChemicalEntry): R
   return next;
 }
 
+/**
+ * Apply a Personal Library pick to one row in a single state update: name, MW and density.
+ * Like a dictionary pick, MW and density go through `editField` (so n / mass / vol and the
+ * equivalents are recalculated as if typed), and a value the compound doesn't have is cleared
+ * rather than left over from whatever the row held before.
+ */
+function applyLibraryPick(rows: ReagentRow[], id: string, compound: LibraryCompound): ReagentRow[] {
+  if (!rows.some((r) => r.id === id)) return rows;
+  let next = rows.map((r) => (r.id === id ? { ...r, name: compound.name } : r));
+  next = editField(next, id, "mw", compound.mw ?? null);
+  next = editField(next, id, "density", compound.density ?? null);
+  return next;
+}
+
 export default function ReagentTable({
   rows,
   units,
@@ -71,9 +95,34 @@ export default function ReagentTable({
   onRows,
   onUnits,
   onColumns,
+  onInsertStructure,
 }: Props) {
   const show = columns;
   const conc = concentration(rows);
+  const { compounds: library } = useLibrary();
+
+  // Result of "+ Sketch" (screen readers announce it; sighted users see the structure appear).
+  const [sketchStatus, setSketchStatus] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
+  const statusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (statusTimer.current) clearTimeout(statusTimer.current);
+    },
+    [],
+  );
+
+  async function pickFromLibrary(rowId: string, compound: LibraryCompound, withStructure: boolean) {
+    onRows((cur) => applyLibraryPick(cur, rowId, compound));
+    if (!withStructure || !onInsertStructure) return;
+    const problem = await onInsertStructure(compound);
+    setSketchStatus(
+      problem
+        ? { kind: "error", text: problem }
+        : { kind: "ok", text: `Added the structure of ${compound.name} to the sketcher.` },
+    );
+    if (statusTimer.current) clearTimeout(statusTimer.current);
+    statusTimer.current = setTimeout(() => setSketchStatus(null), STATUS_MS);
+  }
 
   const edit = (id: string, field: EditableField, value: number | null) =>
     onRows((current) => editField(current, id, field, value));
@@ -109,7 +158,7 @@ export default function ReagentTable({
       </div>
 
       <div className="-mx-2 overflow-x-auto px-2 print:mx-0 print:overflow-visible print:px-0">
-        <table className="w-full min-w-[640px] table-fixed border-collapse text-sm print:min-w-0">
+        <table className="w-full min-w-[720px] table-fixed border-collapse text-sm print:min-w-0">
           <thead>
             <tr className="border-b border-zinc-300 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
               <Th align="left" className="w-auto">Reagent name</Th>
@@ -129,19 +178,19 @@ export default function ReagentTable({
               )}
               {show.mass && (
                 <Th className="w-[5.25rem]">
-                  Mass
+                  <span className="normal-case">m</span>
                   <UnitSelect kind="mass" units={units} onUnits={onUnits} />
                 </Th>
               )}
               {show.vol && (
                 <Th className="w-[5.25rem]">
-                  Vol
+                  <span className="normal-case">v</span>
                   <UnitSelect kind="vol" units={units} onUnits={onUnits} />
                 </Th>
               )}
               {show.density && (
                 <Th className="w-[4.5rem]">
-                  Density
+                  <span className="normal-case">d</span>
                   <Sub>g/mL</Sub>
                 </Th>
               )}
@@ -152,6 +201,8 @@ export default function ReagentTable({
           <tbody>
             {rows.map((row) => {
               const isLimiting = row.role === "Limiting";
+              // Solvents only have a name, volume and density.
+              const isSolvent = row.role === "Solvent";
               // Untouched rows are left out of the printout (limiting eq=1 is implicit).
               const isBlank =
                 row.name.trim() === "" &&
@@ -177,6 +228,11 @@ export default function ReagentTable({
                       // by lib/stoich.ts (the limiting reagent also rescales the other rows).
                       onMolecularWeight={(mw) => edit(row.id, "mw", mw)}
                       onPickLocal={(entry) => onRows((cur) => applyLocalPick(cur, row.id, entry))}
+                      library={library ?? undefined}
+                      onPickLibrary={(compound, withStructure) =>
+                        void pickFromLibrary(row.id, compound, withStructure)
+                      }
+                      canSketch={onInsertStructure !== undefined}
                     />
                   </td>
 
@@ -199,27 +255,43 @@ export default function ReagentTable({
 
                   {show.mw && (
                     <td className="py-1 pr-1">
-                      <NumberInput
-                        ariaLabel={`MW of ${row.name || "reagent"}`}
-                        value={row.mw}
-                        onCommit={(v) => edit(row.id, "mw", v)}
-                      />
+                      {isSolvent ? (
+                        <Dash />
+                      ) : (
+                        <NumberInput
+                          ariaLabel={`MW of ${row.name || "reagent"}`}
+                          value={row.mw}
+                          onCommit={(v) => edit(row.id, "mw", v)}
+                        />
+                      )}
                     </td>
                   )}
 
                   {show.eq && (
                     <td className="py-1 pr-1">
-                      <NumberInput
-                        ariaLabel={`Equivalents of ${row.name || "reagent"}`}
-                        value={isLimiting ? 1 : row.eq}
-                        readOnly={isLimiting}
-                        onCommit={(v) => edit(row.id, "eq", v)}
-                      />
+                      {isSolvent ? (
+                        <Dash />
+                      ) : (
+                        <NumberInput
+                          ariaLabel={`Equivalents of ${row.name || "reagent"}`}
+                          value={isLimiting ? 1 : row.eq}
+                          readOnly={isLimiting}
+                          onCommit={(v) => edit(row.id, "eq", v)}
+                        />
+                      )}
                     </td>
                   )}
 
-                  {show.n && <td className="py-1 pr-1">{quantityCell(row, "n", "Amount")}</td>}
-                  {show.mass && <td className="py-1 pr-1">{quantityCell(row, "mass", "Mass")}</td>}
+                  {show.n && (
+                    <td className="py-1 pr-1">
+                      {isSolvent ? <Dash /> : quantityCell(row, "n", "Amount")}
+                    </td>
+                  )}
+                  {show.mass && (
+                    <td className="py-1 pr-1">
+                      {isSolvent ? <Dash /> : quantityCell(row, "mass", "Mass")}
+                    </td>
+                  )}
                   {show.vol && <td className="py-1 pr-1">{quantityCell(row, "vol", "Volume")}</td>}
 
                   {show.density && (
@@ -260,11 +332,17 @@ export default function ReagentTable({
         >
           + Add row
         </button>
+        <p
+          role={sketchStatus?.kind === "error" ? "alert" : "status"}
+          className={`text-xs print:hidden ${sketchStatus?.kind === "error" ? "text-red-600" : "text-emerald-700"}`}
+        >
+          {sketchStatus?.text}
+        </p>
         {conc !== null && (
           <p className="ml-auto text-xs text-zinc-500">
             Concentration (limiting reagent in solvent):{" "}
             <span className="font-medium tabular-nums text-zinc-800">
-              {formatNumber(conc)} M
+              {formatConcentration(conc)}
             </span>
           </p>
         )}
@@ -294,6 +372,17 @@ function Th({
         {children}
       </div>
     </th>
+  );
+}
+
+function Dash() {
+  return (
+    <div
+      aria-hidden="true"
+      className="select-none px-1 py-1 text-right text-sm text-zinc-300 print:text-zinc-400"
+    >
+      —
+    </div>
   );
 }
 

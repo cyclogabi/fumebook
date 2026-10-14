@@ -1,19 +1,23 @@
 "use client";
 
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import { MAX_BACKUP_BYTES, downloadBackup, parseBackup, type ParsedBackup } from "@/lib/backup";
+import { MAX_BACKUP_BYTES, parseBackup, type ValidBackup } from "@/lib/backup";
+import { pickJsonFile } from "@/lib/fileDialogs";
 import type { Experiment } from "@/lib/types";
 
 export type ImportMode = "merge" | "replace";
-type ValidBackup = Extract<ParsedBackup, { ok: true }>;
 
 interface Props {
   open: boolean;
-  /** Experiments currently in this browser. */
+  /** Experiments currently in this notebook. */
   experiments: Experiment[];
   onClose: () => void;
-  /** Apply the chosen import. The parent updates storage and shows the confirmation toast. */
-  onImport: (mode: ImportMode, incoming: Experiment[]) => void;
+  /**
+   * Apply the chosen import (experiments, their molecule pictures / TLC photos / NMR workspaces, the
+   * Personal Library and profile). The parent takes the safety copy when asked to, updates storage
+   * and shows the confirmation toast.
+   */
+  onImport: (mode: ImportMode, parsed: ValidBackup, options: { safetyBackup: boolean }) => void;
 }
 
 /**
@@ -28,7 +32,6 @@ export default function BackupModal(props: Props) {
 function ImportDialog({ experiments: current, onClose, onImport }: Props) {
   const titleId = useId();
   const dialogRef = useRef<HTMLDialogElement>(null);
-  const fileRef = useRef<HTMLInputElement>(null);
 
   const [fileName, setFileName] = useState("");
   const [parsed, setParsed] = useState<ValidBackup | null>(null);
@@ -54,33 +57,13 @@ function ImportDialog({ experiments: current, onClose, onImport }: Props) {
   const existingCount = rows.filter((r) => r.exists).length;
   const newCount = rows.length - existingCount;
 
-  async function handleFile(file: File | undefined) {
-    if (!file) return;
-    setError(null);
-    setParsed(null);
-    setConfirmReplace(false);
-    setFileName(file.name);
-
-    if (!/\.json$/i.test(file.name) && file.type !== "application/json") {
-      setError("Please choose a .json backup file.");
+  /** Review the text of a chosen file (the same for the native Open dialog and a dropped file). */
+  function review(name: string, text: string) {
+    setFileName(name);
+    if (text.length > MAX_BACKUP_BYTES) {
+      setError("This file is too large to be a Fumebook backup.");
       return;
     }
-    if (file.size > MAX_BACKUP_BYTES) {
-      setError("This file is too large to be an ELN backup.");
-      return;
-    }
-
-    setReading(true);
-    let text: string;
-    try {
-      text = await file.text();
-    } catch {
-      setReading(false);
-      setError("The file could not be read.");
-      return;
-    }
-    setReading(false);
-
     const result = parseBackup(text);
     if (!result.ok) {
       setError(result.error);
@@ -89,15 +72,57 @@ function ImportDialog({ experiments: current, onClose, onImport }: Props) {
     setParsed(result);
   }
 
+  function reset() {
+    setError(null);
+    setParsed(null);
+    setConfirmReplace(false);
+  }
+
+  /** A file dropped onto the dialog (plain browser; the desktop window does not receive drops). */
+  async function handleFile(file: File | undefined) {
+    if (!file) return;
+    reset();
+    setFileName(file.name);
+
+    if (!/\.json$/i.test(file.name) && file.type !== "application/json") {
+      setError("Please choose a .json backup file.");
+      return;
+    }
+    setReading(true);
+    try {
+      review(file.name, await file.text());
+    } catch {
+      setError("The file could not be read.");
+    } finally {
+      setReading(false);
+    }
+  }
+
+  /** The native Windows "Open" dialog on the desktop, the browser's file picker otherwise. */
+  async function chooseFile() {
+    setReading(true);
+    try {
+      const picked = await pickJsonFile();
+      if (picked) {
+        reset();
+        review(picked.name, picked.text);
+      }
+    } catch (err) {
+      reset();
+      setError(err instanceof Error ? err.message : "The file could not be read.");
+    } finally {
+      setReading(false);
+    }
+  }
+
   function runMerge() {
-    if (parsed) onImport("merge", parsed.experiments);
+    if (parsed) onImport("merge", parsed, { safetyBackup: false });
   }
 
   function runReplace() {
     if (!parsed) return;
-    // Safety net: keep a copy of what is about to be wiped.
-    if (safetyBackup && hasExisting) downloadBackup(current, "_pre-restore");
-    onImport("replace", parsed.experiments);
+    // The parent takes the safety copy of what is about to be wiped, and stops if it cannot.
+    onImport("replace", parsed, { safetyBackup: safetyBackup && hasExisting });
   }
 
   const importable = parsed?.experiments.length ?? 0;
@@ -136,19 +161,6 @@ function ImportDialog({ experiments: current, onClose, onImport }: Props) {
         </div>
 
         {/* Step 1: choose a file */}
-        <input
-          ref={fileRef}
-          type="file"
-          accept=".json,application/json"
-          className="sr-only"
-          tabIndex={-1}
-          aria-label="Backup file"
-          onChange={(e) => {
-            void handleFile(e.target.files?.[0]);
-            e.target.value = ""; // allow choosing the same file again
-          }}
-        />
-
         {!parsed && (
           <div
             onDragOver={(e) => {
@@ -166,11 +178,11 @@ function ImportDialog({ experiments: current, onClose, onImport }: Props) {
             }`}
           >
             <p className="text-sm text-zinc-600">
-              {reading ? "Reading file…" : "Drop a backup .json file here"}
+              {reading ? "Reading file…" : "Choose a Fumebook backup .json file"}
             </p>
             <button
               type="button"
-              onClick={() => fileRef.current?.click()}
+              onClick={() => void chooseFile()}
               disabled={reading}
               className="mt-3 rounded-md border border-zinc-300 bg-white px-3 py-1.5 text-sm font-medium text-zinc-700 shadow-sm hover:bg-zinc-50 disabled:opacity-50"
             >
@@ -199,11 +211,7 @@ function ImportDialog({ experiments: current, onClose, onImport }: Props) {
               </div>
               <button
                 type="button"
-                onClick={() => {
-                  setParsed(null);
-                  setConfirmReplace(false);
-                  fileRef.current?.click();
-                }}
+                onClick={() => void chooseFile()}
                 className="shrink-0 text-xs font-medium text-fume-700 hover:underline"
               >
                 Choose another file
@@ -223,6 +231,7 @@ function ImportDialog({ experiments: current, onClose, onImport }: Props) {
               )}
               .
             </p>
+            {importable > 0 && <p className="-mt-2 text-xs text-zinc-500">{describeContents(parsed)}</p>}
 
             {importable > 0 && (
               <ul className="max-h-40 divide-y divide-zinc-100 overflow-y-auto rounded-md border border-zinc-200">
@@ -311,7 +320,7 @@ function ImportDialog({ experiments: current, onClose, onImport }: Props) {
                       onChange={(e) => setSafetyBackup(e.target.checked)}
                       className="size-3.5 rounded border-zinc-300 accent-fume-600"
                     />
-                    Download a backup of my current data first (recommended)
+                    Save a safety copy of my current data first (Documents/Fumebook/backups; recommended)
                   </label>
                   {confirmReplace ? (
                     <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -358,6 +367,22 @@ function ImportDialog({ experiments: current, onClose, onImport }: Props) {
       </div>
     </dialog>
   );
+}
+
+/** What besides the experiment texts the file carries, e.g. "Includes 3 TLC photos, 2 molecule pictures, 1 NMR workspace and 12 library compounds." */
+function describeContents(parsed: ValidBackup): string {
+  const count = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+  const tlc = parsed.experiments.reduce((sum, e) => sum + e.tlcImages.length, 0);
+  const attachments = Object.values(parsed.attachments);
+  const pictures = attachments.filter((a) => a.moleculeImageBase64).length;
+  const nmr = attachments.filter((a) => a.nmrWorkspace).length;
+  const parts: string[] = [];
+  if (tlc > 0) parts.push(count(tlc, "TLC photo"));
+  if (pictures > 0) parts.push(count(pictures, "molecule picture"));
+  if (nmr > 0) parts.push(count(nmr, "NMR workspace"));
+  if (parsed.library && parsed.library.length > 0) parts.push(count(parsed.library.length, "library compound"));
+  if (parts.length === 0) return "No attachments in this file.";
+  return `Includes ${parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}` : parts[0]}.`;
 }
 
 function formatExported(iso: string): string {

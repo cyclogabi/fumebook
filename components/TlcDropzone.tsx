@@ -39,6 +39,7 @@ export default function TlcDropzone({ images, onAdd, onRemove }: Props) {
   // Paste images from the clipboard (e.g. a screenshot or copied photo).
   useEffect(() => {
     function onPaste(e: ClipboardEvent) {
+      if (e.defaultPrevented) return; // the molecule picture box already took it
       const files = Array.from(e.clipboardData?.files ?? []).filter((f) =>
         f.type.startsWith("image/"),
       );
