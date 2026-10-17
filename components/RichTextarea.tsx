@@ -95,7 +95,7 @@ export default function RichTextarea({
 
   return (
     <section className={`group ${isEmpty ? "print:hidden" : ""}`}>
-      <div className="mb-1.5 flex items-center justify-between gap-2">
+      <div className="mb-1.5 flex items-center justify-between gap-2 print:mb-0.5">
         <h3 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
           {label}
         </h3>
@@ -126,7 +126,7 @@ export default function RichTextarea({
         onChange={(e) => onChange(e.target.value)}
         className="-mx-2 block w-[calc(100%+1rem)] resize-none overflow-hidden rounded-md border border-transparent bg-transparent px-2 py-1.5 text-sm leading-relaxed text-zinc-900 placeholder:text-zinc-400 hover:border-zinc-200 focus:border-fume-500 focus:bg-white focus:outline-none print:hidden"
       />
-      <div className="hidden whitespace-pre-wrap break-words text-[12px] leading-relaxed text-zinc-900 print:block">
+      <div className="hidden whitespace-pre-wrap break-words text-[11px] leading-snug text-zinc-900 print:block">
         {value}
       </div>
     </section>

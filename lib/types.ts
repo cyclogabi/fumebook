@@ -54,6 +54,31 @@ export interface ProductInfo {
   /** mg, canonical - `massUnit` only controls how it is displayed / typed. */
   isolatedMass: number | null;
   massUnit: ProductMassUnit;
+  /** Moles of limiting reagent consumed per mole of this product formed. 1 when missing. */
+  stoichRatio?: number;
+}
+
+/**
+ * An additional isolated product (side product, isomer, di-substituted product...) of the same
+ * reaction. The primary product stays in `Experiment.product`; these only add to it.
+ *
+ * Numbers may arrive as text (hand-edited / older files): an empty string means "not entered", and
+ * loading turns numeric text into numbers.
+ */
+export interface SecondaryProduct {
+  id: string;
+  /** e.g. "Side product", "Isomer B", "Di-substituted". */
+  name: string;
+  /** Molecular weight, g/mol. */
+  mw: string | number;
+  /** Isolated mass, in `massUnit` (it is converted, not reinterpreted, when the unit is toggled). */
+  mass: string | number;
+  /** Unit of `mass`; "mg" when missing, like the primary product's selector. */
+  massUnit?: ProductMassUnit;
+  /** Moles of limiting reagent consumed per mole of this product formed. 1 when missing. */
+  stoichRatio?: number;
+  /** Optional notes / appearance. */
+  appearance?: string;
 }
 
 export const DEFAULT_PRODUCT: ProductInfo = {
@@ -101,6 +126,11 @@ export interface Experiment {
   commentsText: string;
   reagents: ReagentRow[];
   product: ProductInfo;
+  /**
+   * Further isolated products. Optional: experiments saved before this existed simply don't have
+   * it, and an experiment with a single product never needs it.
+   */
+  secondaryProducts?: SecondaryProduct[];
   /** base64 data URLs */
   tlcImages: string[];
   references: Reference[];
@@ -125,6 +155,13 @@ const ID_DIGITS = 3;
 
 export function uid(): string {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+}
+
+export function newSecondaryProduct(
+  massUnit: ProductMassUnit = "mg",
+  name = "",
+): SecondaryProduct {
+  return { id: uid(), name, mw: "", mass: "", massUnit, stoichRatio: 1 };
 }
 
 export function newRow(role: Role = "Reagent"): ReagentRow {
@@ -179,8 +216,9 @@ export function newExperiment(
   initials: string = readInitials() ?? ID_PREFIX,
   startNumber: number = readStartNumber(),
 ): Experiment {
+  const id = nextExperimentId(existing, initials, startNumber);
   return {
-    id: nextExperimentId(existing, initials, startNumber),
+    id,
     title: "",
     dateCreated: new Date().toISOString(),
     reactionSchemeRxn: "",
@@ -190,7 +228,7 @@ export function newExperiment(
     purificationText: "",
     commentsText: "",
     reagents: [newRow("Limiting"), newRow("Reagent")],
-    product: { ...DEFAULT_PRODUCT },
+    product: { ...DEFAULT_PRODUCT, name: id },
     tlcImages: [],
     references: [],
     units: { ...DEFAULT_UNITS },

@@ -37,7 +37,7 @@ body {
 /* ---- Print: clean A4 document ------------------------------------------ */
 @page {
   size: A4;
-  margin: 14mm;
+  margin: 10mm 12mm;
 }
 
 @media print {

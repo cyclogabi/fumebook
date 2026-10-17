@@ -27,9 +27,11 @@
 
 import {
   blobToDataUrl,
+  isFileLocked,
   loadMoleculeImage,
   loadNmrState,
   normaliseExperiment,
+  removeAttachmentFilesQuietly,
   removeAttachments,
   saveMoleculeImage,
   saveNmrState,
@@ -260,6 +262,25 @@ export function experimentProblem(raw: unknown): string | null {
     }
   }
 
+  if (raw.secondaryProducts !== undefined) {
+    if (!Array.isArray(raw.secondaryProducts)) return "secondaryProducts must be a list";
+    // Numbers may be text ("180.2") or empty; anything else is rejected.
+    const numberOrText = (v: unknown) =>
+      v === undefined || v === null || isStr(v) || (typeof v === "number" && Number.isFinite(v));
+    for (const [i, p] of raw.secondaryProducts.entries()) {
+      const n = `secondary product ${i + 1}`;
+      if (!isObj(p)) return `${n} is not an object`;
+      if (!optStr(p.id) || !optStr(p.name) || !optStr(p.appearance)) return `${n} must have text fields`;
+      if (!numberOrText(p.mw) || !numberOrText(p.mass)) return `${n}: mw and mass must be numbers`;
+      if (p.massUnit !== undefined && !PRODUCT_MASS_UNITS.includes(p.massUnit as never)) {
+        return `${n} has an unknown mass unit`;
+      }
+      if (p.stoichRatio !== undefined && p.stoichRatio !== null && !numberOrText(p.stoichRatio)) {
+        return `${n}: stoichRatio must be a number`;
+      }
+    }
+  }
+
   return null;
 }
 
@@ -469,12 +490,55 @@ export async function restoreAttachments(
   attachments: ExperimentAttachments,
   replace: boolean,
 ): Promise<void> {
-  if (replace) await removeAttachments(id);
+  if (replace) await clearAttachmentsTolerantly(id);
   if (attachments.moleculeImageBase64) {
-    await saveMoleculeImage(id, dataUrlToBlob(attachments.moleculeImageBase64));
+    const png = dataUrlToBlob(attachments.moleculeImageBase64);
+    await retryWhileLocked(() => saveMoleculeImage(id, png));
   }
   if (attachments.nmrWorkspace) {
-    await saveNmrState(id, attachments.nmrWorkspace);
+    const workspace = attachments.nmrWorkspace;
+    await retryWhileLocked(() => saveNmrState(id, workspace));
+  }
+}
+
+/**
+ * Empty `attachments/[id]/` before a restore without ever failing the import over it.
+ *
+ * Windows refuses to delete a folder while any process holds a file in it open ("os error 32").
+ * That must not abort a "Replace All" / overwrite: the folder is then kept (the writes below
+ * create it if needed, `mkdir` recursive, and overwrite `molecule.png` / `workspace.nmrium` in
+ * place) and its known files are removed one by one, each failure ignored.
+ */
+async function clearAttachmentsTolerantly(id: string): Promise<void> {
+  try {
+    await removeAttachments(id);
+    return;
+  } catch (err) {
+    console.warn(
+      `Could not remove attachments/${id}${isFileLocked(err) ? " (a file is in use)" : ""}; ` +
+        "overwriting its files in place instead:",
+      err,
+    );
+  }
+  try {
+    await removeAttachmentFilesQuietly(id);
+  } catch (err) {
+    console.warn(`Leftover cleanup of attachments/${id} failed (ignored):`, err);
+  }
+}
+
+const LOCK_RETRIES = 4;
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Run a write, retrying a few times (with a growing pause) while the target is locked by another process. */
+async function retryWhileLocked(write: () => Promise<void>): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await write();
+    } catch (err) {
+      if (!isFileLocked(err) || attempt >= LOCK_RETRIES) throw err;
+      await sleep(200 * attempt);
+    }
   }
 }
 

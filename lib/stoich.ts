@@ -11,7 +11,7 @@
  * other (non-solvent) row from its equivalents.
  */
 
-import type { ReagentRow, Role, UnitKind, Units } from "./types";
+import type { Experiment, ProductInfo, ReagentRow, Role, SecondaryProduct, UnitKind, Units } from "./types";
 
 export type EditableField = "mw" | "eq" | "n" | "mass" | "vol" | "density";
 
@@ -263,4 +263,158 @@ export function concentration(rows: ReagentRow[]): number | null {
     .filter((r) => r.role === "Solvent" && positive(r.vol))
     .reduce((sum, r) => sum + (r.vol ?? 0), 0);
   return solventVol > 0 ? nLim / solventVol : null; // mmol/mL == mol/L
+}
+
+// --- Isolated products: individual yields and total limiting-reagent conversion ----------------
+//
+// For every isolated product i (the primary one plus each secondary product):
+//   n_i       = mass_i / MW_i                  (mmol, with mass in mg and MW in g/mol)
+//   n_theo,i  = n_limiting / stoichRatio_i     (stoichRatio = moles of limiting reagent per mole of product)
+//   yield_i   = n_i / n_theo,i * 100
+// and the limiting reagent that ended up in isolated products is
+//   conversion = sum(n_i * stoichRatio_i) / n_limiting * 100
+
+/** A number from a number or numeric text ("12.5", "12,5"); null for empty / anything else. */
+export function looseNumber(value: unknown): number | null {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value !== "string" || value.trim() === "") return null;
+  const parsed = Number(value.trim().replace(",", "."));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/** Moles of limiting reagent per mole of product; anything that is not a positive number counts as 1. */
+export function stoichRatioOf(product: Pick<SecondaryProduct, "stoichRatio">): number {
+  const ratio = looseNumber(product.stoichRatio);
+  return ratio !== null && ratio > 0 ? ratio : 1;
+}
+
+const MG_PER_UNIT = { mg: 1, g: 1000 } as const;
+
+/** The isolated mass of a secondary product in mg (canonical), or null if it is empty / not a number. */
+export function secondaryMassMg(product: SecondaryProduct): number | null {
+  const mass = looseNumber(product.mass);
+  return mass === null ? null : mass * MG_PER_UNIT[product.massUnit === "g" ? "g" : "mg"];
+}
+
+export interface ProductMetrics {
+  /** Moles actually isolated (mmol). */
+  nMmol: number | null;
+  /** Moles the limiting reagent could give at most (mmol). */
+  theoreticalMmol: number | null;
+  /** Individual yield, %. */
+  percent: number | null;
+  ratio: number;
+}
+
+/** Moles and individual yield of one product. `nLimiting` is in mmol, `massMg` in mg, `mw` in g/mol. */
+export function productMetrics(
+  massMg: number | null,
+  mw: number | null,
+  ratio: number,
+  nLimiting: number | null,
+): ProductMetrics {
+  const nMmol = massMg !== null && positive(mw) && massMg >= 0 ? massMg / mw : null;
+  const theoreticalMmol = positive(nLimiting) ? nLimiting / ratio : null;
+  const percent =
+    nMmol !== null && theoreticalMmol !== null ? (nMmol / theoreticalMmol) * 100 : null;
+  return { nMmol, theoreticalMmol, percent, ratio };
+}
+
+export interface ProductSummaryItem extends ProductMetrics {
+  /** Fallback fraction identifier: `GH055` (single product) or `GH055-F1`, `GH055-F2`, ... */
+  label: string;
+  name: string;
+  /** Has a molecular weight and a mass above zero, so it counts towards the conversion. */
+  valid: boolean;
+}
+
+export interface ProductsSummary {
+  items: ProductSummaryItem[];
+  /** Total limiting-reagent conversion, %: null without a limiting amount or any complete product. */
+  conversionPercent: number | null;
+}
+
+/** Every product's metrics plus the total conversion of the limiting reagent. */
+export function summariseProducts(
+  rows: ReagentRow[],
+  product: ProductInfo,
+  secondary: readonly SecondaryProduct[] = [],
+  experimentId = "",
+): ProductsSummary {
+  const nLim = limitingN(rows);
+  const idPrefix = experimentId.trim();
+  const primaryFallback =
+    secondary.length > 0
+      ? idPrefix
+        ? `${idPrefix}-F1`
+        : "F1"
+      : idPrefix || "F1";
+  const rawPrimaryName = product.name.trim();
+  const primaryName =
+    rawPrimaryName === "" ||
+    (secondary.length > 0 && idPrefix !== "" && rawPrimaryName.toUpperCase() === idPrefix.toUpperCase())
+      ? primaryFallback
+      : rawPrimaryName;
+
+  const items: ProductSummaryItem[] = [
+    {
+      ...productMetrics(product.isolatedMass, product.mw, stoichRatioOf(product), nLim),
+      label: primaryFallback,
+      name: primaryName,
+      valid: positive(product.mw) && positive(product.isolatedMass),
+    },
+    ...secondary.map((p, i): ProductSummaryItem => {
+      const massMg = secondaryMassMg(p);
+      const mw = looseNumber(p.mw);
+      const fallback = idPrefix ? `${idPrefix}-F${i + 2}` : `F${i + 2}`;
+      const rawName = p.name.trim();
+      return {
+        ...productMetrics(massMg, mw, stoichRatioOf(p), nLim),
+        label: fallback,
+        name: rawName || fallback,
+        valid: positive(mw) && positive(massMg),
+      };
+    }),
+  ];
+
+  let consumed = 0;
+  let any = false;
+  for (const item of items) {
+    if (!item.valid || item.nMmol === null) continue;
+    consumed += item.nMmol * item.ratio;
+    any = true;
+  }
+  return {
+    items,
+    conversionPercent: any && nLim !== null ? (consumed / nLim) * 100 : null,
+  };
+}
+
+/** "1.25 mmol" from 1.25 mmol, "85 µmol" from 0.085 mmol (below 1 mmol the µmol reads better). */
+export function formatMoles(mmol: number): string {
+  if (!Number.isFinite(mmol)) return "";
+  if (mmol >= 1 || mmol === 0) return `${formatNumber(parseFloat(mmol.toPrecision(3)))} mmol`;
+  return `${formatNumber(parseFloat((mmol * 1000).toPrecision(3)))} µmol`;
+}
+
+/**
+ * The yield as the dashboard shows it: the primary product's yield, e.g. "58%", or "58% (+18%)"
+ * when secondary products add 18 points. `null` when the primary yield cannot be worked out.
+ */
+export function yieldSummary(experiment: Experiment): string | null {
+  const secondary = experiment.secondaryProducts ?? [];
+  const { items } = summariseProducts(
+    experiment.reagents,
+    experiment.product,
+    secondary,
+    experiment.id,
+  );
+  const [primary, ...others] = items;
+  if (primary.percent === null) return null;
+  const extra = others.reduce(
+    (sum, item) => (item.valid && item.percent !== null ? sum + item.percent : sum),
+    0,
+  );
+  const base = `${Math.round(primary.percent)}%`;
+  return extra > 0 ? `${base} (+${Math.round(extra)}%)` : base;
 }

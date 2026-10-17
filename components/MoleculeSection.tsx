@@ -122,7 +122,7 @@ export default function MoleculeSection({
   if (mode === "image") {
     return (
       <section className={hasImage ? "" : "print:hidden"}>
-        <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="mb-2 flex items-center justify-between gap-2 print:mb-1">
           <h2 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
             Reaction scheme
           </h2>

@@ -158,7 +158,7 @@ export default function ReagentTable({
       </div>
 
       <div className="-mx-2 overflow-x-auto px-2 print:mx-0 print:overflow-visible print:px-0">
-        <table className="w-full min-w-[720px] table-fixed border-collapse text-sm print:min-w-0">
+        <table className="w-full min-w-[720px] table-fixed border-collapse text-sm print:min-w-0 print:text-xs">
           <thead>
             <tr className="border-b border-zinc-300 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
               <Th align="left" className="w-auto">Reagent name</Th>
@@ -216,7 +216,7 @@ export default function ReagentTable({
                     isLimiting ? "bg-fume-50/50 print:bg-transparent" : ""
                   } ${isBlank ? "print:hidden" : ""}`}
                 >
-                  <td className="py-1 pr-1">
+                  <td className="py-1 pr-1 print:px-1.5 print:py-0.5">
                     <ReagentNameInput
                       value={row.name}
                       emphasized={isLimiting}
@@ -236,7 +236,7 @@ export default function ReagentTable({
                     />
                   </td>
 
-                  <td className="py-1 pr-1">
+                  <td className="py-1 pr-1 print:px-1.5 print:py-0.5">
                     <select
                       value={row.role}
                       aria-label="Role"
@@ -254,7 +254,7 @@ export default function ReagentTable({
                   </td>
 
                   {show.mw && (
-                    <td className="py-1 pr-1">
+                    <td className="py-1 pr-1 print:px-1.5 print:py-0.5">
                       {isSolvent ? (
                         <Dash />
                       ) : (
@@ -268,7 +268,7 @@ export default function ReagentTable({
                   )}
 
                   {show.eq && (
-                    <td className="py-1 pr-1">
+                    <td className="py-1 pr-1 print:px-1.5 print:py-0.5">
                       {isSolvent ? (
                         <Dash />
                       ) : (
@@ -283,19 +283,23 @@ export default function ReagentTable({
                   )}
 
                   {show.n && (
-                    <td className="py-1 pr-1">
+                    <td className="py-1 pr-1 print:px-1.5 print:py-0.5">
                       {isSolvent ? <Dash /> : quantityCell(row, "n", "Amount")}
                     </td>
                   )}
                   {show.mass && (
-                    <td className="py-1 pr-1">
+                    <td className="py-1 pr-1 print:px-1.5 print:py-0.5">
                       {isSolvent ? <Dash /> : quantityCell(row, "mass", "Mass")}
                     </td>
                   )}
-                  {show.vol && <td className="py-1 pr-1">{quantityCell(row, "vol", "Volume")}</td>}
+                  {show.vol && (
+                    <td className="py-1 pr-1 print:px-1.5 print:py-0.5">
+                      {quantityCell(row, "vol", "Volume")}
+                    </td>
+                  )}
 
                   {show.density && (
-                    <td className="py-1 pr-1">
+                    <td className="py-1 pr-1 print:px-1.5 print:py-0.5">
                       <NumberInput
                         ariaLabel={`Density of ${row.name || "reagent"}`}
                         value={row.density}
@@ -324,7 +328,11 @@ export default function ReagentTable({
         </table>
       </div>
 
-      <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+      <div
+        className={`mt-2 flex flex-wrap items-center justify-between gap-2 print:mt-1 ${
+          conc === null ? "print:hidden" : ""
+        }`}
+      >
         <button
           type="button"
           onClick={() => onRows((cur) => [...cur, newRow("Reagent")])}
@@ -339,7 +347,7 @@ export default function ReagentTable({
           {sketchStatus?.text}
         </p>
         {conc !== null && (
-          <p className="ml-auto text-xs text-zinc-500">
+          <p className="ml-auto text-xs text-zinc-500 print:text-[11px]">
             Concentration (limiting reagent in solvent):{" "}
             <span className="font-medium tabular-nums text-zinc-800">
               {formatConcentration(conc)}
@@ -364,7 +372,7 @@ function Th({
 }) {
   return (
     <th
-      className={`px-1.5 py-2 align-bottom font-semibold ${
+      className={`px-1.5 py-2 align-bottom font-semibold print:px-1.5 print:py-0.5 ${
         align === "right" ? "text-right" : "text-left"
       } ${className}`}
     >
@@ -379,7 +387,7 @@ function Dash() {
   return (
     <div
       aria-hidden="true"
-      className="select-none px-1 py-1 text-right text-sm text-zinc-300 print:text-zinc-400"
+      className="select-none px-1 py-1 text-right text-sm text-zinc-300 print:px-1 print:py-0 print:text-xs print:text-zinc-400"
     >
       —
     </div>

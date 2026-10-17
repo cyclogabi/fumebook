@@ -53,7 +53,7 @@ export default function TlcDropzone({ images, onAdd, onRemove }: Props) {
 
   return (
     <section className={images.length === 0 ? "print:hidden" : ""}>
-      <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
+      <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-zinc-500 print:mb-1">
         TLC
       </h3>
 
@@ -113,13 +113,13 @@ export default function TlcDropzone({ images, onAdd, onRemove }: Props) {
           {images.map((src, i) => (
             <li
               key={i}
-              className="group relative aspect-[2/3] w-36 break-inside-avoid overflow-hidden rounded-md border border-zinc-200 bg-zinc-50 print:w-32 print:rounded-none print:border-zinc-300"
+              className="group relative aspect-[2/3] w-36 break-inside-avoid overflow-hidden rounded-md border border-zinc-200 bg-zinc-50 print:aspect-auto print:h-28 print:max-h-28 print:w-auto print:rounded-none print:border-zinc-300"
             >
               {/* eslint-disable-next-line @next/next/no-img-element -- user-provided data URLs */}
               <img
                 src={src}
                 alt={`TLC plate ${i + 1}`}
-                className="size-full object-contain"
+                className="size-full object-contain print:h-full print:max-h-28 print:w-auto"
               />
               <button
                 type="button"

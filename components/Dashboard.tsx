@@ -2,7 +2,17 @@
 
 import { formatDate } from "./ExperimentEditor";
 import { sortExperiments } from "./Sidebar";
+import { yieldSummary } from "@/lib/stoich";
 import type { Experiment } from "@/lib/types";
+
+/** "58%" or "58% (+18%)"; never throws on odd saved data. */
+function yieldText(exp: Experiment): string | null {
+  try {
+    return yieldSummary(exp);
+  } catch {
+    return null;
+  }
+}
 
 interface Props {
   experiments: Experiment[];
@@ -84,6 +94,14 @@ export default function Dashboard({ experiments, onOpen, onNew, onParse, onImpor
                   {exp.reagents.filter((r) => r.name.trim()).length} reagents
                   {exp.tlcImages.length > 0 && ` · ${exp.tlcImages.length} TLC`}
                 </span>
+                {yieldText(exp) && (
+                  <span
+                    title="Isolated yield (+ extra from secondary products)"
+                    className="shrink-0 text-xs font-medium tabular-nums text-zinc-600"
+                  >
+                    {yieldText(exp)}
+                  </span>
+                )}
                 <span className="shrink-0 text-xs text-zinc-500">
                   {formatDate(exp.dateCreated)}
                 </span>

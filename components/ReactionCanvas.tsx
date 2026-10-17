@@ -565,7 +565,7 @@ export default function ReactionCanvas({ value, onChange, fileName, toolbar, exp
 
   return (
     <section className={hasContent ? "" : "print:hidden"}>
-      <div className="mb-2 flex items-center justify-between gap-2">
+      <div className="mb-2 flex items-center justify-between gap-2 print:mb-1">
         <h2 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
           Reaction scheme
         </h2>
@@ -696,7 +696,7 @@ export default function ReactionCanvas({ value, onChange, fileName, toolbar, exp
         <img
           src={previewUrl}
           alt="Reaction scheme"
-          className="hidden max-h-[110mm] max-w-full print:block"
+          className="hidden max-h-36 max-w-full object-contain print:block print:max-h-36"
         />
       )}
 

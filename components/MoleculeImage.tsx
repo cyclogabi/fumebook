@@ -179,7 +179,7 @@ export default function MoleculeImage({ experimentId, hasImage, onHasImageChange
       {showImage ? (
         <div
           {...dropProps}
-          className={`relative flex min-h-48 items-center justify-center rounded-md border bg-white p-3 print:border-0 print:p-0 ${
+          className={`relative flex min-h-48 items-center justify-center rounded-md border bg-white p-3 print:min-h-0 print:justify-start print:border-0 print:p-0 print:py-0.5 ${
             dragging ? "border-fume-500 bg-fume-50" : "border-zinc-200"
           }`}
         >
@@ -187,7 +187,7 @@ export default function MoleculeImage({ experimentId, hasImage, onHasImageChange
           <img
             src={url}
             alt="Molecule"
-            className="max-h-[110mm] max-w-full object-contain print:max-h-[110mm]"
+            className="max-h-[110mm] max-w-full object-contain print:max-h-36"
           />
           <div className="absolute right-2 top-2 flex gap-1.5 print:hidden">
             <button

@@ -17,9 +17,11 @@ import {
   type ProductInfo,
   type ReagentRow,
   type Reference,
+  type SecondaryProduct,
   type UnitKind,
 } from "./types";
 import { cleanDoi } from "./references";
+import { looseNumber } from "./stoich";
 import * as path from "@tauri-apps/api/path";
 import { isTauri } from "./tauri";
 import {
@@ -139,6 +141,7 @@ function normaliseProduct(raw: Partial<ProductInfo> | null | undefined): Product
   const p = raw ?? {};
   const mw = num(p.mw);
   const mass = num(p.isolatedMass);
+  const ratio = looseNumber(p.stoichRatio);
   return {
     name: typeof p.name === "string" ? p.name : "",
     mw: mw !== null && mw > 0 ? mw : null,
@@ -146,7 +149,28 @@ function normaliseProduct(raw: Partial<ProductInfo> | null | undefined): Product
     massUnit: PRODUCT_MASS_UNITS.includes(p.massUnit as never)
       ? (p.massUnit as ProductInfo["massUnit"])
       : DEFAULT_PRODUCT.massUnit,
+    ...(ratio !== null && ratio > 0 && ratio !== 1 ? { stoichRatio: ratio } : {}),
   };
+}
+
+/** A secondary product with defaults filled in; text numbers become numbers, empty ones stay "". */
+function normaliseSecondary(raw: unknown): SecondaryProduct | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Partial<Record<keyof SecondaryProduct, unknown>>;
+  const field = (v: unknown): string | number => looseNumber(v) ?? "";
+  const ratio = looseNumber(r.stoichRatio);
+  const product: SecondaryProduct = {
+    id: typeof r.id === "string" && r.id ? r.id : uid(),
+    name: typeof r.name === "string" ? r.name : "",
+    mw: field(r.mw),
+    mass: field(r.mass),
+    massUnit: PRODUCT_MASS_UNITS.includes(r.massUnit as never)
+      ? (r.massUnit as SecondaryProduct["massUnit"])
+      : "mg",
+    stoichRatio: ratio !== null && ratio > 0 ? ratio : 1,
+  };
+  if (typeof r.appearance === "string" && r.appearance !== "") product.appearance = r.appearance;
+  return product;
 }
 
 /** Fill defaults / drop junk so older or hand-edited data always has the current shape. */
@@ -164,6 +188,23 @@ export function normaliseExperiment(raw: Partial<Experiment>): Experiment | null
     const visible = raw.columns?.[key];
     if (typeof visible === "boolean") columns[key] = visible;
   }
+  const secondary = Array.isArray(raw.secondaryProducts)
+    ? raw.secondaryProducts
+        .map(normaliseSecondary)
+        .filter((p): p is SecondaryProduct => p !== null)
+        .map((p, i) => (p.name.trim() === "" ? { ...p, name: `${raw.id}-F${i + 2}` } : p))
+    : [];
+  const product = normaliseProduct(raw.product);
+  const trimmedName = product.name.trim();
+  const idUpper = raw.id.toUpperCase();
+  if (secondary.length > 0) {
+    if (trimmedName === "" || trimmedName.toUpperCase() === idUpper) {
+      product.name = `${raw.id}-F1`;
+    }
+  } else if (trimmedName === "" || trimmedName.toUpperCase() === `${idUpper}-F1`) {
+    product.name = raw.id;
+  }
+
   return {
     id: raw.id,
     title: typeof raw.title === "string" ? raw.title : "",
@@ -179,7 +220,9 @@ export function normaliseExperiment(raw: Partial<Experiment>): Experiment | null
     purificationText: typeof raw.purificationText === "string" ? raw.purificationText : "",
     commentsText: typeof raw.commentsText === "string" ? raw.commentsText : "",
     reagents: Array.isArray(raw.reagents) ? raw.reagents.map(normaliseRow) : [],
-    product: normaliseProduct(raw.product),
+    product,
+    // Only present when the experiment has some: single-product experiments stay exactly as they were.
+    ...(secondary.length > 0 ? { secondaryProducts: secondary } : {}),
     tlcImages: Array.isArray(raw.tlcImages)
       ? raw.tlcImages.filter((s): s is string => typeof s === "string")
       : [],
@@ -389,6 +432,32 @@ export async function removeMoleculeImage(experimentId: string): Promise<void> {
     await removeFile(await path.join(await getNmrDir(experimentId), MOLECULE_IMAGE_FILE));
   } catch (err) {
     if (!isNotFound(err)) throw err;
+  }
+}
+
+/**
+ * Windows "os error 32": the file is held open by another process (antivirus, the search indexer,
+ * a preview pane...), usually only for a moment.
+ */
+export const isFileLocked = (e: unknown) =>
+  /os error 32\b|being used by another process|sharing violation/i.test(errorMessage(e));
+
+/**
+ * Remove the files the app keeps in `attachments/[id]/`, one by one, ignoring every failure
+ * (locked files included). The fallback when removing the whole folder was refused.
+ */
+export async function removeAttachmentFilesQuietly(id: string): Promise<void> {
+  if (!isTauri()) {
+    await removeAttachments(id);
+    return;
+  }
+  const dir = await getNmrDir(id);
+  for (const name of [MOLECULE_IMAGE_FILE, NMR_STATE_FILE, SCHEME_CDXML_FILE]) {
+    try {
+      await removeFile(await path.join(dir, name));
+    } catch {
+      // Missing, locked or protected: whatever is left is overwritten in place later.
+    }
   }
 }
 

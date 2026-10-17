@@ -26,6 +26,7 @@ tauri-plugin-log = "2"
 tauri-plugin-fs = "2.6.0"
 tauri-plugin-clipboard-manager = "2.4.2"
 tauri-plugin-dialog = "2.8.3"
+tauri-plugin-shell = "2.5.0"
 
 # Windows-only: reads ChemDraw's custom clipboard formats (see `read_chemdraw_clipboard`).
 [target.'cfg(windows)'.dependencies]

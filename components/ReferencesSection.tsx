@@ -39,20 +39,22 @@ export default function ReferencesSection({ references, onAdd, onRemove }: Props
   }
 
   return (
-    <section className="print:break-inside-avoid">
-      <h2 className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
+    <section
+      className={`print:break-inside-avoid ${references.length === 0 ? "print:hidden" : ""}`}
+    >
+      <h2 className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-zinc-500 print:mb-1">
         References
       </h2>
 
       {references.length === 0 ? (
         <p className="mb-3 text-sm text-zinc-400 print:hidden">No references yet.</p>
       ) : (
-        <ol className="mb-3 space-y-1.5">
+        <ol className="mb-3 space-y-1.5 print:mb-0 print:space-y-0.5">
           {references.map((ref, i) => {
             const href = referenceHref(ref);
             const doiText = cleanDoi(ref.doi);
             return (
-              <li key={ref.id} className="group flex items-start gap-2 text-sm text-zinc-800">
+              <li key={ref.id} className="group flex items-start gap-2 text-sm text-zinc-800 print:text-[11px]">
                 <span className="w-6 shrink-0 pt-px text-right font-mono text-xs text-zinc-400">
                   [{i + 1}]
                 </span>

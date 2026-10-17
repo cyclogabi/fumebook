@@ -79,9 +79,9 @@ export default function ExperimentEditor({
 
       {/* A4 sheet */}
       <article className="min-h-[297mm] rounded-sm border border-zinc-200 bg-white px-8 py-10 shadow-md sm:px-14 sm:py-14 print:min-h-0 print:rounded-none print:border-0 print:p-0 print:shadow-none">
-        <header className="mb-8 border-b border-zinc-300 pb-4 print:mb-5 print:pb-3">
-          <div className="mb-2 flex items-baseline justify-between text-xs text-zinc-500">
-            <span className="font-mono text-sm font-semibold tracking-wide text-zinc-900">
+        <header className="mb-8 border-b border-zinc-300 pb-4 print:mb-2.5 print:pb-1.5">
+          <div className="mb-2 flex items-baseline justify-between text-xs text-zinc-500 print:mb-0.5">
+            <span className="font-mono text-sm font-semibold tracking-wide text-zinc-900 print:text-xs">
               {experiment.id}
             </span>
             <span>{formatDate(experiment.dateCreated)}</span>
@@ -94,12 +94,12 @@ export default function ExperimentEditor({
             aria-label="Experiment title"
             className="-mx-2 w-[calc(100%+1rem)] rounded-md border border-transparent bg-transparent px-2 py-1 text-2xl font-semibold tracking-tight text-zinc-900 placeholder:text-zinc-300 hover:border-zinc-200 focus:border-fume-500 focus:outline-none print:hidden"
           />
-          <h1 className="hidden break-words text-xl font-semibold tracking-tight print:block">
+          <h1 className="hidden break-words text-base font-semibold leading-tight tracking-tight print:block">
             {experiment.title || "Untitled experiment"}
           </h1>
         </header>
 
-        <div className="space-y-8 print:space-y-5">
+        <div className="flex flex-col gap-6 print:gap-2">
           <MoleculeSection
             ref={moleculeRef}
             experimentId={experiment.id}
@@ -112,8 +112,8 @@ export default function ExperimentEditor({
             onOpenLibrary={onOpenLibrary}
           />
 
-          <section>
-            <h2 className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
+          <section className="print:break-inside-avoid">
+            <h2 className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-zinc-500 print:mb-1">
               Reagents &amp; stoichiometry
             </h2>
             <ReagentTable
@@ -130,36 +130,48 @@ export default function ExperimentEditor({
             />
           </section>
 
-          <RichTextarea
-            label="Procedure"
-            value={experiment.procedureText}
-            onChange={(procedureText) => onUpdate({ procedureText })}
-            placeholder="Describe the experimental procedure: setup, addition order, temperature, time…"
-            minRows={6}
-          />
-          <RichTextarea
-            label="Purification"
-            value={experiment.purificationText}
-            onChange={(purificationText) => onUpdate({ purificationText })}
-            placeholder="Work-up and purification: extraction, column conditions, yield…"
-            minRows={3}
-          />
+          <div className={!experiment.procedureText?.trim() ? "print:hidden" : ""}>
+            <RichTextarea
+              label="Procedure"
+              value={experiment.procedureText}
+              onChange={(procedureText) => onUpdate({ procedureText })}
+              placeholder="Describe the experimental procedure: setup, addition order, temperature, time…"
+              minRows={6}
+            />
+          </div>
 
-          <TlcDropzone
-            images={experiment.tlcImages}
-            onAdd={(added) =>
-              onUpdate((exp) => ({ tlcImages: [...exp.tlcImages, ...added] }))
-            }
-            onRemove={(index) =>
-              onUpdate((exp) => ({ tlcImages: exp.tlcImages.filter((_, i) => i !== index) }))
-            }
-          />
+          <div className={!experiment.purificationText?.trim() ? "print:hidden" : ""}>
+            <RichTextarea
+              label="Purification"
+              value={experiment.purificationText}
+              onChange={(purificationText) => onUpdate({ purificationText })}
+              placeholder="Work-up and purification: extraction, column conditions, yield…"
+              minRows={3}
+            />
+          </div>
+
+          <div className={experiment.tlcImages.length === 0 ? "print:hidden" : ""}>
+            <TlcDropzone
+              images={experiment.tlcImages}
+              onAdd={(added) =>
+                onUpdate((exp) => ({ tlcImages: [...exp.tlcImages, ...added] }))
+              }
+              onRemove={(index) =>
+                onUpdate((exp) => ({ tlcImages: exp.tlcImages.filter((_, i) => i !== index) }))
+              }
+            />
+          </div>
 
           <ProductYieldCard
+            experimentId={experiment.id}
             product={experiment.product}
             rows={experiment.reagents}
             onChange={(patch) =>
               onUpdate((exp) => ({ product: { ...exp.product, ...patch } }))
+            }
+            secondaryProducts={experiment.secondaryProducts}
+            onSecondaryChange={(fn) =>
+              onUpdate((exp) => ({ secondaryProducts: fn(exp.secondaryProducts ?? []) }))
             }
           />
           <div className="print:hidden">
@@ -172,23 +184,27 @@ export default function ExperimentEditor({
             </button>
           </div>
 
-          <RichTextarea
-            label="Comments"
-            value={experiment.commentsText}
-            onChange={(commentsText) => onUpdate({ commentsText })}
-            placeholder="Observations, deviations, ideas for next time…"
-            minRows={2}
-          />
+          <div className={!experiment.commentsText?.trim() ? "print:hidden" : ""}>
+            <RichTextarea
+              label="Comments"
+              value={experiment.commentsText}
+              onChange={(commentsText) => onUpdate({ commentsText })}
+              placeholder="Observations, deviations, ideas for next time…"
+              minRows={2}
+            />
+          </div>
 
-          <ReferencesSection
-            references={experiment.references}
-            onAdd={(reference) =>
-              onUpdate((exp) => ({ references: [...exp.references, reference] }))
-            }
-            onRemove={(id) =>
-              onUpdate((exp) => ({ references: exp.references.filter((r) => r.id !== id) }))
-            }
-          />
+          <div className={experiment.references.length === 0 ? "print:hidden" : ""}>
+            <ReferencesSection
+              references={experiment.references}
+              onAdd={(reference) =>
+                onUpdate((exp) => ({ references: [...exp.references, reference] }))
+              }
+              onRemove={(id) =>
+                onUpdate((exp) => ({ references: exp.references.filter((r) => r.id !== id) }))
+              }
+            />
+          </div>
         </div>
       </article>
     </div>
