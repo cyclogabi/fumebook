@@ -21,6 +21,8 @@ interface Props {
   onChange: (value: string) => void;
   placeholder?: string;
   minRows?: number;
+  /** Optional extra controls rendered on the right of the header (screen only). */
+  headerExtra?: React.ReactNode;
 }
 
 /**
@@ -35,6 +37,7 @@ export default function RichTextarea({
   onChange,
   placeholder,
   minRows = 4,
+  headerExtra,
 }: Props) {
   const ref = useRef<HTMLTextAreaElement>(null);
 
@@ -95,26 +98,29 @@ export default function RichTextarea({
 
   return (
     <section className={`group ${isEmpty ? "print:hidden" : ""}`}>
-      <div className="mb-1.5 flex items-center justify-between gap-2 print:mb-0.5">
+      <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2 print:mb-0.5">
         <h3 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
           {label}
         </h3>
-        <div
-          className="flex items-center gap-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-focus-within:opacity-100 print:hidden"
-          onMouseDown={(e) => e.preventDefault()} // keep the caret/selection in the textarea
-        >
-          <ToolButton title="Subscript (selection or previous character)" onClick={() => transform(SUBSCRIPT)}>
-            x<sub>2</sub>
-          </ToolButton>
-          <ToolButton title="Superscript (selection or previous character)" onClick={() => transform(SUPERSCRIPT)}>
-            x<sup>2</sup>
-          </ToolButton>
-          <span className="mx-1 h-3 w-px bg-zinc-200" />
-          {SYMBOLS.map((s) => (
-            <ToolButton key={s} title={`Insert ${s}`} onClick={() => insertSymbol(s)}>
-              {s}
+        <div className="flex flex-wrap items-center gap-2 print:hidden">
+          <div
+            className="flex items-center gap-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-focus-within:opacity-100"
+            onMouseDown={(e) => e.preventDefault()} // keep the caret/selection in the textarea
+          >
+            <ToolButton title="Subscript (selection or previous character)" onClick={() => transform(SUBSCRIPT)}>
+              x<sub>2</sub>
             </ToolButton>
-          ))}
+            <ToolButton title="Superscript (selection or previous character)" onClick={() => transform(SUPERSCRIPT)}>
+              x<sup>2</sup>
+            </ToolButton>
+            <span className="mx-1 h-3 w-px bg-zinc-200" />
+            {SYMBOLS.map((s) => (
+              <ToolButton key={s} title={`Insert ${s}`} onClick={() => insertSymbol(s)}>
+                {s}
+              </ToolButton>
+            ))}
+          </div>
+          {headerExtra}
         </div>
       </div>
 

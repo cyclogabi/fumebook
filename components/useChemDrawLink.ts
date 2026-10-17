@@ -2,7 +2,15 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { loadSchemeCdxml, saveSchemeCdxml, schemeCdxmlModified } from "@/lib/storage";
+import {
+  isFileLocked,
+  loadSchemeCdxml,
+  saveSchemeCdxml,
+  schemeCdxmlModified,
+  schemeCdxmlPath,
+  type CdxmlSlot,
+  type SchemeCdxmlFile,
+} from "@/lib/storage";
 import { isTauri } from "@/lib/tauri";
 
 /**
@@ -41,11 +49,13 @@ export const BLANK_CDXML = `<?xml version="1.0" encoding="UTF-8" ?>
 
 /** Whether a CDXML document has anything on its page (a blank one is how ChemDraw shows "cleared"). */
 export function hasCdxmlContent(cdxml: string): boolean {
-  return /<(fragment|arrow|t|graphic|bioshape|curve|embeddedobject)[\s>/]/.test(cdxml);
+  return /<(fragment|arrow|t|graphic|bioshape|curve|embeddedobject|n|b)[\s>/]/i.test(cdxml);
 }
 
 interface Options {
   experimentId: string;
+  /** Which file inside `attachments/[id]/` to sync (`scheme.cdxml`, `reactant.cdxml`, or `product.cdxml`). */
+  slot?: CdxmlSlot;
   /** The drawing as CDXML, or "" when the canvas is blank. */
   getCdxml: () => Promise<string>;
   /** Replace the drawing with this CDXML (a blank document clears the canvas). */
@@ -63,44 +73,110 @@ const messageOf = (e: unknown) => (e instanceof Error ? e.message : String(e));
  *
  * Only on the desktop app; `supported` is false in a plain browser.
  */
-export function useChemDrawLink({ experimentId, getCdxml, loadCdxml, onNotice, onError }: Options) {
+export function useChemDrawLink({
+  experimentId,
+  slot = "scheme",
+  getCdxml,
+  loadCdxml,
+  onNotice,
+  onError,
+}: Options) {
   const supported = isTauri();
   const [busy, setBusy] = useState<"open" | "reload" | null>(null);
+  const currentKey = `${experimentId}:${slot}`;
+  const [watchingKey, setWatchingKey] = useState<string | null>(null);
+  const [justUpdatedKey, setJustUpdatedKey] = useState<string | null>(null);
+  const watching = watchingKey === currentKey;
+  const justUpdated = justUpdatedKey === currentKey;
+  const updatedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   /** Modification time of scheme.cdxml the last time we wrote it or read it; null = not yet this session. */
   const syncedMs = useRef<number | null>(null);
-  /** Set once ChemDraw has been opened from here: only then does regaining focus check the file. */
+  /** Last CDXML text synced with the sketcher/zone, to avoid redundant reloads. */
+  const lastText = useRef<string | null>(null);
+  /** Set once ChemDraw has been opened from here: only then does regaining focus / polling check the file. */
   const linked = useRef(false);
   const working = useRef(false);
 
-  const latest = useRef({ experimentId, getCdxml, loadCdxml, onNotice, onError });
+  const latest = useRef({ experimentId, slot, getCdxml, loadCdxml, onNotice, onError });
   useEffect(() => {
-    latest.current = { experimentId, getCdxml, loadCdxml, onNotice, onError };
+    latest.current = { experimentId, slot, getCdxml, loadCdxml, onNotice, onError };
   });
+
+  useEffect(() => {
+    linked.current = false;
+    syncedMs.current = null;
+    lastText.current = null;
+    return () => {
+      if (updatedTimerRef.current) {
+        clearTimeout(updatedTimerRef.current);
+        updatedTimerRef.current = null;
+      }
+    };
+  }, [experimentId, slot]);
+
+  const stopWatching = useCallback(() => {
+    linked.current = false;
+    setWatchingKey(null);
+    setJustUpdatedKey(null);
+    if (updatedTimerRef.current) {
+      clearTimeout(updatedTimerRef.current);
+      updatedTimerRef.current = null;
+    }
+  }, []);
 
   /** Read scheme.cdxml into the sketcher. Returns false if there was nothing (valid) to load. */
   const pull = useCallback(async (manual: boolean): Promise<boolean> => {
-    const { experimentId: id, loadCdxml: load, onNotice: notice, onError: fail } = latest.current;
+    const {
+      experimentId: id,
+      slot: s,
+      loadCdxml: load,
+      onNotice: notice,
+      onError: fail,
+    } = latest.current;
     try {
-      const file = await loadSchemeCdxml(id);
+      const file = await loadSchemeCdxml(id, s);
       if (!file) {
-        if (manual) notice("There is no ChemDraw file for this experiment yet. Click “Open in ChemDraw” first.");
+        if (manual) {
+          notice("There is no ChemDraw file for this experiment yet. Click “Open in ChemDraw” first.");
+        }
         return false;
       }
-      // Remember the version we are reading, so a failure below is not retried on every focus.
-      syncedMs.current = file.modifiedMs;
-      if (!/<CDXML[\s>]/.test(file.text)) {
+      if (!/<CDXML[\s>]/i.test(file.text)) {
+        syncedMs.current = file.modifiedMs;
         fail(`${file.path} is not a CDXML document, so the drawing was left as it is.`);
         return false;
       }
+      syncedMs.current = file.modifiedMs;
+      const changed = lastText.current === null || lastText.current.trim() !== file.text.trim();
+      lastText.current = file.text;
+      if (!changed && !manual) {
+        return true;
+      }
       await load(file.text);
+
+      // Automatically stop watching once the updated structure has been loaded, and show a 2-second confirmation pill.
+      linked.current = false;
+      setWatchingKey(null);
+      setJustUpdatedKey(`${id}:${s}`);
+      if (updatedTimerRef.current) clearTimeout(updatedTimerRef.current);
+      updatedTimerRef.current = setTimeout(() => {
+        setJustUpdatedKey(null);
+        updatedTimerRef.current = null;
+      }, 2000);
+
       notice(
         manual
           ? "Reloaded the drawing from ChemDraw."
-          : "The drawing was updated from ChemDraw (the saved scheme.cdxml).",
+          : `Updated ${s} structure and MW from ChemDraw ✓`,
       );
       return true;
     } catch (err) {
+      // If ChemDraw is still flushing the file during an automatic background poll,
+      // stay quiet and let the next poll tick retry without advancing syncedMs.
+      if (!manual && isFileLocked(err)) {
+        return false;
+      }
       fail(`Could not read the drawing from ChemDraw: ${messageOf(err)}`);
       return false;
     }
@@ -122,35 +198,81 @@ export function useChemDrawLink({ experimentId, getCdxml, loadCdxml, onNotice, o
     if (working.current) return;
     working.current = true;
     setBusy("open");
-    const { experimentId: id, getCdxml: read, onNotice: notice, onError: fail } = latest.current;
+    const {
+      experimentId: id,
+      slot: s,
+      getCdxml: read,
+      onNotice: notice,
+      onError: fail,
+    } = latest.current;
     try {
       let target: string;
 
-      // ChemDraw edits that were saved but not brought in yet win: never overwrite them.
-      const modified = await schemeCdxmlModified(id);
-      const unsynced = modified !== null && syncedMs.current !== null && modified > syncedMs.current;
-      const existing = modified === null ? null : await loadSchemeCdxml(id);
+      let modified: number | null = null;
+      try {
+        modified = await schemeCdxmlModified(id, s);
+      } catch (err) {
+        if (!isFileLocked(err)) throw err;
+      }
 
-      if (unsynced && existing) {
+      let existing: SchemeCdxmlFile | null = null;
+      let existingLockedByChemDraw = false;
+      if (modified !== null) {
+        try {
+          existing = await loadSchemeCdxml(id, s);
+        } catch (err) {
+          if (isFileLocked(err)) {
+            existingLockedByChemDraw = true;
+          } else {
+            throw err;
+          }
+        }
+      }
+
+      const unsynced =
+        modified !== null && syncedMs.current !== null && modified > syncedMs.current;
+
+      if (existingLockedByChemDraw) {
+        // The file is already open and locked in ChemDraw: reuse its path without overwriting.
+        target = await schemeCdxmlPath(id, s);
+        if (modified !== null) syncedMs.current = modified;
+      } else if (unsynced && existing) {
         await pull(false);
         target = existing.path;
       } else {
         const drawn = await read();
-        if (drawn.trim() === "" && existing) {
-          // Nothing drawn here: reopen what ChemDraw saved last time, untouched.
+        const desiredXml = drawn.trim() === "" ? BLANK_CDXML : drawn;
+
+        if (existing && (drawn.trim() === "" || existing.text.trim() === desiredXml.trim())) {
+          // File on disk already has the structure (or we have nothing new to overwrite it with):
+          // avoid touching the file so an already-open ChemDraw window never hits os error 32.
           target = existing.path;
           syncedMs.current = existing.modifiedMs;
+          lastText.current = existing.text;
         } else {
-          const saved = await saveSchemeCdxml(id, drawn.trim() === "" ? BLANK_CDXML : drawn);
-          target = saved.path;
-          syncedMs.current = saved.modifiedMs;
+          try {
+            const saved = await saveSchemeCdxml(id, desiredXml, s);
+            target = saved.path;
+            syncedMs.current = saved.modifiedMs;
+            lastText.current = desiredXml;
+          } catch (err) {
+            if (isFileLocked(err) && (existing || modified !== null)) {
+              // ChemDraw currently holds an open handle on this file; focus/reopen the existing file.
+              target = existing ? existing.path : await schemeCdxmlPath(id, s);
+              syncedMs.current = existing ? existing.modifiedMs : modified;
+            } else {
+              throw err;
+            }
+          }
         }
       }
 
       await invoke("open_in_chemdraw", { path: target });
       linked.current = true;
+      setJustUpdatedKey(null);
+      setWatchingKey(`${id}:${s}`);
       notice(
-        `Opened ${target} in ChemDraw. Edit, press Ctrl+S, then come back: the drawing updates here by itself (or use “Reload from ChemDraw”).`,
+        `Opened ${target} in ChemDraw. Edit and press Ctrl+S — the structure and MW update automatically.`,
       );
     } catch (err) {
       fail(`Could not open ChemDraw: ${messageOf(err)}`);
@@ -160,16 +282,22 @@ export function useChemDrawLink({ experimentId, getCdxml, loadCdxml, onNotice, o
     }
   }, [pull]);
 
-  // Back in Fumebook after ChemDraw saved: pick the change up.
+  // Live file watcher: check on focus, visibilitychange, and every 750ms while watching is active.
   useEffect(() => {
     if (!supported) return;
     let checking = false;
     const check = async () => {
-      if (!linked.current || working.current || checking || document.visibilityState === "hidden") return;
+      if (!linked.current || working.current || checking) return;
       checking = true;
       try {
-        const modified = await schemeCdxmlModified(latest.current.experimentId);
-        if (modified !== null && syncedMs.current !== null && modified > syncedMs.current) {
+        const modified = await schemeCdxmlModified(
+          latest.current.experimentId,
+          latest.current.slot,
+        );
+        if (
+          modified !== null &&
+          (syncedMs.current === null || modified > syncedMs.current)
+        ) {
           working.current = true;
           setBusy("reload");
           try {
@@ -180,18 +308,22 @@ export function useChemDrawLink({ experimentId, getCdxml, loadCdxml, onNotice, o
           }
         }
       } catch (err) {
-        console.warn("Checking scheme.cdxml failed:", err);
+        if (!isFileLocked(err)) {
+          console.warn("Checking scheme.cdxml failed:", err);
+        }
       } finally {
         checking = false;
       }
     };
     window.addEventListener("focus", check);
     document.addEventListener("visibilitychange", check);
+    const interval = watching ? window.setInterval(() => void check(), 750) : null;
     return () => {
       window.removeEventListener("focus", check);
       document.removeEventListener("visibilitychange", check);
+      if (interval !== null) window.clearInterval(interval);
     };
-  }, [supported, pull]);
+  }, [supported, watching, pull]);
 
-  return { supported, busy, open, reload };
+  return { supported, busy, watching, justUpdated, open, reload, stopWatching };
 }

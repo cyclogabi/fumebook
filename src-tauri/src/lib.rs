@@ -122,34 +122,52 @@ mod chemdraw {
     }
 
     /// The best structure among `(format name, bytes)` clipboard blocks, in this order:
-    /// 1. the `SMILES` format (any letter case);
-    /// 2. CDXML from any block;
-    /// 3. a Molfile from a block named like one (MDLCT, mol, ctab) or holding an `M  END` line.
+    /// 1. CDXML from any block (preserves 2D/3D perspective coordinates, `<colortable>`, and `<curve>` splines);
+    /// 2. a Molfile from a block named like one (MDLCT, mol, ctab) or holding an `M  END` line
+    ///    (preserves 2D/3D perspective coordinates and wedge/hash bond stereochemistry);
+    /// 3. the `SMILES` format (any letter case) as a 1D fallback when neither CDXML nor Molfile is present.
     ///
     /// Molfiles are fixed-layout (title, program and comment lines, then the counts line as line 4,
     /// with leading spaces that matter), so their text is never trimmed at the start.
     pub fn pick_structure(blocks: &[(String, Vec<u8>)]) -> Option<String> {
-        let smiles = blocks
-            .iter()
-            .filter(|(name, _)| name.eq_ignore_ascii_case("smiles"))
-            .find_map(|(_, bytes)| decode_smiles(bytes));
-        if let Some(smiles) = smiles {
-            println!("[ChemDraw Clipboard] Found SMILES format: {smiles}");
-            return Some(smiles);
-        }
-        if let Some(cdxml) = blocks.iter().find_map(|(_, bytes)| extract_cdxml(bytes)) {
+        if let Some(cdxml) = pick_cdxml(blocks) {
             println!("[ChemDraw Clipboard] Found CDXML ({} characters)", cdxml.len());
             return Some(cdxml);
         }
+        if let Some(molfile) = pick_molfile(blocks) {
+            let head: Vec<&str> = molfile.lines().take(4).collect();
+            println!("[ChemDraw Clipboard] Found Molfile, first 4 lines: {head:?}");
+            return Some(molfile);
+        }
+        if let Some(smiles) = pick_smiles(blocks) {
+            println!("[ChemDraw Clipboard] Found SMILES format: {smiles}");
+            return Some(smiles);
+        }
+        None
+    }
+
+    pub fn pick_cdxml(blocks: &[(String, Vec<u8>)]) -> Option<String> {
+        blocks.iter().find_map(|(_, bytes)| extract_cdxml(bytes))
+    }
+
+    pub fn pick_molfile(blocks: &[(String, Vec<u8>)]) -> Option<String> {
         blocks.iter().find_map(|(name, bytes)| {
             let name = name.to_ascii_lowercase();
             let molfile_like = ["mdlct", "mol", "ctab"].iter().any(|key| name.contains(key))
                 || find_bytes(bytes, b"M  END").is_some();
-            let molfile = if molfile_like { parse_mdlct(bytes) } else { None }?;
-            let head: Vec<&str> = molfile.lines().take(4).collect();
-            println!("[ChemDraw Clipboard] Found Molfile, first 4 lines: {head:?}");
-            Some(molfile)
+            if molfile_like {
+                parse_mdlct(bytes)
+            } else {
+                None
+            }
         })
+    }
+
+    pub fn pick_smiles(blocks: &[(String, Vec<u8>)]) -> Option<String> {
+        blocks
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("smiles"))
+            .find_map(|(_, bytes)| decode_smiles(bytes))
     }
 
     /// Walk every format on the clipboard (logging each, so `tauri dev` shows what ChemDraw
@@ -180,6 +198,227 @@ mod chemdraw {
             }
         }
         pick_structure(&blocks)
+    }
+
+    /// If `CF_ENHMETAFILE` (`format = 14`, placed on the Windows clipboard by ChemDraw on `Ctrl+C`)
+    /// is available, replay it via Win32 GDI `PlayEnhMetaFile` onto a white 32-bit DIB and return
+    /// `(width, height, rgba_bytes)`.
+    #[cfg(windows)]
+    pub fn render_clipboard_emf_to_rgba() -> Option<(u32, u32, Vec<u8>)> {
+        use clipboard_win::Clipboard;
+        use core::ffi::c_void;
+        use core::ptr::null_mut;
+
+        const CF_ENHMETAFILE: u32 = 14;
+        const DIB_RGB_COLORS: u32 = 0;
+
+        #[repr(C)]
+        #[derive(Clone, Copy, Default)]
+        struct RECT {
+            left: i32,
+            top: i32,
+            right: i32,
+            bottom: i32,
+        }
+
+        #[repr(C)]
+        #[derive(Clone, Copy, Default)]
+        struct SIZEL {
+            cx: i32,
+            cy: i32,
+        }
+
+        #[repr(C)]
+        #[derive(Clone, Copy, Default)]
+        struct ENHMETAHEADER {
+            i_type: u32,
+            n_size: u32,
+            rcl_bounds: RECT,
+            rcl_frame: RECT,
+            d_signature: u32,
+            n_version: u32,
+            n_bytes: u32,
+            n_records: u32,
+            n_handles: u16,
+            s_reserved: u16,
+            n_description: u32,
+            off_description: u32,
+            n_pal_entries: u32,
+            szl_device: SIZEL,
+            szl_millimeters: SIZEL,
+            cb_pixel_format: u32,
+            off_pixel_format: u32,
+            b_open_gl: u32,
+            szl_micrometers: SIZEL,
+        }
+
+        #[repr(C)]
+        #[derive(Clone, Copy, Default)]
+        struct BITMAPINFOHEADER {
+            bi_size: u32,
+            bi_width: i32,
+            bi_height: i32,
+            bi_planes: u16,
+            bi_bit_count: u16,
+            bi_compression: u32,
+            bi_size_image: u32,
+            bi_x_pels_per_meter: i32,
+            bi_y_pels_per_meter: i32,
+            bi_clr_used: u32,
+            bi_clr_important: u32,
+        }
+
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetClipboardData(u_format: u32) -> *mut c_void;
+        }
+
+        #[link(name = "gdi32")]
+        unsafe extern "system" {
+            fn GetEnhMetaFileHeader(
+                hemf: *mut c_void,
+                n_size: u32,
+                lp_enh_meta_header: *mut ENHMETAHEADER,
+            ) -> u32;
+            fn CreateCompatibleDC(hdc: *mut c_void) -> *mut c_void;
+            fn DeleteDC(hdc: *mut c_void) -> i32;
+            fn CreateDIBSection(
+                hdc: *mut c_void,
+                pbmi: *const BITMAPINFOHEADER,
+                usage: u32,
+                ppv_bits: *mut *mut u8,
+                h_section: *mut c_void,
+                offset: u32,
+            ) -> *mut c_void;
+            fn SelectObject(hdc: *mut c_void, h: *mut c_void) -> *mut c_void;
+            fn DeleteObject(ho: *mut c_void) -> i32;
+            fn PlayEnhMetaFile(hdc: *mut c_void, hemf: *mut c_void, lprect: *const RECT) -> i32;
+            fn GdiFlush() -> i32;
+        }
+
+        let _clip = Clipboard::new_attempts(10).ok()?;
+
+        unsafe {
+            let hemf = GetClipboardData(CF_ENHMETAFILE);
+            if hemf.is_null() {
+                return None;
+            }
+
+            let mut hdr = ENHMETAHEADER::default();
+            let got = GetEnhMetaFileHeader(
+                hemf,
+                core::mem::size_of::<ENHMETAHEADER>() as u32,
+                &mut hdr,
+            );
+            if got == 0 {
+                return None;
+            }
+
+            let frame_w = (hdr.rcl_frame.right - hdr.rcl_frame.left).max(0) as f64;
+            let frame_h = (hdr.rcl_frame.bottom - hdr.rcl_frame.top).max(0) as f64;
+            let bounds_w = (hdr.rcl_bounds.right - hdr.rcl_bounds.left).max(0) as f64;
+            let bounds_h = (hdr.rcl_bounds.bottom - hdr.rcl_bounds.top).max(0) as f64;
+
+            // rcl_frame is in 0.01 mm units (2540 units = 1 inch). Render at 300 DPI.
+            let (raw_w, raw_h) = if frame_w > 10.0 && frame_h > 10.0 {
+                (frame_w * 300.0 / 2540.0, frame_h * 300.0 / 2540.0)
+            } else if bounds_w > 1.0 && bounds_h > 1.0 {
+                (bounds_w * 3.0, bounds_h * 3.0)
+            } else {
+                return None;
+            };
+
+            let max_edge = raw_w.max(raw_h).max(1.0);
+            let scale = if max_edge > 2200.0 {
+                2200.0 / max_edge
+            } else if max_edge < 600.0 {
+                (900.0 / max_edge).min(4.0)
+            } else {
+                1.0
+            };
+
+            let draw_w = (raw_w * scale).round().clamp(64.0, 2400.0) as i32;
+            let draw_h = (raw_h * scale).round().clamp(64.0, 2400.0) as i32;
+            let pad = 24i32;
+            let canvas_w = draw_w + pad * 2;
+            let canvas_h = draw_h + pad * 2;
+
+            let hdc = CreateCompatibleDC(null_mut());
+            if hdc.is_null() {
+                return None;
+            }
+
+            let bmi = BITMAPINFOHEADER {
+                bi_size: core::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                bi_width: canvas_w,
+                bi_height: -canvas_h, // top-down DIB
+                bi_planes: 1,
+                bi_bit_count: 32,
+                bi_compression: 0,
+                bi_size_image: (canvas_w * canvas_h * 4) as u32,
+                bi_x_pels_per_meter: 11811,
+                bi_y_pels_per_meter: 11811,
+                bi_clr_used: 0,
+                bi_clr_important: 0,
+            };
+
+            let mut bits_ptr: *mut u8 = null_mut();
+            let hbmp = CreateDIBSection(
+                hdc,
+                &bmi,
+                DIB_RGB_COLORS,
+                &mut bits_ptr,
+                null_mut(),
+                0,
+            );
+            if hbmp.is_null() || bits_ptr.is_null() {
+                DeleteDC(hdc);
+                return None;
+            }
+
+            let old_obj = SelectObject(hdc, hbmp);
+            let total_bytes = (canvas_w as usize) * (canvas_h as usize) * 4;
+            core::slice::from_raw_parts_mut(bits_ptr, total_bytes).fill(0xFF);
+
+            let target_rect = RECT {
+                left: pad,
+                top: pad,
+                right: pad + draw_w,
+                bottom: pad + draw_h,
+            };
+            let played = PlayEnhMetaFile(hdc, hemf, &target_rect);
+            GdiFlush();
+
+            let out = if played != 0 {
+                let bgra = core::slice::from_raw_parts(bits_ptr, total_bytes);
+                let mut rgba = Vec::with_capacity(total_bytes);
+                let mut has_non_white = false;
+                for px in bgra.chunks_exact(4) {
+                    let b = px[0];
+                    let g = px[1];
+                    let r = px[2];
+                    if r < 252 || g < 252 || b < 252 {
+                        has_non_white = true;
+                    }
+                    rgba.push(r);
+                    rgba.push(g);
+                    rgba.push(b);
+                    rgba.push(255);
+                }
+                if has_non_white {
+                    Some((canvas_w as u32, canvas_h as u32, rgba))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            SelectObject(hdc, old_obj);
+            DeleteObject(hbmp);
+            DeleteDC(hdc);
+            out
+        }
     }
 
     #[cfg(test)]
@@ -286,17 +525,26 @@ mod chemdraw {
         }
 
         #[test]
-        fn smiles_format_comes_first_whatever_its_letter_case() {
+        fn cdxml_and_molfile_come_before_smiles_to_preserve_3d_coordinates() {
             let mdlct = prefixed(&["", "", "", "  0  0  0  0  0  0  0  0  0  0999 V2000", "M  END"]);
+            // When CDXML, MDLCT, and SMILES are all present, CDXML wins first
             let blocks = [
+                block("Smiles", b"CCO\0"),
                 block("MDLCT", &mdlct),
                 block("CDXML", b"<CDXML><page/></CDXML>"),
-                block("Smiles", b"CCO\0"),
             ];
-            assert_eq!(pick_structure(&blocks).unwrap(), "CCO");
-            // an empty SMILES slot does not hide the structure behind it
-            let blocks = [block("SMILES", b"\0\0"), block("CDXML", b"<CDXML><page/></CDXML>")];
             assert!(pick_structure(&blocks).unwrap().starts_with("<CDXML"));
+
+            // When MDLCT and SMILES are present (like ChemDraw Ctrl+C on cyclodextrins), MDLCT wins over 1D SMILES
+            let blocks_no_cdxml = [
+                block("Smiles", b"CCO\0"),
+                block("MDLCT", &mdlct),
+            ];
+            assert!(pick_structure(&blocks_no_cdxml).unwrap().ends_with("M  END\n"));
+
+            // When only SMILES is present, SMILES is returned
+            let blocks_only_smiles = [block("Smiles", b"CCO\0")];
+            assert_eq!(pick_structure(&blocks_only_smiles).unwrap(), "CCO");
         }
 
         #[test]
@@ -360,13 +608,13 @@ mod chemdraw {
             }
             assert!(read().unwrap().contains("M  END"));
 
-            // ChemDraw's normal Ctrl+C: MDLCT and SMILES side by side; SMILES is what we return.
+            // ChemDraw's normal Ctrl+C: MDLCT and SMILES side by side; MDLCT (with coordinates) wins over 1D SMILES.
             let smiles = raw::register_format("SMILES").unwrap().get();
             {
                 let _clip = Clipboard::new_attempts(10).unwrap();
                 raw::set_without_clear(smiles, b"CCO\0").unwrap();
             }
-            assert_eq!(read().unwrap(), "CCO");
+            assert!(read().unwrap().contains("M  END"));
         }
     }
 }
@@ -387,6 +635,60 @@ fn read_chemdraw_clipboard() -> Option<String> {
     {
         None
     }
+}
+
+#[tauri::command]
+fn read_clipboard_image_base64() -> Result<String, String> {
+    let arboard_rgba: Result<(u32, u32, Vec<u8>), String> = (|| {
+        let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+        let image_data = clipboard.get_image().map_err(|e| e.to_string())?;
+        let width: u32 = image_data
+            .width
+            .try_into()
+            .map_err(|_| "Invalid image width".to_string())?;
+        let height: u32 = image_data
+            .height
+            .try_into()
+            .map_err(|_| "Invalid image height".to_string())?;
+        Ok((width, height, image_data.bytes.into_owned()))
+    })();
+
+    let (width, height, rgba_bytes) = match arboard_rgba {
+        Ok(data) => data,
+        Err(err) => {
+            #[cfg(target_os = "windows")]
+            {
+                if let Some(emf_rgba) = chemdraw::render_clipboard_emf_to_rgba() {
+                    println!(
+                        "[ChemDraw Clipboard] Rendered CF_ENHMETAFILE to {}x{} RGBA PNG",
+                        emf_rgba.0, emf_rgba.1
+                    );
+                    emf_rgba
+                } else {
+                    return Err(err);
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                return Err(err);
+            }
+        }
+    };
+
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    let dynamic_image = image::DynamicImage::ImageRgba8(
+        image::RgbaImage::from_raw(width, height, rgba_bytes)
+            .ok_or("Failed to construct image")?,
+    );
+
+    dynamic_image
+        .write_to(&mut buffer, image::ImageOutputFormat::Png)
+        .map_err(|e| e.to_string())?;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    Ok(format!(
+        "data:image/png;base64,{}",
+        STANDARD.encode(buffer.into_inner())
+    ))
 }
 
 /// Why `path` may not be handed to the system opener, or `None` if it is fine.
@@ -412,6 +714,23 @@ fn cdxml_path_problem(path: &str) -> Option<String> {
     None
 }
 
+/// Wait briefly (up to 3 retries: 50ms, 100ms, 200ms) if the `.cdxml` file is still being
+/// flushed or scanned by Windows Defender right after writing, ensuring all handles in our
+/// process are closed before handing the path to `cmd /C start`.
+fn wait_for_cdxml_unlocked(path: &str) {
+    let delays_ms = [50_u64, 100, 200];
+    for delay in delays_ms {
+        let can_open = {
+            // File handle is scoped to this block and dropped immediately.
+            std::fs::OpenOptions::new().read(true).open(path).is_ok()
+        };
+        if can_open {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(delay));
+    }
+}
+
 /// Open a `.cdxml` file in the user's default application for it (ChemDraw, when installed).
 /// On Windows this is `cmd /C start "" "<path>"`. Like `read_chemdraw_clipboard`, this app command
 /// needs no capability entry.
@@ -421,9 +740,12 @@ fn open_in_chemdraw(path: String) -> Result<(), String> {
         return Err(problem);
     }
 
+    wait_for_cdxml_unlocked(&path);
+
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
+        use std::process::Stdio;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         // `raw_arg` so the path is quoted exactly once, by us: paths with `&` or spaces stay
         // one argument for `start`. The empty "" is `start`'s window-title slot.
@@ -431,6 +753,9 @@ fn open_in_chemdraw(path: String) -> Result<(), String> {
             .args(["/C", "start", ""])
             .raw_arg(format!("\"{path}\""))
             .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .map(|_| ())
             .map_err(|e| format!("Could not start the default app for .cdxml files: {e}"))
@@ -476,7 +801,11 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
-        .invoke_handler(tauri::generate_handler![read_chemdraw_clipboard, open_in_chemdraw])
+        .invoke_handler(tauri::generate_handler![
+            read_chemdraw_clipboard,
+            read_clipboard_image_base64,
+            open_in_chemdraw
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -54,7 +54,7 @@ export default function TlcDropzone({ images, onAdd, onRemove }: Props) {
   return (
     <section className={images.length === 0 ? "print:hidden" : ""}>
       <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-zinc-500 print:mb-1">
-        TLC
+        TLC (Reaction Monitoring)
       </h3>
 
       <div

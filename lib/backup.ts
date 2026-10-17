@@ -252,6 +252,9 @@ export function experimentProblem(raw: unknown): string | null {
     }
   }
 
+  const numberOrText = (v: unknown) =>
+    v === undefined || v === null || isStr(v) || (typeof v === "number" && Number.isFinite(v));
+
   if (raw.product !== undefined) {
     const p = raw.product;
     if (!isObj(p)) return "product must be an object";
@@ -260,13 +263,14 @@ export function experimentProblem(raw: unknown): string | null {
     if (p.massUnit !== undefined && !PRODUCT_MASS_UNITS.includes(p.massUnit as never)) {
       return "unknown product mass unit";
     }
+    if (!numberOrText(p.stoichRatio)) return "product stoichRatio must be numeric";
+    if (!numberOrText(p.elutionStartCv) || !numberOrText(p.elutionEndCv)) {
+      return "product elution CV window must be numeric";
+    }
   }
 
   if (raw.secondaryProducts !== undefined) {
     if (!Array.isArray(raw.secondaryProducts)) return "secondaryProducts must be a list";
-    // Numbers may be text ("180.2") or empty; anything else is rejected.
-    const numberOrText = (v: unknown) =>
-      v === undefined || v === null || isStr(v) || (typeof v === "number" && Number.isFinite(v));
     for (const [i, p] of raw.secondaryProducts.entries()) {
       const n = `secondary product ${i + 1}`;
       if (!isObj(p)) return `${n} is not an object`;
@@ -277,6 +281,74 @@ export function experimentProblem(raw: unknown): string | null {
       }
       if (p.stoichRatio !== undefined && p.stoichRatio !== null && !numberOrText(p.stoichRatio)) {
         return `${n}: stoichRatio must be a number`;
+      }
+      if (!numberOrText(p.elutionStartCv) || !numberOrText(p.elutionEndCv)) {
+        return `${n}: elution CV window must be numeric`;
+      }
+    }
+  }
+
+  if (raw.purificationGradient !== undefined && raw.purificationGradient !== null) {
+    const g = raw.purificationGradient;
+    if (!isObj(g)) return "purificationGradient must be an object";
+    if (g.enabled !== undefined && typeof g.enabled !== "boolean") {
+      return "purificationGradient.enabled must be true or false";
+    }
+    if (!optStr(g.columnSize) || !optStr(g.solventA) || !optStr(g.solventB)) {
+      return "purificationGradient text fields must be strings";
+    }
+    if (!optNum(g.equilibrationCv)) {
+      return "purificationGradient.equilibrationCv must be a number";
+    }
+    if (g.points !== undefined) {
+      if (!Array.isArray(g.points)) return "purificationGradient.points must be a list";
+      for (const [i, pt] of g.points.entries()) {
+        if (!isObj(pt)) return `gradient point ${i + 1} is not an object`;
+        if (!optStr(pt.id)) return `gradient point ${i + 1} has an invalid id`;
+        if (!optNum(pt.cv) || !optNum(pt.percentB)) {
+          return `gradient point ${i + 1}: cv and percentB must be numbers`;
+        }
+      }
+    }
+    if (g.productWindow !== undefined && g.productWindow !== null) {
+      if (!isObj(g.productWindow)) return "purificationGradient.productWindow must be an object";
+      if (
+        !optNum(g.productWindow.startCv) ||
+        !optNum(g.productWindow.endCv) ||
+        !optStr(g.productWindow.label)
+      ) {
+        return "purificationGradient.productWindow has invalid fields";
+      }
+    }
+    if (g.fractionTlcImage !== undefined && g.fractionTlcImage !== null && g.fractionTlcImage !== "") {
+      if (!isStr(g.fractionTlcImage) || !g.fractionTlcImage.startsWith("data:image/")) {
+        return "purificationGradient.fractionTlcImage must be an embedded image";
+      }
+    }
+  }
+
+  if (raw.structuredScheme !== undefined && raw.structuredScheme !== null) {
+    const s = raw.structuredScheme;
+    if (!isObj(s)) return "structuredScheme must be an object";
+    for (const imgField of ["reactantImage", "productImage"] as const) {
+      const val = s[imgField];
+      if (val !== undefined && val !== null && val !== "") {
+        if (!isStr(val) || !val.startsWith("data:image/")) {
+          return `structuredScheme.${imgField} must be an embedded image`;
+        }
+      }
+    }
+    for (const txtField of [
+      "reactantCdxml",
+      "productCdxml",
+      "solvent",
+      "temperature",
+      "duration",
+      "atmosphere",
+      "extraArrowNotes",
+    ] as const) {
+      if (s[txtField] !== undefined && s[txtField] !== null && !isStr(s[txtField])) {
+        return `structuredScheme.${txtField} must be text`;
       }
     }
   }

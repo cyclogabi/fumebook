@@ -13,11 +13,14 @@ import {
   newExperiment,
   uid,
   type Experiment,
+  type GradientPoint,
   type MoleculeMode,
   type ProductInfo,
+  type PurificationGradient,
   type ReagentRow,
   type Reference,
   type SecondaryProduct,
+  type StructuredReactionScheme,
   type UnitKind,
 } from "./types";
 import { cleanDoi } from "./references";
@@ -142,6 +145,8 @@ function normaliseProduct(raw: Partial<ProductInfo> | null | undefined): Product
   const mw = num(p.mw);
   const mass = num(p.isolatedMass);
   const ratio = looseNumber(p.stoichRatio);
+  const elutionStartCv = looseNumber(p.elutionStartCv);
+  const elutionEndCv = looseNumber(p.elutionEndCv);
   return {
     name: typeof p.name === "string" ? p.name : "",
     mw: mw !== null && mw > 0 ? mw : null,
@@ -150,6 +155,8 @@ function normaliseProduct(raw: Partial<ProductInfo> | null | undefined): Product
       ? (p.massUnit as ProductInfo["massUnit"])
       : DEFAULT_PRODUCT.massUnit,
     ...(ratio !== null && ratio > 0 && ratio !== 1 ? { stoichRatio: ratio } : {}),
+    ...(elutionStartCv !== null && elutionStartCv >= 0 ? { elutionStartCv } : {}),
+    ...(elutionEndCv !== null && elutionEndCv >= 0 ? { elutionEndCv } : {}),
   };
 }
 
@@ -159,6 +166,8 @@ function normaliseSecondary(raw: unknown): SecondaryProduct | null {
   const r = raw as Partial<Record<keyof SecondaryProduct, unknown>>;
   const field = (v: unknown): string | number => looseNumber(v) ?? "";
   const ratio = looseNumber(r.stoichRatio);
+  const elutionStartCv = looseNumber(r.elutionStartCv);
+  const elutionEndCv = looseNumber(r.elutionEndCv);
   const product: SecondaryProduct = {
     id: typeof r.id === "string" && r.id ? r.id : uid(),
     name: typeof r.name === "string" ? r.name : "",
@@ -168,9 +177,104 @@ function normaliseSecondary(raw: unknown): SecondaryProduct | null {
       ? (r.massUnit as SecondaryProduct["massUnit"])
       : "mg",
     stoichRatio: ratio !== null && ratio > 0 ? ratio : 1,
+    ...(elutionStartCv !== null && elutionStartCv >= 0 ? { elutionStartCv } : {}),
+    ...(elutionEndCv !== null && elutionEndCv >= 0 ? { elutionEndCv } : {}),
   };
   if (typeof r.appearance === "string" && r.appearance !== "") product.appearance = r.appearance;
   return product;
+}
+
+function normaliseGradientPoint(raw: unknown): GradientPoint | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Partial<Record<keyof GradientPoint, unknown>>;
+  const cv = looseNumber(r.cv);
+  const percentB = looseNumber(r.percentB);
+  if (cv === null || percentB === null) return null;
+  return {
+    id: typeof r.id === "string" && r.id ? r.id : uid(),
+    cv: Math.max(0, cv),
+    percentB: Math.min(100, Math.max(0, percentB)),
+  };
+}
+
+function normalisePurificationGradient(raw: unknown): PurificationGradient | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const g = raw as Partial<Record<keyof PurificationGradient, unknown>>;
+  const points = Array.isArray(g.points)
+    ? g.points
+        .map(normaliseGradientPoint)
+        .filter((p): p is GradientPoint => p !== null)
+        .sort((a, b) => a.cv - b.cv)
+    : [];
+  const equil = looseNumber(g.equilibrationCv);
+  const columnSize = typeof g.columnSize === "string" ? g.columnSize : "";
+  const solventA = typeof g.solventA === "string" ? g.solventA : "Cyclohexane";
+  const solventB = typeof g.solventB === "string" ? g.solventB : "EtOAc";
+  const fractionTlcImage =
+    typeof g.fractionTlcImage === "string" && g.fractionTlcImage.startsWith("data:image/")
+      ? g.fractionTlcImage
+      : undefined;
+
+  let productWindow: PurificationGradient["productWindow"];
+  if (g.productWindow && typeof g.productWindow === "object") {
+    const pw = g.productWindow as Record<string, unknown>;
+    const startCv = looseNumber(pw.startCv);
+    const endCv = looseNumber(pw.endCv);
+    if (startCv !== null && endCv !== null && startCv >= 0 && endCv >= startCv) {
+      productWindow = {
+        startCv,
+        endCv,
+        ...(typeof pw.label === "string" && pw.label.trim() !== ""
+          ? { label: pw.label.trim() }
+          : {}),
+      };
+    }
+  }
+
+  return {
+    enabled: g.enabled === true,
+    ...(columnSize ? { columnSize } : {}),
+    ...(equil !== null && equil >= 0 ? { equilibrationCv: equil } : {}),
+    solventA,
+    solventB,
+    points,
+    ...(productWindow ? { productWindow } : {}),
+    ...(fractionTlcImage ? { fractionTlcImage } : {}),
+  };
+}
+
+function normaliseStructuredScheme(raw: unknown): StructuredReactionScheme | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const s = raw as Partial<Record<keyof StructuredReactionScheme, unknown>>;
+  const out: StructuredReactionScheme = {};
+  if (typeof s.reactantImage === "string" && s.reactantImage.startsWith("data:image/")) {
+    out.reactantImage = s.reactantImage;
+  }
+  if (typeof s.reactantCdxml === "string" && s.reactantCdxml.trim() !== "") {
+    out.reactantCdxml = s.reactantCdxml;
+  }
+  if (typeof s.productImage === "string" && s.productImage.startsWith("data:image/")) {
+    out.productImage = s.productImage;
+  }
+  if (typeof s.productCdxml === "string" && s.productCdxml.trim() !== "") {
+    out.productCdxml = s.productCdxml;
+  }
+  if (typeof s.solvent === "string" && s.solvent.trim() !== "") {
+    out.solvent = s.solvent;
+  }
+  if (typeof s.temperature === "string" && s.temperature.trim() !== "") {
+    out.temperature = s.temperature;
+  }
+  if (typeof s.duration === "string" && s.duration.trim() !== "") {
+    out.duration = s.duration;
+  }
+  if (typeof s.atmosphere === "string" && s.atmosphere.trim() !== "") {
+    out.atmosphere = s.atmosphere;
+  }
+  if (typeof s.extraArrowNotes === "string" && s.extraArrowNotes.trim() !== "") {
+    out.extraArrowNotes = s.extraArrowNotes;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /** Fill defaults / drop junk so older or hand-edited data always has the current shape. */
@@ -205,6 +309,9 @@ export function normaliseExperiment(raw: Partial<Experiment>): Experiment | null
     product.name = raw.id;
   }
 
+  const purificationGradient = normalisePurificationGradient(raw.purificationGradient);
+  const structuredScheme = normaliseStructuredScheme(raw.structuredScheme);
+
   return {
     id: raw.id,
     title: typeof raw.title === "string" ? raw.title : "",
@@ -216,8 +323,10 @@ export function normaliseExperiment(raw: Partial<Experiment>): Experiment | null
       ? (raw.moleculeMode as MoleculeMode)
       : "draw",
     moleculeImage: raw.moleculeImage === true,
+    ...(structuredScheme ? { structuredScheme } : {}),
     procedureText: typeof raw.procedureText === "string" ? raw.procedureText : "",
     purificationText: typeof raw.purificationText === "string" ? raw.purificationText : "",
+    ...(purificationGradient ? { purificationGradient } : {}),
     commentsText: typeof raw.commentsText === "string" ? raw.commentsText : "",
     reagents: Array.isArray(raw.reagents) ? raw.reagents.map(normaliseRow) : [],
     product,
@@ -381,10 +490,11 @@ export async function loadNmrState(experimentId: string): Promise<string | null>
 }
 
 // --- Molecule picture ("Upload Image" mode) -------------------------------------
-// Desktop: Documents/Fumebook/attachments/[experimentId]/molecule.png
+// Desktop: Documents/Fumebook/attachments/[experimentId]/molecule.png (or molecule.svg for vector SVGs)
 // Browser: a data URL in localStorage (one key per experiment).
 
 const MOLECULE_IMAGE_FILE = "molecule.png";
+const MOLECULE_SVG_FILE = "molecule.svg";
 const moleculeImageKey = (experimentId: string) => `chem-eln:molecule-image:v1:${experimentId}`;
 
 export function blobToDataUrl(blob: Blob): Promise<string> {
@@ -396,25 +506,40 @@ export function blobToDataUrl(blob: Blob): Promise<string> {
   });
 }
 
-/** Save the molecule picture (a PNG) for an experiment, replacing any previous one. */
-export async function saveMoleculeImage(experimentId: string, png: Blob): Promise<void> {
+/** Save the molecule picture (a lossless PNG or vector SVG) for an experiment, replacing any previous one. */
+export async function saveMoleculeImage(experimentId: string, image: Blob): Promise<void> {
   if (!isTauri()) {
-    window.localStorage.setItem(moleculeImageKey(experimentId), await blobToDataUrl(png));
+    window.localStorage.setItem(moleculeImageKey(experimentId), await blobToDataUrl(image));
     return;
   }
   const dir = await getNmrDir(experimentId);
   await mkdir(dir, { recursive: true });
-  await writeFile(await path.join(dir, MOLECULE_IMAGE_FILE), new Uint8Array(await png.arrayBuffer()));
+  const isSvg = image.type === "image/svg+xml";
+  const targetFile = isSvg ? MOLECULE_SVG_FILE : MOLECULE_IMAGE_FILE;
+  const staleFile = isSvg ? MOLECULE_IMAGE_FILE : MOLECULE_SVG_FILE;
+  await writeFile(await path.join(dir, targetFile), new Uint8Array(await image.arrayBuffer()));
+  try {
+    await removeFile(await path.join(dir, staleFile));
+  } catch {
+    // Nothing to remove or locked: ignored.
+  }
 }
 
-/** Read the saved molecule picture, or `null` if there is none. */
+/** Read the saved molecule picture (vector SVG or PNG), or `null` if there is none. */
 export async function loadMoleculeImage(experimentId: string): Promise<Blob | null> {
   if (!isTauri()) {
     const url = window.localStorage.getItem(moleculeImageKey(experimentId));
     return url ? (await fetch(url)).blob() : null;
   }
+  const dir = await getNmrDir(experimentId);
   try {
-    const bytes = await readFile(await path.join(await getNmrDir(experimentId), MOLECULE_IMAGE_FILE));
+    const svgText = await readTextFile(await path.join(dir, MOLECULE_SVG_FILE));
+    return new Blob([svgText], { type: "image/svg+xml" });
+  } catch (err) {
+    if (!isNotFound(err)) throw err;
+  }
+  try {
+    const bytes = await readFile(await path.join(dir, MOLECULE_IMAGE_FILE));
     return new Blob([bytes], { type: "image/png" });
   } catch (err) {
     if (isNotFound(err)) return null;
@@ -428,19 +553,49 @@ export async function removeMoleculeImage(experimentId: string): Promise<void> {
     window.localStorage.removeItem(moleculeImageKey(experimentId));
     return;
   }
-  try {
-    await removeFile(await path.join(await getNmrDir(experimentId), MOLECULE_IMAGE_FILE));
-  } catch (err) {
-    if (!isNotFound(err)) throw err;
+  const dir = await getNmrDir(experimentId);
+  for (const name of [MOLECULE_SVG_FILE, MOLECULE_IMAGE_FILE]) {
+    try {
+      await removeFile(await path.join(dir, name));
+    } catch (err) {
+      if (!isNotFound(err)) throw err;
+    }
   }
 }
 
 /**
- * Windows "os error 32": the file is held open by another process (antivirus, the search indexer,
- * a preview pane...), usually only for a moment.
+ * Windows "os error 32": the file is held open by another process (ChemDraw, antivirus, the
+ * search indexer, a preview pane...), usually only for a moment during save or scan.
  */
 export const isFileLocked = (e: unknown) =>
-  /os error 32\b|being used by another process|sharing violation/i.test(errorMessage(e));
+  /os error 32\b|os error 5\b|being used by another process|sharing violation|access is denied/i.test(
+    errorMessage(e),
+  );
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Retry a file operation with exponential backoff (default: 3 retries with 50ms, 100ms, 200ms
+ * pauses) whenever the OS reports a transient file lock (`os error 32`).
+ */
+export async function withFileRetry<T>(
+  operation: () => Promise<T>,
+  delaysMs: readonly number[] = [50, 100, 200],
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= delaysMs.length; attempt++) {
+    try {
+      return await operation();
+    } catch (err) {
+      lastError = err;
+      if (!isFileLocked(err) || attempt === delaysMs.length) {
+        throw err;
+      }
+      await sleep(delaysMs[attempt]);
+    }
+  }
+  throw lastError;
+}
 
 /**
  * Remove the files the app keeps in `attachments/[id]/`, one by one, ignoring every failure
@@ -452,7 +607,14 @@ export async function removeAttachmentFilesQuietly(id: string): Promise<void> {
     return;
   }
   const dir = await getNmrDir(id);
-  for (const name of [MOLECULE_IMAGE_FILE, NMR_STATE_FILE, SCHEME_CDXML_FILE]) {
+  for (const name of [
+    MOLECULE_IMAGE_FILE,
+    MOLECULE_SVG_FILE,
+    NMR_STATE_FILE,
+    CDXML_FILES.scheme,
+    CDXML_FILES.reactant,
+    CDXML_FILES.product,
+  ]) {
     try {
       await removeFile(await path.join(dir, name));
     } catch {
@@ -462,12 +624,21 @@ export async function removeAttachmentFilesQuietly(id: string): Promise<void> {
 }
 
 // --- ChemDraw round trip (desktop only) ------------------------------------------
-// Documents/Fumebook/attachments/[experimentId]/scheme.cdxml is the file ChemDraw is pointed at.
+// Documents/Fumebook/attachments/[experimentId]/scheme.cdxml (or reactant.cdxml / product.cdxml)
 
-const SCHEME_CDXML_FILE = "scheme.cdxml";
+export type CdxmlSlot = "scheme" | "reactant" | "product";
 
-async function schemeCdxmlPath(experimentId: string): Promise<string> {
-  return path.join(await getNmrDir(experimentId), SCHEME_CDXML_FILE);
+const CDXML_FILES: Record<CdxmlSlot, string> = {
+  scheme: "scheme.cdxml",
+  reactant: "reactant.cdxml",
+  product: "product.cdxml",
+};
+
+export async function schemeCdxmlPath(
+  experimentId: string,
+  slot: CdxmlSlot = "scheme",
+): Promise<string> {
+  return path.join(await getNmrDir(experimentId), CDXML_FILES[slot]);
 }
 
 export interface SchemeCdxmlFile {
@@ -477,34 +648,66 @@ export interface SchemeCdxmlFile {
   modifiedMs: number;
 }
 
-/** Write `scheme.cdxml` and return its full path plus the modification time the OS recorded. */
+/**
+ * Write `scheme.cdxml` (or `reactant.cdxml` / `product.cdxml`) with exponential backoff retries
+ * and return its full path plus the modification time the OS recorded.
+ */
 export async function saveSchemeCdxml(
   experimentId: string,
   cdxml: string,
+  slot: CdxmlSlot = "scheme",
 ): Promise<{ path: string; modifiedMs: number }> {
   const dir = await getNmrDir(experimentId);
   await mkdir(dir, { recursive: true });
-  const file = await schemeCdxmlPath(experimentId);
-  await writeTextFile(file, cdxml);
-  return { path: file, modifiedMs: (await stat(file)).mtime?.getTime() ?? 0 };
+  const file = await schemeCdxmlPath(experimentId, slot);
+  await withFileRetry(() => writeTextFile(file, cdxml), [50, 100, 200]);
+  // Brief settle pause so the write handle is completely released before stat / cmd start.
+  await sleep(20);
+  const info = await withFileRetry(() => stat(file), [50, 100, 200]);
+  return { path: file, modifiedMs: info.mtime?.getTime() ?? Date.now() };
 }
 
 /** Modification time of `scheme.cdxml` in ms, or `null` if there is no such file. */
-export async function schemeCdxmlModified(experimentId: string): Promise<number | null> {
+export async function schemeCdxmlModified(
+  experimentId: string,
+  slot: CdxmlSlot = "scheme",
+): Promise<number | null> {
+  const file = await schemeCdxmlPath(experimentId, slot);
   try {
-    return (await stat(await schemeCdxmlPath(experimentId))).mtime?.getTime() ?? 0;
+    const info = await withFileRetry(() => stat(file), [50, 100, 200]);
+    return info.mtime?.getTime() ?? 0;
   } catch (err) {
     if (isNotFound(err)) return null;
     throw err;
   }
 }
 
-/** Read `scheme.cdxml`, or `null` if it does not exist yet. */
-export async function loadSchemeCdxml(experimentId: string): Promise<SchemeCdxmlFile | null> {
-  const file = await schemeCdxmlPath(experimentId);
+/**
+ * Read `scheme.cdxml` (or `reactant.cdxml` / `product.cdxml`) with exponential backoff retries,
+ * or `null` if it does not exist yet. If ChemDraw is mid-save (file locked or not yet flushed
+ * through `</CDXML>`), retries at 50ms, 100ms, 200ms pauses.
+ */
+export async function loadSchemeCdxml(
+  experimentId: string,
+  slot: CdxmlSlot = "scheme",
+): Promise<SchemeCdxmlFile | null> {
+  const file = await schemeCdxmlPath(experimentId, slot);
   try {
-    const text = await readTextFile(file);
-    return { path: file, text, modifiedMs: (await stat(file)).mtime?.getTime() ?? 0 };
+    return await withFileRetry(
+      async () => {
+        const text = await readTextFile(file);
+        if (text.trim() === "" || (/<CDXML[\s>]/i.test(text) && !/<\/CDXML>/i.test(text))) {
+          throw new Error("os error 32: CDXML file is still being written by ChemDraw.");
+        }
+        const info = await stat(file);
+        return {
+          path: file,
+          text,
+          modifiedMs: info.mtime?.getTime() ?? Date.now(),
+        };
+      },
+      [50, 100, 200],
+    );
   } catch (err) {
     if (isNotFound(err)) return null;
     throw err;
@@ -728,4 +931,202 @@ export function useExperiments() {
   );
 
   return { experiments, storageError, create, update, remove, replaceAll };
+}
+
+// --- Purification Gradient Presets (`fumebook_gradient_presets`) --------------
+
+export const GRADIENT_PRESETS_STORAGE_KEY = "fumebook_gradient_presets";
+
+export interface GradientPresetPoint {
+  cv: number;
+  percentB: number;
+}
+
+export interface GradientPreset {
+  id: string;
+  name: string;
+  columnSize?: string;
+  solventA: string;
+  solventB: string;
+  equilibrationCv?: number;
+  points: GradientPresetPoint[];
+}
+
+const DEFAULT_GRADIENT_PRESETS: GradientPreset[] = [
+  {
+    id: "preset-std-0-20-etoac",
+    name: "Standard 0–20% EtOAc over 10 CV",
+    solventA: "Cyclohexane",
+    solventB: "EtOAc",
+    equilibrationCv: 3,
+    points: [
+      { cv: 0, percentB: 0 },
+      { cv: 3, percentB: 0 },
+      { cv: 13, percentB: 20 },
+    ],
+  },
+  {
+    id: "preset-steep-0-50-etoac",
+    name: "Steep 0–50% Gradient",
+    solventA: "Cyclohexane",
+    solventB: "EtOAc",
+    equilibrationCv: 3,
+    points: [
+      { cv: 0, percentB: 0 },
+      { cv: 2, percentB: 0 },
+      { cv: 12, percentB: 50 },
+    ],
+  },
+  {
+    id: "preset-iso-5-meoh",
+    name: "Isocratic 5% MeOH",
+    solventA: "DCM",
+    solventB: "MeOH",
+    equilibrationCv: 3,
+    points: [
+      { cv: 0, percentB: 5 },
+      { cv: 12, percentB: 5 },
+    ],
+  },
+];
+
+let gradientPresetsCache: GradientPreset[] | null = null;
+const gradientPresetListeners = new Set<() => void>();
+const emitGradientPresets = () => gradientPresetListeners.forEach((l) => l());
+
+function normaliseGradientPreset(raw: unknown): GradientPreset | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Partial<GradientPreset>;
+  const name = typeof r.name === "string" ? r.name.trim() : "";
+  if (!name) return null;
+  const points: GradientPresetPoint[] = Array.isArray(r.points)
+    ? r.points
+        .map((pt) => {
+          if (!pt || typeof pt !== "object") return null;
+          const p = pt as Partial<GradientPresetPoint>;
+          const cv = looseNumber(p.cv);
+          const percentB = looseNumber(p.percentB);
+          if (cv === null || cv < 0 || percentB === null) return null;
+          return {
+            cv,
+            percentB: Math.min(100, Math.max(0, percentB)),
+          };
+        })
+        .filter((pt): pt is GradientPresetPoint => pt !== null)
+    : [];
+  if (points.length === 0) return null;
+  const eq = looseNumber(r.equilibrationCv);
+  return {
+    id: typeof r.id === "string" && r.id ? r.id : uid(),
+    name,
+    ...(typeof r.columnSize === "string" && r.columnSize.trim()
+      ? { columnSize: r.columnSize.trim() }
+      : {}),
+    solventA: typeof r.solventA === "string" ? r.solventA : "Cyclohexane",
+    solventB: typeof r.solventB === "string" ? r.solventB : "EtOAc",
+    ...(eq !== null && eq >= 0 ? { equilibrationCv: eq } : {}),
+    points,
+  };
+}
+
+export function loadGradientPresets(): GradientPreset[] {
+  if (typeof window === "undefined") return DEFAULT_GRADIENT_PRESETS;
+  try {
+    const raw = window.localStorage.getItem(GRADIENT_PRESETS_STORAGE_KEY);
+    if (raw === null) {
+      window.localStorage.setItem(
+        GRADIENT_PRESETS_STORAGE_KEY,
+        JSON.stringify(DEFAULT_GRADIENT_PRESETS),
+      );
+      return DEFAULT_GRADIENT_PRESETS;
+    }
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return DEFAULT_GRADIENT_PRESETS;
+    return parsed
+      .map(normaliseGradientPreset)
+      .filter((p): p is GradientPreset => p !== null);
+  } catch {
+    return DEFAULT_GRADIENT_PRESETS;
+  }
+}
+
+function writeGradientPresets(next: GradientPreset[]) {
+  gradientPresetsCache = next;
+  if (typeof window !== "undefined") {
+    try {
+      window.localStorage.setItem(GRADIENT_PRESETS_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // Ignore quota errors
+    }
+  }
+  emitGradientPresets();
+}
+
+export function saveGradientPreset(input: {
+  name: string;
+  columnSize?: string;
+  solventA: string;
+  solventB: string;
+  equilibrationCv?: number;
+  points: GradientPresetPoint[];
+}): GradientPreset {
+  const current = gradientPresetsCache ?? loadGradientPresets();
+  const trimmedName = input.name.trim() || "Custom Gradient";
+  const existingIdx = current.findIndex(
+    (p) => p.name.toLowerCase() === trimmedName.toLowerCase(),
+  );
+  const preset: GradientPreset = {
+    id: existingIdx >= 0 ? current[existingIdx].id : uid(),
+    name: trimmedName,
+    ...(input.columnSize?.trim() ? { columnSize: input.columnSize.trim() } : {}),
+    solventA: input.solventA.trim() || "Cyclohexane",
+    solventB: input.solventB.trim() || "EtOAc",
+    ...(input.equilibrationCv !== undefined && input.equilibrationCv >= 0
+      ? { equilibrationCv: input.equilibrationCv }
+      : {}),
+    points: input.points.map((pt) => ({
+      cv: Math.max(0, pt.cv),
+      percentB: Math.min(100, Math.max(0, pt.percentB)),
+    })),
+  };
+  const next =
+    existingIdx >= 0
+      ? current.map((p, idx) => (idx === existingIdx ? preset : p))
+      : [preset, ...current];
+  writeGradientPresets(next);
+  return preset;
+}
+
+export function deleteGradientPreset(id: string): void {
+  const current = gradientPresetsCache ?? loadGradientPresets();
+  writeGradientPresets(current.filter((p) => p.id !== id));
+}
+
+function subscribeGradientPresets(listener: () => void) {
+  gradientPresetListeners.add(listener);
+  return () => {
+    gradientPresetListeners.delete(listener);
+  };
+}
+
+function getGradientPresetsSnapshot(): GradientPreset[] {
+  if (gradientPresetsCache === null) {
+    gradientPresetsCache = loadGradientPresets();
+  }
+  return gradientPresetsCache;
+}
+
+const getGradientPresetsServerSnapshot = (): GradientPreset[] => DEFAULT_GRADIENT_PRESETS;
+
+export function useGradientPresets() {
+  const presets = useSyncExternalStore(
+    subscribeGradientPresets,
+    getGradientPresetsSnapshot,
+    getGradientPresetsServerSnapshot,
+  );
+  return {
+    presets,
+    savePreset: saveGradientPreset,
+    deletePreset: deleteGradientPreset,
+  };
 }

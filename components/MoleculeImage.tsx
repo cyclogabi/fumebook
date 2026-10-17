@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, type DragEvent } from "react";
 import { imageFileToPng } from "@/lib/images";
-import { loadMoleculeImage, removeMoleculeImage, saveMoleculeImage } from "@/lib/storage";
+import { blobToDataUrl, loadMoleculeImage, removeMoleculeImage, saveMoleculeImage } from "@/lib/storage";
 
 interface Props {
   experimentId: string;
@@ -28,11 +28,23 @@ export default function MoleculeImage({ experimentId, hasImage, onHasImageChange
   const [dragging, setDragging] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  /** Show `blob` (or nothing). One object URL at a time; the previous one is released. */
-  function show(blob: Blob | null) {
-    if (urlRef.current) URL.revokeObjectURL(urlRef.current);
-    urlRef.current = blob ? URL.createObjectURL(blob) : null;
-    setUrl(urlRef.current);
+  /**
+   * Show `blob` (or nothing). Vector SVGs are rendered directly as `data:image/svg+xml;base64,...`
+   * so Chromium/WebView2 prints them as infinite-resolution vector paths; raster PNGs use a blob URL.
+   */
+  async function show(blob: Blob | null) {
+    if (urlRef.current?.startsWith("blob:")) URL.revokeObjectURL(urlRef.current);
+    if (!blob) {
+      urlRef.current = null;
+      setUrl(null);
+      return;
+    }
+    const nextUrl =
+      blob.type === "image/svg+xml"
+        ? await blobToDataUrl(blob)
+        : URL.createObjectURL(blob);
+    urlRef.current = nextUrl;
+    setUrl(nextUrl);
   }
   const showRef = useRef(show);
   useEffect(() => {
@@ -42,7 +54,7 @@ export default function MoleculeImage({ experimentId, hasImage, onHasImageChange
   // Release the object URL when the section closes.
   useEffect(() => {
     return () => {
-      if (urlRef.current) URL.revokeObjectURL(urlRef.current);
+      if (urlRef.current?.startsWith("blob:")) URL.revokeObjectURL(urlRef.current);
       urlRef.current = null;
     };
   }, []);
@@ -52,9 +64,9 @@ export default function MoleculeImage({ experimentId, hasImage, onHasImageChange
     if (!hasImage) return;
     let cancelled = false;
     loadMoleculeImage(experimentId)
-      .then((saved) => {
+      .then(async (saved) => {
         if (cancelled) return;
-        showRef.current(saved);
+        await showRef.current(saved);
         if (!saved) setError("The saved image could not be found. Drop it again to replace it.");
       })
       .catch((err) => {
@@ -71,7 +83,8 @@ export default function MoleculeImage({ experimentId, hasImage, onHasImageChange
   }, [experimentId]);
 
   async function addFile(files: File[]) {
-    const file = files.find((f) => f.type.startsWith("image/")) ?? null;
+    const file =
+      files.find((f) => f.type.startsWith("image/") || /\.svg$/i.test(f.name)) ?? null;
     if (!file) {
       if (files.length > 0) setError("Only image files can be used here (PNG, JPEG, SVG, ...).");
       return;
@@ -79,9 +92,9 @@ export default function MoleculeImage({ experimentId, hasImage, onHasImageChange
     setBusy(true);
     setError(null);
     try {
-      const png = await imageFileToPng(file);
-      await saveMoleculeImage(experimentId, png);
-      show(png);
+      const prepared = await imageFileToPng(file);
+      await saveMoleculeImage(experimentId, prepared);
+      await show(prepared);
       onHasImageChange(true);
     } catch (err) {
       setError(`The image could not be saved: ${messageOf(err)}`);
@@ -120,11 +133,13 @@ export default function MoleculeImage({ experimentId, hasImage, onHasImageChange
       if (!(clickedHere ?? !hasPictureRef.current)) return;
       const items = Array.from(event.clipboardData?.items ?? []).filter((i) => i.kind === "file");
       const item =
-        items.find((i) => i.type === "image/png") ?? items.find((i) => i.type.startsWith("image/"));
+        items.find((i) => i.type === "image/svg+xml") ??
+        items.find((i) => i.type === "image/png") ??
+        items.find((i) => i.type.startsWith("image/"));
       const file = item?.getAsFile();
       if (!file) return;
       event.preventDefault();
-      void addFileRef.current([file]); // converted to PNG and saved as molecule.png
+      void addFileRef.current([file]); // SVG kept as vector, raster saved as high-DPI lossless PNG
     };
     document.addEventListener("pointerdown", onPointerDown, true);
     document.addEventListener("paste", onPaste, true);
@@ -168,7 +183,7 @@ export default function MoleculeImage({ experimentId, hasImage, onHasImageChange
       <input
         ref={inputRef}
         type="file"
-        accept="image/*"
+        accept="image/*,.svg"
         hidden
         onChange={(e) => {
           void addFile(Array.from(e.target.files ?? []));
@@ -179,7 +194,7 @@ export default function MoleculeImage({ experimentId, hasImage, onHasImageChange
       {showImage ? (
         <div
           {...dropProps}
-          className={`relative flex min-h-48 items-center justify-center rounded-md border bg-white p-3 print:min-h-0 print:justify-start print:border-0 print:p-0 print:py-0.5 ${
+          className={`relative flex min-h-48 items-center justify-center rounded-md border bg-white p-3 print:flex print:min-h-0 print:w-full print:items-center print:justify-center print:border-0 print:p-0 print:py-0.5 ${
             dragging ? "border-fume-500 bg-fume-50" : "border-zinc-200"
           }`}
         >
@@ -187,7 +202,7 @@ export default function MoleculeImage({ experimentId, hasImage, onHasImageChange
           <img
             src={url}
             alt="Molecule"
-            className="max-h-[110mm] max-w-full object-contain print:max-h-36"
+            className="mx-auto block max-h-[110mm] max-w-full object-contain print:mx-auto print:max-h-36"
           />
           <div className="absolute right-2 top-2 flex gap-1.5 print:hidden">
             <button

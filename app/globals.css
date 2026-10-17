@@ -37,16 +37,30 @@ body {
 /* ---- Print: clean A4 document ------------------------------------------ */
 @page {
   size: A4;
-  margin: 10mm 12mm;
+  margin: 0mm !important;
 }
 
 @media print {
-  html,
-  body {
+  html {
+    margin: 0 !important;
+    padding: 0 !important;
     height: auto !important;
+    overflow: visible !important;
+    background: #fff !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  body {
+    margin: 0 !important;
+    padding: 10mm 12mm !important;
+    height: auto !important;
+    overflow: visible !important;
     display: block !important;
     background: #fff !important;
     color: #000;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
   }
 
   /* Keep light tints (e.g. the limiting-reagent row, TLC plates) as authored. */

@@ -19,6 +19,7 @@ import { readClipboardText } from "@/lib/clipboard";
 import { cleanClipboardText, isValidChemicalText } from "@/lib/chemText";
 import { prepareForKetcher } from "@/lib/library";
 import { saveCdxmlFile } from "@/lib/fileDialogs";
+import { blobToDataUrl } from "@/lib/storage";
 import { isTauri } from "@/lib/tauri";
 import { hasCdxmlContent, useChemDrawLink } from "./useChemDrawLink";
 import {
@@ -222,25 +223,21 @@ export default function ReactionCanvas({ value, onChange, fileName, toolbar, exp
     [],
   );
 
-  // Static SVG of the scheme, shown instead of the editor when printing.
+  // Static vector SVG data URL of the scheme, shown instead of the editor when printing.
   const updatePreview = useCallback((ketcher: Ketcher, text: string) => {
     if (previewTimerRef.current) clearTimeout(previewTimerRef.current);
     const seq = ++previewSeqRef.current;
     previewTimerRef.current = setTimeout(async () => {
       try {
-        const url = text
-          ? URL.createObjectURL(
-              await ketcher.generateImage(text, {
-                outputFormat: "svg",
-                backgroundColor: "255, 255, 255",
-              }),
-            )
+        const svgBlob = text
+          ? await ketcher.generateImage(text, {
+              outputFormat: "svg",
+              backgroundColor: "255, 255, 255",
+            })
           : null;
-        if (seq !== previewSeqRef.current) {
-          if (url) URL.revokeObjectURL(url); // a newer render superseded this one
-          return;
-        }
-        setPreviewUrl(url); // the previous URL is revoked by the cleanup effect below
+        const url = svgBlob ? await blobToDataUrl(svgBlob) : null;
+        if (seq !== previewSeqRef.current) return;
+        setPreviewUrl(url);
       } catch {
         // Preview is a print nicety; never surface its failure.
       }
@@ -564,7 +561,7 @@ export default function ReactionCanvas({ value, onChange, fileName, toolbar, exp
   }
 
   return (
-    <section className={hasContent ? "" : "print:hidden"}>
+    <section className={`print:w-full ${hasContent ? "" : "print:hidden"}`}>
       <div className="mb-2 flex items-center justify-between gap-2 print:mb-1">
         <h2 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
           Reaction scheme
@@ -692,12 +689,14 @@ export default function ReactionCanvas({ value, onChange, fileName, toolbar, exp
       )}
 
       {previewUrl && (
-        // eslint-disable-next-line @next/next/no-img-element -- generated blob URL
-        <img
-          src={previewUrl}
-          alt="Reaction scheme"
-          className="hidden max-h-36 max-w-full object-contain print:block print:max-h-36"
-        />
+        <div className="hidden print:flex print:w-full print:items-center print:justify-center print:py-0.5">
+          {/* eslint-disable-next-line @next/next/no-img-element -- generated blob URL */}
+          <img
+            src={previewUrl}
+            alt="Reaction scheme"
+            className="mx-auto block max-h-36 max-w-full object-contain print:mx-auto print:max-h-36"
+          />
+        </div>
       )}
 
       {error && (

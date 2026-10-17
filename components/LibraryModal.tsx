@@ -2,12 +2,19 @@
 
 import { useEffect, useId, useMemo, useRef, useState, type FormEvent } from "react";
 import {
+  extractDualStreamClipboard,
+  renderStructureToVectorSvg,
+} from "@/components/MoleculeSection";
+import { imageFileToPng } from "@/lib/images";
+import {
   describeProperties,
   detectFormat,
   structureFromFile,
   useLibrary,
+  type LibraryCompound,
   type StructureFormat,
 } from "@/lib/library";
+import { blobToDataUrl } from "@/lib/storage";
 
 const FORMAT_LABELS: Record<StructureFormat, string> = {
   smiles: "SMILES",
@@ -45,11 +52,14 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
   const titleId = useId();
   const dialogRef = useRef<HTMLDialogElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
-  const { compounds, error: libraryError, add, remove } = useLibrary();
+  const editFileRef = useRef<HTMLInputElement>(null);
+  const { compounds, error: libraryError, add, update, remove } = useLibrary();
 
   const [query, setQuery] = useState("");
   const [name, setName] = useState("");
   const [structure, setStructure] = useState("");
+  const [addCdxml, setAddCdxml] = useState<string | undefined>(undefined);
+  const [addImageDataUrl, setAddImageDataUrl] = useState<string | undefined>(undefined);
   /** Name of the file the structure came from (a `.cdxml` name marks the text as CDXML). */
   const [fileName, setFileName] = useState<string | undefined>(undefined);
   const [mwText, setMwText] = useState("");
@@ -59,6 +69,20 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
   /** Id of the compound whose delete button was pressed once ("Sure?" state). */
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
+
+  // In-place Edit state for any compound row
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editName, setEditName] = useState("");
+  const [editMwText, setEditMwText] = useState("");
+  const [editDensityText, setEditDensityText] = useState("");
+  const [editNotes, setEditNotes] = useState("");
+  const [editStructure, setEditStructure] = useState("");
+  const [editCdxml, setEditCdxml] = useState<string | undefined>(undefined);
+  const [editImageDataUrl, setEditImageDataUrl] = useState<string | undefined>(undefined);
+  const [editFileName, setEditFileName] = useState<string | undefined>(undefined);
+  const [editClearStructure, setEditClearStructure] = useState(false);
+  const [editBusy, setEditBusy] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
 
   // Native <dialog>: focus trap, Esc to close and the backdrop come for free.
   useEffect(() => {
@@ -76,14 +100,179 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
 
   const detected = structure.trim() ? detectFormat(structure, fileName) : null;
 
-  function handleAdd(e: FormEvent) {
+  function startEditing(c: LibraryCompound) {
+    setConfirmId(null);
+    setEditingId(c.id);
+    setEditName(c.name);
+    setEditMwText(c.mw !== undefined ? String(c.mw) : "");
+    setEditDensityText(c.density !== undefined ? String(c.density) : "");
+    setEditNotes(c.notes ?? "");
+    setEditStructure(c.structure ?? c.cdxml ?? "");
+    setEditCdxml(c.cdxml);
+    setEditImageDataUrl(c.imageDataUrl);
+    setEditFileName(c.format === "cdxml" ? "structure.cdxml" : undefined);
+    setEditClearStructure(false);
+    setEditError(null);
+  }
+
+  function cancelEditing() {
+    setEditingId(null);
+    setEditError(null);
+    setEditBusy(false);
+  }
+
+  async function handlePasteStructureForEdit() {
+    setEditBusy(true);
+    setEditError(null);
+    try {
+      const extracted = await extractDualStreamClipboard();
+      if (!extracted) {
+        setEditError(
+          "Clipboard does not contain a structure or image. Copy a structure in ChemDraw (Ctrl+C) first.",
+        );
+        return;
+      }
+      setEditStructure(extracted.cdxml || extracted.structureText);
+      setEditCdxml(extracted.cdxml || undefined);
+      setEditImageDataUrl(extracted.imageDataUrl);
+      setEditFileName(extracted.cdxml ? "clipboard.cdxml" : undefined);
+      setEditClearStructure(false);
+      if (extracted.mw !== null && extracted.mw > 0) {
+        setEditMwText(String(extracted.mw));
+      }
+    } catch (err) {
+      setEditError(err instanceof Error ? err.message : "Could not paste structure.");
+    } finally {
+      setEditBusy(false);
+    }
+  }
+
+  async function handleEditStructureFile(file: File | undefined) {
+    if (!file) return;
+    if (file.size > MAX_STRUCTURE_FILE_BYTES) {
+      setEditError("That file is too large to be a single structure.");
+      return;
+    }
+    setEditBusy(true);
+    setEditError(null);
+    try {
+      if (file.type.startsWith("image/") || /\.svg$/i.test(file.name)) {
+        const prepared = await imageFileToPng(file);
+        const dataUrl = await blobToDataUrl(prepared);
+        setEditImageDataUrl(dataUrl);
+        setEditClearStructure(false);
+        return;
+      }
+      const { structure: text, note } = structureFromFile(file.name, await file.text());
+      setEditStructure(text);
+      setEditFileName(file.name);
+      setEditClearStructure(false);
+      if (note) setEditError(note);
+      try {
+        const rendered = await renderStructureToVectorSvg(text);
+        setEditCdxml(rendered.cdxml);
+        setEditImageDataUrl(rendered.svgDataUrl);
+        if (rendered.mw !== null && rendered.mw > 0 && !editMwText.trim()) {
+          setEditMwText(String(rendered.mw));
+        }
+      } catch {
+        // Keep raw structure text even if SVG preview fails
+      }
+    } catch {
+      setEditError("The file could not be read.");
+    } finally {
+      setEditBusy(false);
+    }
+  }
+
+  async function handleSaveEdit(id: string) {
+    const mw = parseOptionalNumber(editMwText);
+    const density = parseOptionalNumber(editDensityText);
+    if (mw === null) {
+      setEditError("Molecular weight must be a positive number, e.g. 46.07.");
+      return;
+    }
+    if (density === null) {
+      setEditError("Density must be a positive number, e.g. 0.789.");
+      return;
+    }
+
+    setEditBusy(true);
+    setEditError(null);
+    try {
+      let nextCdxml = editCdxml;
+      let nextImage = editImageDataUrl;
+      let nextMw = mw;
+
+      const trimmedStruct = editStructure.trim();
+      if (!editClearStructure && trimmedStruct && !nextImage) {
+        try {
+          const rendered = await renderStructureToVectorSvg(trimmedStruct);
+          nextCdxml = rendered.cdxml;
+          nextImage = rendered.svgDataUrl;
+          if (nextMw === undefined && rendered.mw !== null && rendered.mw > 0) {
+            nextMw = rendered.mw;
+          }
+        } catch {
+          // Allow saving SMILES/MOL text even if offline preview renderer didn't produce an SVG
+        }
+      }
+
+      const result = update(id, {
+        name: editName,
+        mw: nextMw ?? null,
+        density: density ?? null,
+        notes: editNotes,
+        structure: editClearStructure ? "" : trimmedStruct,
+        cdxml: editClearStructure ? undefined : nextCdxml,
+        imageDataUrl: editClearStructure ? undefined : nextImage,
+        fileName: editFileName,
+        clearStructure: editClearStructure,
+      });
+
+      if (!result.ok) {
+        setEditError(result.error);
+        return;
+      }
+      setEditingId(null);
+    } finally {
+      setEditBusy(false);
+    }
+  }
+
+  async function handleAdd(e: FormEvent) {
     e.preventDefault();
     const mw = parseOptionalNumber(mwText);
     const density = parseOptionalNumber(densityText);
     if (mw === null) return setFormError("Molecular weight must be a positive number, e.g. 46.07.");
     if (density === null) return setFormError("Density must be a positive number, e.g. 0.789.");
 
-    const result = add({ name, structure, notes, mw, density, fileName });
+    let nextCdxml = addCdxml;
+    let nextImage = addImageDataUrl;
+    let nextMw = mw;
+    if (structure.trim() && !nextImage) {
+      try {
+        const rendered = await renderStructureToVectorSvg(structure.trim());
+        nextCdxml = rendered.cdxml;
+        nextImage = rendered.svgDataUrl;
+        if (nextMw === undefined && rendered.mw !== null && rendered.mw > 0) {
+          nextMw = rendered.mw;
+        }
+      } catch {
+        // Keep text structure if vector render is skipped
+      }
+    }
+
+    const result = add({
+      name,
+      structure,
+      cdxml: nextCdxml,
+      imageDataUrl: nextImage,
+      notes,
+      mw: nextMw,
+      density,
+      fileName,
+    });
     if (!result.ok) {
       setFormError(result.error);
       return;
@@ -91,10 +280,34 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
     setFormError(null);
     setName("");
     setStructure("");
+    setAddCdxml(undefined);
+    setAddImageDataUrl(undefined);
     setFileName(undefined);
     setMwText("");
     setDensityText("");
     setNotes("");
+  }
+
+  async function handlePasteStructureForAdd() {
+    setFormError(null);
+    try {
+      const extracted = await extractDualStreamClipboard();
+      if (!extracted) {
+        setFormError(
+          "Clipboard does not contain a structure or image. Copy a structure in ChemDraw (Ctrl+C) first.",
+        );
+        return;
+      }
+      setStructure(extracted.cdxml || extracted.structureText);
+      setAddCdxml(extracted.cdxml || undefined);
+      setAddImageDataUrl(extracted.imageDataUrl);
+      setFileName(extracted.cdxml ? "clipboard.cdxml" : undefined);
+      if (extracted.mw !== null && extracted.mw > 0 && !mwText.trim()) {
+        setMwText(String(extracted.mw));
+      }
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : "Could not paste structure.");
+    }
   }
 
   async function handleStructureFile(file: File | undefined) {
@@ -110,6 +323,16 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
       // Name the compound after the file when no name was typed yet.
       if (!name.trim()) setName(file.name.replace(/\.[^.]+$/, ""));
       setFormError(note ?? null);
+      try {
+        const rendered = await renderStructureToVectorSvg(text);
+        setAddCdxml(rendered.cdxml);
+        setAddImageDataUrl(rendered.svgDataUrl);
+        if (rendered.mw !== null && rendered.mw > 0 && !mwText.trim()) {
+          setMwText(String(rendered.mw));
+        }
+      } catch {
+        // Ignore preview error
+      }
     } catch {
       setFormError("The file could not be read.");
     }
@@ -195,6 +418,13 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
             >
               Choose file (.mol, .sdf, .cdxml)…
             </button>
+            <button
+              type="button"
+              onClick={() => void handlePasteStructureForAdd()}
+              className="rounded-md border border-zinc-300 bg-white px-2 py-1 font-medium text-zinc-700 hover:bg-zinc-50"
+            >
+              Paste structure from Clipboard
+            </button>
             {detected && <span>Detected: {FORMAT_LABELS[detected]}</span>}
           </div>
           <div className="grid grid-cols-2 gap-2">
@@ -267,67 +497,287 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
             )}
             {visible.map((c) => {
               const expanded = expandedId === c.id;
+              const isEditing = editingId === c.id;
               return (
-                <li key={c.id} className="px-3 py-2">
-                  <div className="flex items-start gap-2">
-                    <button
-                      type="button"
-                      onClick={() => setExpandedId(expanded ? null : c.id)}
-                      aria-expanded={expanded}
-                      className="min-w-0 flex-1 text-left"
-                    >
-                      <span className="flex items-center gap-2">
-                        <span className="truncate text-sm font-medium text-zinc-900">{c.name}</span>
-                        <span className="shrink-0 rounded bg-zinc-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
-                          {FORMAT_LABELS[c.format]}
+                <li key={c.id} className="px-3 py-2.5">
+                  {isEditing ? (
+                    <div className="space-y-2.5 rounded-lg border border-fume-200 bg-fume-50/30 p-3">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[11px] font-semibold uppercase tracking-wider text-fume-800">
+                          Editing Compound
                         </span>
-                      </span>
-                      {describeProperties(c) && (
-                        <span className="block truncate text-xs text-zinc-500">{describeProperties(c)}</span>
-                      )}
-                      {c.notes && <span className="block truncate text-xs text-zinc-500">{c.notes}</span>}
-                      {c.format === "smiles" && (
-                        <span className="block truncate font-mono text-xs text-zinc-400">{c.structure}</span>
-                      )}
-                    </button>
+                        <button
+                          type="button"
+                          onClick={cancelEditing}
+                          className="text-xs text-zinc-400 hover:text-zinc-700"
+                        >
+                          Cancel
+                        </button>
+                      </div>
 
-                    {confirmId === c.id ? (
-                      <span className="flex shrink-0 items-center gap-1.5 text-xs">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            remove(c.id);
-                            setConfirmId(null);
+                      <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                        <label className="block text-xs text-zinc-600 sm:col-span-1">
+                          Name
+                          <input
+                            type="text"
+                            value={editName}
+                            onChange={(e) => setEditName(e.target.value)}
+                            aria-label="Edit compound name"
+                            className="mt-0.5 w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 focus:border-fume-500 focus:outline-none"
+                          />
+                        </label>
+                        <label className="block text-xs text-zinc-600">
+                          MW (g/mol)
+                          <input
+                            type="text"
+                            inputMode="decimal"
+                            value={editMwText}
+                            onChange={(e) => setEditMwText(e.target.value)}
+                            placeholder="e.g. 245.3"
+                            aria-label="Edit molecular weight (g/mol)"
+                            className="mt-0.5 w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 focus:border-fume-500 focus:outline-none"
+                          />
+                        </label>
+                        <label className="block text-xs text-zinc-600">
+                          Density d (g/mL)
+                          <input
+                            type="text"
+                            inputMode="decimal"
+                            value={editDensityText}
+                            onChange={(e) => setEditDensityText(e.target.value)}
+                            placeholder="optional"
+                            aria-label="Edit density (g/mL)"
+                            className="mt-0.5 w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 focus:border-fume-500 focus:outline-none"
+                          />
+                        </label>
+                      </div>
+
+                      <label className="block text-xs text-zinc-600">
+                        Molecular Formula / Notes
+                        <input
+                          type="text"
+                          value={editNotes}
+                          onChange={(e) => setEditNotes(e.target.value)}
+                          placeholder="Formula, CAS, supplier, appearance…"
+                          aria-label="Edit molecular formula or notes"
+                          className="mt-0.5 w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 focus:border-fume-500 focus:outline-none"
+                        />
+                      </label>
+
+                      {/* Structure preview + Paste / Upload / Clear controls */}
+                      <div className="rounded border border-zinc-200 bg-white p-2">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex items-center gap-2.5">
+                            {editImageDataUrl && !editClearStructure ? (
+                              // eslint-disable-next-line @next/next/no-img-element
+                              <img
+                                src={editImageDataUrl}
+                                alt=""
+                                className="h-12 w-16 shrink-0 rounded border border-zinc-200 bg-white object-contain p-0.5"
+                              />
+                            ) : (
+                              <span className="inline-flex h-10 items-center rounded border border-dashed border-zinc-200 px-2.5 text-[11px] text-zinc-400">
+                                No structure saved
+                              </span>
+                            )}
+                            <div className="text-xs text-zinc-600">
+                              <span className="font-medium text-zinc-800">Saved Structure</span>
+                              <span className="block text-[11px] text-zinc-400">
+                                Paste from ChemDraw, upload a file, or edit SMILES/CDXML below
+                              </span>
+                            </div>
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <input
+                              ref={editFileRef}
+                              type="file"
+                              accept=".mol,.sdf,.cdxml,.smi,.smiles,.svg,.png,.jpg,image/*"
+                              hidden
+                              onChange={(e) => {
+                                void handleEditStructureFile(e.target.files?.[0]);
+                                e.target.value = "";
+                              }}
+                            />
+                            <button
+                              type="button"
+                              onClick={() => void handlePasteStructureForEdit()}
+                              disabled={editBusy}
+                              className="rounded border border-fume-300 bg-fume-50 px-2 py-1 text-[11px] font-medium text-fume-800 hover:bg-fume-100 disabled:opacity-50"
+                              title="Paste structure from ChemDraw clipboard and recalculate MW"
+                            >
+                              Paste Structure
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => editFileRef.current?.click()}
+                              disabled={editBusy}
+                              className="rounded border border-zinc-300 bg-white px-2 py-1 text-[11px] font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50"
+                            >
+                              Upload…
+                            </button>
+                            {(editImageDataUrl || editStructure.trim() || editCdxml) &&
+                              !editClearStructure && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setEditClearStructure(true);
+                                    setEditStructure("");
+                                    setEditCdxml(undefined);
+                                    setEditImageDataUrl(undefined);
+                                  }}
+                                  className="rounded border border-red-200 bg-white px-2 py-1 text-[11px] font-medium text-red-600 hover:bg-red-50"
+                                >
+                                  Clear Structure ×
+                                </button>
+                              )}
+                          </div>
+                        </div>
+
+                        <textarea
+                          value={editClearStructure ? "" : editStructure}
+                          onChange={(e) => {
+                            setEditClearStructure(false);
+                            setEditStructure(e.target.value);
+                            setEditImageDataUrl(undefined);
+                            setEditCdxml(undefined);
                           }}
-                          className="rounded-md bg-red-600 px-2 py-1 font-semibold text-white hover:bg-red-700"
+                          placeholder="Optional SMILES, MOLfile, or CDXML text…"
+                          aria-label="Edit structure text"
+                          rows={2}
+                          spellCheck={false}
+                          className="mt-2 w-full resize-y rounded border border-zinc-200 bg-zinc-50 px-2 py-1 font-mono text-[11px] text-zinc-700 placeholder:font-sans placeholder:text-zinc-400 focus:border-fume-500 focus:bg-white focus:outline-none"
+                        />
+                      </div>
+
+                      {editError && (
+                        <p role="alert" className="text-xs text-red-600">
+                          {editError}
+                        </p>
+                      )}
+
+                      <div className="flex justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={cancelEditing}
+                          className="rounded-md border border-zinc-300 bg-white px-3 py-1 text-xs font-medium text-zinc-600 hover:bg-zinc-50"
                         >
-                          Delete
+                          Cancel
                         </button>
                         <button
                           type="button"
-                          onClick={() => setConfirmId(null)}
-                          className="rounded-md border border-zinc-300 px-2 py-1 font-medium text-zinc-600 hover:bg-zinc-50"
+                          disabled={editBusy}
+                          onClick={() => void handleSaveEdit(c.id)}
+                          className="rounded-md bg-fume-600 px-3 py-1 text-xs font-semibold text-white shadow-2xs hover:bg-fume-700 disabled:opacity-50"
                         >
-                          Keep
+                          {editBusy ? "Saving…" : "Save Changes"}
                         </button>
-                      </span>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={() => setConfirmId(c.id)}
-                        aria-label={`Delete ${c.name}`}
-                        className="shrink-0 rounded-md p-1.5 text-zinc-400 hover:bg-red-50 hover:text-red-600"
-                      >
-                        <svg viewBox="0 0 16 16" className="size-4" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                          <path d="M3 4.5h10M6.5 4.5V3h3v1.5M5 4.5l.5 8h5l.5-8" />
-                        </svg>
-                      </button>
-                    )}
-                  </div>
-                  {expanded && (
-                    <pre className="mt-2 max-h-40 overflow-auto rounded-md bg-zinc-50 p-2 font-mono text-[11px] leading-snug text-zinc-600">
-                      {c.structure}
-                    </pre>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="flex items-start gap-2.5">
+                        {c.imageDataUrl && (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img
+                            src={c.imageDataUrl}
+                            alt=""
+                            className="mt-0.5 h-9 w-12 shrink-0 rounded border border-zinc-200/80 bg-white object-contain p-0.5"
+                          />
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => setExpandedId(expanded ? null : c.id)}
+                          aria-expanded={expanded}
+                          className="min-w-0 flex-1 text-left"
+                        >
+                          <span className="flex items-center gap-2">
+                            <span className="truncate text-sm font-medium text-zinc-900">
+                              {c.name}
+                            </span>
+                            {c.structure && (
+                              <span className="shrink-0 rounded bg-zinc-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
+                                {FORMAT_LABELS[c.format]}
+                              </span>
+                            )}
+                          </span>
+                          {describeProperties(c) && (
+                            <span className="block truncate text-xs text-zinc-500">
+                              {describeProperties(c)}
+                            </span>
+                          )}
+                          {c.notes && (
+                            <span className="block truncate text-xs text-zinc-500">
+                              {c.notes}
+                            </span>
+                          )}
+                          {c.format === "smiles" && c.structure && (
+                            <span className="block truncate font-mono text-xs text-zinc-400">
+                              {c.structure}
+                            </span>
+                          )}
+                        </button>
+
+                        {confirmId === c.id ? (
+                          <span className="flex shrink-0 items-center gap-1.5 text-xs">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                remove(c.id);
+                                setConfirmId(null);
+                              }}
+                              className="rounded-md bg-red-600 px-2 py-1 font-semibold text-white hover:bg-red-700"
+                            >
+                              Delete
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setConfirmId(null)}
+                              className="rounded-md border border-zinc-300 px-2 py-1 font-medium text-zinc-600 hover:bg-zinc-50"
+                            >
+                              Keep
+                            </button>
+                          </span>
+                        ) : (
+                          <div className="flex shrink-0 items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => startEditing(c)}
+                              aria-label={`Edit ${c.name}`}
+                              title={`Edit ${c.name}`}
+                              className="rounded-md px-2 py-1 text-xs font-medium text-zinc-500 hover:bg-fume-50 hover:text-fume-800"
+                            >
+                              ✎ Edit
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setConfirmId(c.id)}
+                              aria-label={`Delete ${c.name}`}
+                              title={`Delete ${c.name}`}
+                              className="rounded-md p-1.5 text-zinc-400 hover:bg-red-50 hover:text-red-600"
+                            >
+                              <svg
+                                viewBox="0 0 16 16"
+                                className="size-4"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="1.5"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                aria-hidden
+                              >
+                                <path d="M3 4.5h10M6.5 4.5V3h3v1.5M5 4.5l.5 8h5l.5-8" />
+                              </svg>
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                      {expanded && c.structure && (
+                        <pre className="mt-2 max-h-40 overflow-auto rounded-md bg-zinc-50 p-2 font-mono text-[11px] leading-snug text-zinc-600">
+                          {c.structure}
+                        </pre>
+                      )}
+                    </>
                   )}
                 </li>
               );

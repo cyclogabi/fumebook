@@ -31,11 +31,15 @@ export interface LibraryCompound {
   mw?: number;
   /** Density in g/mL (liquids). Fills the Density column when picked in the reagent table. */
   density?: number;
+  /** Optional ChemDraw CDXML structure text for instant ChemDraw editing and vector rendering. */
+  cdxml?: string;
+  /** Optional pre-rendered vector SVG or PNG data URL (`data:image/...`). */
+  imageDataUrl?: string;
 }
 
 export type CompoundInput = {
   name: string;
-  structure: string;
+  structure?: string;
   notes?: string;
   /** g/mol; must be a positive number when given. */
   mw?: number | null;
@@ -43,6 +47,10 @@ export type CompoundInput = {
   density?: number | null;
   /** Name of the file the structure came from (a `.cdxml` name marks the text as CDXML). */
   fileName?: string;
+  /** Optional ChemDraw CDXML text. */
+  cdxml?: string;
+  /** Optional rendered structure image data URL (`data:image/...`). */
+  imageDataUrl?: string;
 };
 
 const APP_DIR_NAME = "Fumebook";
@@ -156,6 +164,24 @@ export function describeProperties(c: Pick<LibraryCompound, "mw" | "density">): 
   return parts.join(" \u00b7 ");
 }
 
+/**
+ * Given a desired compound name `baseName`, returns a distinct name (e.g. `"GH055 (2)"`,
+ * `"GH055 (3)"`) if a compound with `baseName` already exists in `compounds`.
+ */
+export function suggestDistinctLibraryName(
+  baseName: string,
+  compounds: readonly LibraryCompound[],
+): string {
+  const trimmed = baseName.trim() || "Compound";
+  const taken = new Set(compounds.map((c) => c.name.trim().toLowerCase()));
+  if (!taken.has(trimmed.toLowerCase())) return trimmed;
+  let suffix = 2;
+  while (taken.has(`${trimmed} (${suffix})`.toLowerCase())) {
+    suffix++;
+  }
+  return `${trimmed} (${suffix})`;
+}
+
 // --- Reading & writing ----------------------------------------------------------
 
 /** Formats saved before CDXML support called MOLfiles "molfile". */
@@ -165,12 +191,32 @@ function normaliseFormat(value: unknown, structure: string): StructureFormat {
   return detectFormat(structure);
 }
 
+function enrichStructureFields(compound: LibraryCompound): LibraryCompound {
+  if (!compound.cdxml && compound.format === "cdxml" && /<CDXML[\s>]/i.test(compound.structure)) {
+    compound.cdxml = compound.structure.trim();
+  }
+  return compound;
+}
+
 function normaliseCompound(raw: unknown): LibraryCompound | null {
   if (!raw || typeof raw !== "object") return null;
   const r = raw as Record<string, unknown>;
   const name = typeof r.name === "string" ? r.name.trim() : "";
-  const structure = typeof r.structure === "string" ? r.structure : "";
-  if (!name || structure.trim() === "") return null;
+  const rawCdxml =
+    typeof r.cdxml === "string" && /<CDXML[\s>]/i.test(r.cdxml) ? r.cdxml.trim() : undefined;
+  const rawImageDataUrl =
+    typeof r.imageDataUrl === "string" && r.imageDataUrl.trim().startsWith("data:image/")
+      ? r.imageDataUrl.trim()
+      : undefined;
+  const rawStructure = typeof r.structure === "string" ? r.structure : "";
+  const structure = rawStructure.trim() ? rawStructure : rawCdxml ?? "";
+  const mw = positiveNumber(r.mw);
+  const density = positiveNumber(r.density);
+
+  if (!name) {
+    return null;
+  }
+
   const compound: LibraryCompound = {
     id: typeof r.id === "string" && r.id ? r.id : uid(),
     name,
@@ -178,11 +224,11 @@ function normaliseCompound(raw: unknown): LibraryCompound | null {
     format: normaliseFormat(r.format, structure),
     notes: typeof r.notes === "string" ? r.notes : "",
   };
-  const mw = positiveNumber(r.mw);
-  const density = positiveNumber(r.density);
   if (mw !== undefined) compound.mw = mw;
   if (density !== undefined) compound.density = density;
-  return compound;
+  if (rawCdxml) compound.cdxml = rawCdxml;
+  if (rawImageDataUrl) compound.imageDataUrl = rawImageDataUrl;
+  return enrichStructureFields(compound);
 }
 
 function parseLibrary(text: string): LibraryCompound[] {
@@ -347,13 +393,29 @@ export function useLibrary() {
         return { ok: false, error: "The library file could not be read, so nothing was changed." };
       }
       const name = input.name.trim();
-      const structure = cleanStructure(input.structure, input.fileName);
+      const rawStruct = input.structure ?? input.cdxml ?? "";
+      const structure = cleanStructure(rawStruct, input.fileName);
+      const cdxml =
+        input.cdxml && /<CDXML[\s>]/i.test(input.cdxml)
+          ? input.cdxml.trim()
+          : /<CDXML[\s>]/i.test(structure)
+            ? structure
+            : undefined;
+      const imageDataUrl =
+        input.imageDataUrl && input.imageDataUrl.trim().startsWith("data:image/")
+          ? input.imageDataUrl.trim()
+          : undefined;
+      const mw = positiveNumber(input.mw);
+      const density = positiveNumber(input.density);
+
+      const notes = (input.notes ?? "").trim();
+
       if (!name) return { ok: false, error: "Give the compound a name." };
-      if (!structure) {
-        return { ok: false, error: "Paste a SMILES, MOLfile or CDXML for the structure." };
+      if (!structure && !cdxml && !imageDataUrl && mw === undefined && !notes) {
+        return { ok: false, error: "Paste a structure or enter a molecular weight." };
       }
-      const format = detectFormat(structure, input.fileName);
-      if (format === "cdxml" && !/<CDXML[\s>]/i.test(structure)) {
+      const format = detectFormat(structure || cdxml || "", input.fileName);
+      if (structure && format === "cdxml" && !/<CDXML[\s>]/i.test(structure)) {
         return { ok: false, error: "That does not look like a ChemDraw CDXML file." };
       }
       for (const [label, value] of [
@@ -364,22 +426,193 @@ export function useLibrary() {
           return { ok: false, error: `${label} must be a positive number.` };
         }
       }
-      const compound: LibraryCompound = {
+      const compound: LibraryCompound = enrichStructureFields({
         id: uid(),
         name,
-        structure,
+        structure: structure || cdxml || "",
         format,
-        notes: (input.notes ?? "").trim(),
-      };
-      const mw = positiveNumber(input.mw);
-      const density = positiveNumber(input.density);
-      if (mw !== undefined) compound.mw = mw;
-      if (density !== undefined) compound.density = density;
+        notes,
+        ...(mw !== undefined ? { mw } : {}),
+        ...(density !== undefined ? { density } : {}),
+        ...(cdxml ? { cdxml } : {}),
+        ...(imageDataUrl ? { imageDataUrl } : {}),
+      });
       const next = [...(getSnapshot() ?? []), compound].sort(byName);
       cache = next;
       emit();
       persist(next);
       return { ok: true, compound };
+    },
+    [],
+  );
+
+  /**
+   * Update an existing compound in the Personal Library by `id`.
+   * Supports editing Name, MW, Density, Notes/Formula, and replacing or clearing its Structure.
+   */
+  const update = useCallback(
+    (
+      id: string,
+      input: CompoundInput & { clearStructure?: boolean },
+    ): { ok: true; compound: LibraryCompound } | { ok: false; error: string } => {
+      if (cache === null) return { ok: false, error: "The library is still loading." };
+      if (readFailed) {
+        return { ok: false, error: "The library file could not be read, so nothing was changed." };
+      }
+      const current = getSnapshot() ?? [];
+      const existingIdx = current.findIndex((c) => c.id === id);
+      if (existingIdx < 0) {
+        return { ok: false, error: "That compound was not found in the library." };
+      }
+      const prev = current[existingIdx];
+
+      const name = input.name.trim();
+      if (!name) return { ok: false, error: "Give the compound a name." };
+
+      for (const [label, value] of [
+        ["Molecular weight", input.mw],
+        ["Density", input.density],
+      ] as const) {
+        if (value != null && positiveNumber(value) === undefined) {
+          return { ok: false, error: `${label} must be a positive number.` };
+        }
+      }
+
+      const mw = input.mw !== undefined ? positiveNumber(input.mw) : prev.mw;
+      const density = input.density !== undefined ? positiveNumber(input.density) : prev.density;
+      const notes = input.notes !== undefined ? input.notes.trim() : prev.notes;
+
+      let nextStructure = prev.structure;
+      let nextCdxml = prev.cdxml;
+      let nextImage = prev.imageDataUrl;
+      let nextFormat = prev.format;
+
+      if (input.clearStructure) {
+        nextStructure = "";
+        nextCdxml = undefined;
+        nextImage = undefined;
+        nextFormat = "smiles";
+      } else if (
+        input.structure !== undefined ||
+        input.cdxml !== undefined ||
+        input.imageDataUrl !== undefined
+      ) {
+        const rawStruct = input.structure ?? input.cdxml ?? "";
+        const cleaned = cleanStructure(rawStruct, input.fileName);
+        nextStructure = cleaned;
+        nextFormat = detectFormat(cleaned || input.cdxml || "", input.fileName);
+        if (cleaned && nextFormat === "cdxml" && !/<CDXML[\s>]/i.test(cleaned)) {
+          return { ok: false, error: "That does not look like a ChemDraw CDXML file." };
+        }
+        nextCdxml =
+          input.cdxml && /<CDXML[\s>]/i.test(input.cdxml)
+            ? input.cdxml.trim()
+            : /<CDXML[\s>]/i.test(cleaned)
+              ? cleaned
+              : undefined;
+        nextImage =
+          input.imageDataUrl && input.imageDataUrl.trim().startsWith("data:image/")
+            ? input.imageDataUrl.trim()
+            : undefined;
+      }
+
+      const updated: LibraryCompound = enrichStructureFields({
+        id: prev.id,
+        name,
+        structure: nextStructure || nextCdxml || "",
+        format: nextFormat,
+        notes,
+        ...(mw !== undefined ? { mw } : {}),
+        ...(density !== undefined ? { density } : {}),
+        ...(nextCdxml ? { cdxml: nextCdxml } : {}),
+        ...(nextImage ? { imageDataUrl: nextImage } : {}),
+      });
+
+      const next = current.map((c, i) => (i === existingIdx ? updated : c)).sort(byName);
+      cache = next;
+      emit();
+      persist(next);
+      return { ok: true, compound: updated };
+    },
+    [],
+  );
+
+  /**
+   * Save or update a compound in the Personal Library by name (case-insensitive).
+   * Used by the 1-click "Save to Library" buttons under the Reactant/Product zones and in ProductYieldCard.
+   */
+  const upsert = useCallback(
+    (input: CompoundInput): { ok: true; compound: LibraryCompound } | { ok: false; error: string } => {
+      if (cache === null) return { ok: false, error: "The library is still loading." };
+      if (readFailed) {
+        return { ok: false, error: "The library file could not be read, so nothing was changed." };
+      }
+      const name = input.name.trim();
+      if (!name) return { ok: false, error: "Give the compound a name." };
+
+      const rawStruct = input.structure ?? input.cdxml ?? "";
+      const structure = cleanStructure(rawStruct, input.fileName);
+      const cdxml =
+        input.cdxml && /<CDXML[\s>]/i.test(input.cdxml)
+          ? input.cdxml.trim()
+          : /<CDXML[\s>]/i.test(structure)
+            ? structure
+            : undefined;
+      const imageDataUrl =
+        input.imageDataUrl && input.imageDataUrl.trim().startsWith("data:image/")
+          ? input.imageDataUrl.trim()
+          : undefined;
+      const mw = positiveNumber(input.mw);
+      const density = positiveNumber(input.density);
+
+      const current = getSnapshot() ?? [];
+      const existingIdx = current.findIndex(
+        (c) => c.name.trim().toLowerCase() === name.toLowerCase(),
+      );
+
+      if (existingIdx >= 0) {
+        const prev = current[existingIdx];
+        const nextStruct = structure || cdxml || prev.structure;
+        const nextCdxml = cdxml ?? prev.cdxml;
+        const nextImage = imageDataUrl ?? prev.imageDataUrl;
+        const updated: LibraryCompound = enrichStructureFields({
+          ...prev,
+          name,
+          structure: nextStruct,
+          format: nextStruct ? detectFormat(nextStruct, input.fileName) : prev.format,
+          notes: input.notes !== undefined ? input.notes.trim() : prev.notes,
+          mw: mw ?? prev.mw,
+          density: density ?? prev.density,
+          ...(nextCdxml ? { cdxml: nextCdxml } : {}),
+          ...(nextImage ? { imageDataUrl: nextImage } : {}),
+        });
+        const next = current.map((c, i) => (i === existingIdx ? updated : c)).sort(byName);
+        cache = next;
+        emit();
+        persist(next);
+        return { ok: true, compound: updated };
+      }
+
+      if (!structure && !cdxml && !imageDataUrl && mw === undefined) {
+        return { ok: false, error: "Draw a structure or enter a molecular weight first." };
+      }
+
+      const created: LibraryCompound = enrichStructureFields({
+        id: uid(),
+        name,
+        structure: structure || cdxml || "",
+        format: detectFormat(structure || cdxml || "", input.fileName),
+        notes: (input.notes ?? "").trim(),
+        ...(mw !== undefined ? { mw } : {}),
+        ...(density !== undefined ? { density } : {}),
+        ...(cdxml ? { cdxml } : {}),
+        ...(imageDataUrl ? { imageDataUrl } : {}),
+      });
+      const next = [...current, created].sort(byName);
+      cache = next;
+      emit();
+      persist(next);
+      return { ok: true, compound: created };
     },
     [],
   );
@@ -392,5 +625,12 @@ export function useLibrary() {
     persist(next);
   }, []);
 
-  return { compounds: compounds ? [...compounds].sort(byName) : null, error, add, remove };
+  return {
+    compounds: compounds ? [...compounds].sort(byName) : null,
+    error,
+    add,
+    update,
+    upsert,
+    remove,
+  };
 }

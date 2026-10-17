@@ -418,3 +418,105 @@ export function yieldSummary(experiment: Experiment): string | null {
   const base = `${Math.round(primary.percent)}%`;
   return extra > 0 ? `${base} (+${Math.round(extra)}%)` : base;
 }
+
+// --- Per-product color palette & CV elution bands ----------------------------
+
+export interface ProductColor {
+  hex: string;
+  text: string;
+  badgeBg: string;
+}
+
+export const PRODUCT_PALETTE: readonly ProductColor[] = [
+  { hex: "#10b981", text: "#047857", badgeBg: "#ecfdf5" }, // Product 1 / F1: Emerald/Teal
+  { hex: "#f59e0b", text: "#b45309", badgeBg: "#fffbeb" }, // Product 2 / F2: Amber/Orange
+  { hex: "#8b5cf6", text: "#6d28d9", badgeBg: "#f5f3ff" }, // Product 3 / F3: Violet/Purple
+  { hex: "#f43f5e", text: "#be123c", badgeBg: "#fff1f2" }, // Product 4 / F4: Rose/Pink
+  { hex: "#0ea5e9", text: "#0369a1", badgeBg: "#f0f9ff" }, // Product 5 / F5: Sky Blue
+];
+
+export function productColorAt(index: number): ProductColor {
+  return PRODUCT_PALETTE[index % PRODUCT_PALETTE.length];
+}
+
+export interface ProductElutionBand {
+  id: string;
+  name: string;
+  startCv: number;
+  endCv: number;
+  color: ProductColor;
+}
+
+/**
+ * Resolve every product that has a valid elution CV window (`startCv` and `endCv`),
+ * paired with its resolved fraction/product name (`GH055` or `GH055-F1`, `GH055-F2`, ...)
+ * and distinct palette color. Falls back to `legacyWindow` if no product has an elution window.
+ */
+export function resolveProductElutionBands(
+  experimentId: string,
+  product?: ProductInfo,
+  secondary: readonly SecondaryProduct[] = [],
+  legacyWindow?: { startCv: number; endCv: number; label?: string },
+): ProductElutionBand[] {
+  const idPrefix = (experimentId ?? "").trim();
+  const primaryFallback =
+    secondary.length > 0
+      ? idPrefix
+        ? `${idPrefix}-F1`
+        : "F1"
+      : idPrefix || "F1";
+  const rawPrimaryName = product?.name?.trim() ?? "";
+  const primaryName =
+    rawPrimaryName === "" ||
+    (secondary.length > 0 &&
+      idPrefix !== "" &&
+      rawPrimaryName.toUpperCase() === idPrefix.toUpperCase())
+      ? primaryFallback
+      : rawPrimaryName;
+
+  const bands: ProductElutionBand[] = [];
+
+  const pStart = looseNumber(product?.elutionStartCv);
+  const pEnd = looseNumber(product?.elutionEndCv);
+  if (pStart !== null && pEnd !== null && pStart >= 0 && pEnd >= pStart && pEnd > 0) {
+    bands.push({
+      id: "primary",
+      name: primaryName,
+      startCv: pStart,
+      endCv: pEnd,
+      color: productColorAt(0),
+    });
+  }
+
+  secondary.forEach((sec, i) => {
+    const start = looseNumber(sec.elutionStartCv);
+    const end = looseNumber(sec.elutionEndCv);
+    if (start === null || end === null || start < 0 || end < start || end <= 0) return;
+    const fallback = idPrefix ? `${idPrefix}-F${i + 2}` : `F${i + 2}`;
+    bands.push({
+      id: sec.id,
+      name: sec.name.trim() || fallback,
+      startCv: start,
+      endCv: end,
+      color: productColorAt(i + 1),
+    });
+  });
+
+  if (
+    bands.length === 0 &&
+    legacyWindow &&
+    legacyWindow.startCv >= 0 &&
+    legacyWindow.endCv >= legacyWindow.startCv &&
+    legacyWindow.endCv > 0
+  ) {
+    bands.push({
+      id: "legacy-window",
+      name: legacyWindow.label?.trim() || primaryName,
+      startCv: legacyWindow.startCv,
+      endCv: legacyWindow.endCv,
+      color: productColorAt(0),
+    });
+  }
+
+  return bands;
+}

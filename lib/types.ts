@@ -56,6 +56,10 @@ export interface ProductInfo {
   massUnit: ProductMassUnit;
   /** Moles of limiting reagent consumed per mole of this product formed. 1 when missing. */
   stoichRatio?: number;
+  /** Optional flash chromatography elution start volume (CV). */
+  elutionStartCv?: number | string;
+  /** Optional flash chromatography elution end volume (CV). */
+  elutionEndCv?: number | string;
 }
 
 /**
@@ -79,6 +83,10 @@ export interface SecondaryProduct {
   stoichRatio?: number;
   /** Optional notes / appearance. */
   appearance?: string;
+  /** Optional flash chromatography elution start volume (CV). */
+  elutionStartCv?: number | string;
+  /** Optional flash chromatography elution end volume (CV). */
+  elutionEndCv?: number | string;
 }
 
 export const DEFAULT_PRODUCT: ProductInfo = {
@@ -104,6 +112,47 @@ export interface Reference {
 export const MOLECULE_MODES = ["draw", "image"] as const;
 export type MoleculeMode = (typeof MOLECULE_MODES)[number];
 
+/** 3-Zone Structured Reaction Scheme: [Reactant Zone] -> [Arrow + Above/Below Conditions] -> [Product Zone]. */
+export interface StructuredReactionScheme {
+  reactantImage?: string;    // Data URL (SVG or high-res PNG) for Left Zone (Limiting Reagent / SM)
+  reactantCdxml?: string;    // Optional raw CDXML / Molfile captured on paste
+  productImage?: string;     // Data URL (SVG or high-res PNG) for Right Zone (Product)
+  productCdxml?: string;     // Optional raw CDXML / Molfile captured on paste
+  solvent?: string;          // Below arrow: e.g. "THF" or "DCM / H2O (4:1)"
+  temperature?: string;      // Below arrow: e.g. "0 °C to rt" or "80 °C"
+  duration?: string;         // Below arrow: e.g. "16 h"
+  atmosphere?: string;       // Optional badge below arrow: e.g. "Ar", "N2", "Air"
+  extraArrowNotes?: string;  // Optional extra line above/below arrow
+}
+
+/** One coordinate point on a flash chromatography elution gradient (% Solvent B vs. CV). */
+export interface GradientPoint {
+  id: string;
+  /** Cumulative Column Volumes (X-axis, >= 0) */
+  cv: number;
+  /** % Solvent B (Y-axis, 0 to 100) */
+  percentB: number;
+}
+
+/** Optional flash chromatography elution gradient and panoramic fraction TLC strip. */
+export interface PurificationGradient {
+  enabled: boolean;
+  /** e.g., "320g SiO₂", "25g Biotage SNAP" */
+  columnSize?: string;
+  /** Pre-run equilibration volume in CV, e.g., 2 or 3 */
+  equilibrationCv?: number;
+  /** Weak / primary eluent, e.g., "Cyclohexane" */
+  solventA: string;
+  /** Strong / polar eluent, e.g., "EtOAc" */
+  solventB: string;
+  /** Ordered points (CV, %B) */
+  points: GradientPoint[];
+  /** Optional shaded elution window where product eluted */
+  productWindow?: { startCv: number; endCv: number; label?: string };
+  /** Optional panoramic TLC strip image (data URL) showing consecutive tubes/fractions */
+  fractionTlcImage?: string;
+}
+
 export interface Experiment {
   id: string; // e.g. "GH00001"
   title: string;
@@ -121,8 +170,12 @@ export interface Experiment {
    * (desktop: `Documents/Fumebook/attachments/[id]/molecule.png`). The bytes are not in this JSON.
    */
   moleculeImage: boolean;
+  /** Optional 3-zone structured reaction scheme ([Reactant] -> [Arrow + Conditions] -> [Product]). */
+  structuredScheme?: StructuredReactionScheme;
   procedureText: string;
   purificationText: string;
+  /** Optional flash chromatography elution gradient & panoramic fraction TLC strip. */
+  purificationGradient?: PurificationGradient;
   commentsText: string;
   reagents: ReagentRow[];
   product: ProductInfo;
@@ -162,6 +215,10 @@ export function newSecondaryProduct(
   name = "",
 ): SecondaryProduct {
   return { id: uid(), name, mw: "", mass: "", massUnit, stoichRatio: 1 };
+}
+
+export function newGradientPoint(cv = 0, percentB = 0): GradientPoint {
+  return { id: uid(), cv, percentB };
 }
 
 export function newRow(role: Role = "Reagent"): ReagentRow {

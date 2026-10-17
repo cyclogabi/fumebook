@@ -4,6 +4,7 @@ import { useRef, useState } from "react";
 import MoleculeSection, { type MoleculeSectionHandle } from "./MoleculeSection";
 import NmrRoom from "./NmrRoom";
 import ProductYieldCard from "./ProductYieldCard";
+import PurificationSection from "./PurificationSection";
 import RichTextarea from "./RichTextarea";
 import ReagentTable from "./ReagentTable";
 import ReferencesSection from "./ReferencesSection";
@@ -109,6 +110,15 @@ export default function ExperimentEditor({
             onModeChange={(moleculeMode) => onUpdate({ moleculeMode })}
             hasImage={experiment.moleculeImage}
             onHasImageChange={(moleculeImage) => onUpdate({ moleculeImage })}
+            structuredScheme={experiment.structuredScheme}
+            onStructuredSchemeChange={(structuredScheme) => onUpdate({ structuredScheme })}
+            reagents={experiment.reagents}
+            onReagentsChange={(fn) => onUpdate((exp) => ({ reagents: fn(exp.reagents) }))}
+            product={experiment.product}
+            onProductChange={(patch) =>
+              onUpdate((exp) => ({ product: { ...exp.product, ...patch } }))
+            }
+            secondaryProducts={experiment.secondaryProducts}
             onOpenLibrary={onOpenLibrary}
           />
 
@@ -123,8 +133,8 @@ export default function ExperimentEditor({
               onRows={(fn) => onUpdate((exp) => ({ reagents: fn(exp.reagents) }))}
               onUnits={(units) => onUpdate({ units })}
               onColumns={(columns) => onUpdate({ columns })}
-              onInsertStructure={async (compound) =>
-                (await moleculeRef.current?.insertCompound(compound)) ??
+              onInsertStructure={async (compound, preferredZone) =>
+                (await moleculeRef.current?.insertCompound(compound, preferredZone)) ??
                 "The sketcher is not ready yet."
               }
             />
@@ -140,16 +150,6 @@ export default function ExperimentEditor({
             />
           </div>
 
-          <div className={!experiment.purificationText?.trim() ? "print:hidden" : ""}>
-            <RichTextarea
-              label="Purification"
-              value={experiment.purificationText}
-              onChange={(purificationText) => onUpdate({ purificationText })}
-              placeholder="Work-up and purification: extraction, column conditions, yield…"
-              minRows={3}
-            />
-          </div>
-
           <div className={experiment.tlcImages.length === 0 ? "print:hidden" : ""}>
             <TlcDropzone
               images={experiment.tlcImages}
@@ -162,6 +162,16 @@ export default function ExperimentEditor({
             />
           </div>
 
+          <PurificationSection
+            experimentId={experiment.id}
+            purificationText={experiment.purificationText}
+            onPurificationTextChange={(purificationText) => onUpdate({ purificationText })}
+            gradient={experiment.purificationGradient}
+            onGradientChange={(purificationGradient) => onUpdate({ purificationGradient })}
+            product={experiment.product}
+            secondaryProducts={experiment.secondaryProducts}
+          />
+
           <ProductYieldCard
             experimentId={experiment.id}
             product={experiment.product}
@@ -173,6 +183,8 @@ export default function ExperimentEditor({
             onSecondaryChange={(fn) =>
               onUpdate((exp) => ({ secondaryProducts: fn(exp.secondaryProducts ?? []) }))
             }
+            productCdxml={experiment.structuredScheme?.productCdxml}
+            productImage={experiment.structuredScheme?.productImage}
           />
           <div className="print:hidden">
             <button

@@ -23,14 +23,41 @@ let nativeReadText: (() => Promise<string>) | null = null;
 const NATIVE_READ_TIMEOUT_MS = 1500;
 
 /**
+ * Read the native clipboard image (`CF_DIB` / bitmap) via `arboard` in Rust and return it
+ * as a `data:image/png;base64,...` string, or `null` when the clipboard has no image.
+ */
+export async function readClipboardImageBase64(): Promise<string | null> {
+  if (!isTauri()) return null;
+  try {
+    const dataUrl = await invoke<string>("read_clipboard_image_base64");
+    return dataUrl && dataUrl.startsWith("data:image/") ? dataUrl : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read ChemDraw's custom clipboard formats (`CDXML` / `MDLCT` Molfile / `SMILES`) via Rust.
+ */
+export async function readChemDrawClipboard(): Promise<string | null> {
+  if (!isTauri()) return null;
+  try {
+    const raw = await invoke<string | null>("read_chemdraw_clipboard");
+    const cleaned = cleanClipboardText(raw ?? "");
+    return isValidChemicalText(cleaned) ? cleaned : null;
+  } catch (err) {
+    console.warn("ChemDraw clipboard invoke failed:", err);
+    return null;
+  }
+}
+
+/**
  * Read the clipboard as text for the sketcher's paste, trying in order:
  *
- * 1. The Tauri clipboard plugin's `readText()` (desktop only). Valid chemical text, such as the
- *    SMILES from ChemDraw's Ctrl+Alt+C, is returned straight away.
- * 2. The webview's own `navigator.clipboard.readText()`, in case the plugin failed.
- * 3. Only if neither produced a valid structure, the native `read_chemdraw_clipboard` command,
- *    which reads ChemDraw's custom Windows clipboard formats (a plain Ctrl+C leaves the text slot
- *    empty).
+ * 1. ChemDraw's own Windows clipboard formats (`read_chemdraw_clipboard`), which preserves
+ *    full `CDXML` or `MDLCT` Molfile 2D/3D coordinates before falling back to 1D text.
+ * 2. The Tauri clipboard plugin's `readText()` (desktop only).
+ * 3. The webview's own `navigator.clipboard.readText()`, in case the plugin failed.
  *
  * Every step has its own try/catch: a failing step (plugin error, permission refusal, command
  * missing or erroring) just moves on to the next, and this never throws. Without a valid
@@ -46,7 +73,17 @@ export async function readClipboardText(): Promise<string> {
     return null;
   };
 
-  // Step A: the Tauri plugin.
+  // Step A: ChemDraw's own clipboard formats (Windows desktop) — preserves CDXML / MDLCT coordinates.
+  if (desktop) {
+    try {
+      const valid = consider(await invoke<string | null>("read_chemdraw_clipboard"));
+      if (valid) return valid;
+    } catch (err) {
+      console.warn("ChemDraw clipboard invoke failed:", err);
+    }
+  }
+
+  // Step B: the Tauri plugin.
   if (desktop) {
     try {
       const valid = consider(await readText());
@@ -56,7 +93,7 @@ export async function readClipboardText(): Promise<string> {
     }
   }
 
-  // Step B: the webview's own clipboard API (the original, not the bridge's replacement).
+  // Step C: the webview's own clipboard API (the original, not the bridge's replacement).
   try {
     const read = nativeReadText ?? navigator.clipboard?.readText?.bind(navigator.clipboard);
     if (read) {
@@ -69,16 +106,6 @@ export async function readClipboardText(): Promise<string> {
     }
   } catch {
     // Permission refused or no clipboard API.
-  }
-
-  // Step C: ChemDraw's own clipboard formats (Windows desktop).
-  if (desktop) {
-    try {
-      const valid = consider(await invoke<string | null>("read_chemdraw_clipboard"));
-      if (valid) return valid;
-    } catch (err) {
-      console.warn("ChemDraw clipboard invoke failed:", err);
-    }
   }
 
   return found;
