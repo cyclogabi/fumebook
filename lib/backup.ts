@@ -43,7 +43,8 @@ import {
   readStartNumber,
   START_NUMBER_DEFAULT,
 } from "./initials";
-import { loadLibrary, normaliseCompounds, type LibraryCompound } from "./library";
+import { withAiReactionData } from "./aiReaction";
+import { getLibraryCompounds, loadLibrary, normaliseCompounds, type LibraryCompound } from "./library";
 import {
   COLUMN_KEYS,
   PRODUCT_MASS_UNITS,
@@ -100,6 +101,7 @@ const messageOf = (e: unknown) => (e instanceof Error ? e.message : String(e));
 export async function buildExperimentBundle(
   experiment: Experiment,
   now = new Date(),
+  library?: readonly LibraryCompound[],
 ): Promise<ExperimentBundle> {
   let moleculeImageBase64: string | null = null;
   let nmrWorkspace: string | null = null;
@@ -114,11 +116,22 @@ export async function buildExperimentBundle(
   } catch (err) {
     throw new Error(`The NMR workspace of ${experiment.id} could not be read: ${messageOf(err)}`);
   }
+  let compounds: readonly LibraryCompound[];
+  if (library) {
+    compounds = library;
+  } else {
+    try {
+      compounds = await loadLibrary();
+    } catch {
+      compounds = getLibraryCompounds();
+    }
+  }
+  const prepared = withAiReactionData(experiment, compounds);
   return {
     format: EXPERIMENT_FORMAT,
     version: BACKUP_VERSION,
     exportedAt: now.toISOString(),
-    experiment: { ...experiment, moleculeImage: moleculeImageBase64 !== null, tlcImages: [] },
+    experiment: { ...prepared, moleculeImage: moleculeImageBase64 !== null, tlcImages: [] },
     moleculeImageBase64,
     tlcImages: experiment.tlcImages,
     nmrWorkspace,
@@ -130,13 +143,15 @@ export async function buildFullBackup(
   experiments: Experiment[],
   now = new Date(),
 ): Promise<FullBackupBundle> {
-  const bundles: ExperimentBundle[] = [];
-  for (const experiment of experiments) bundles.push(await buildExperimentBundle(experiment, now));
   let library: LibraryCompound[];
   try {
     library = await loadLibrary();
   } catch (err) {
     throw new Error(`The Personal Library could not be read: ${messageOf(err)}`);
+  }
+  const bundles: ExperimentBundle[] = [];
+  for (const experiment of experiments) {
+    bundles.push(await buildExperimentBundle(experiment, now, library));
   }
   return {
     format: BACKUP_FORMAT,
@@ -349,6 +364,26 @@ export function experimentProblem(raw: unknown): string | null {
     ] as const) {
       if (s[txtField] !== undefined && s[txtField] !== null && !isStr(s[txtField])) {
         return `structuredScheme.${txtField} must be text`;
+      }
+    }
+  }
+
+  if (raw.msSpectrum !== undefined && raw.msSpectrum !== null) {
+    const s = raw.msSpectrum;
+    if (!isObj(s)) return "msSpectrum must be an object";
+    if (!optStr(s.fileName) || !optStr(s.ionizationMode) || !optStr(s.targetNote)) {
+      return "msSpectrum text fields must be strings";
+    }
+    if (!optNum(s.mzMin) || !optNum(s.mzMax)) {
+      return "msSpectrum m/z range must be numeric";
+    }
+    if (s.peaks !== undefined) {
+      if (!Array.isArray(s.peaks)) return "msSpectrum.peaks must be a list";
+      for (const [i, peak] of s.peaks.entries()) {
+        if (!isObj(peak)) return `msSpectrum peak ${i + 1} is not an object`;
+        if (!optNum(peak.mz) || !optNum(peak.intensity) || !optNum(peak.rawIntensity)) {
+          return `msSpectrum peak ${i + 1} must have numeric m/z and intensity`;
+        }
       }
     }
   }

@@ -23,6 +23,9 @@ import {
   type StructuredReactionScheme,
   type UnitKind,
 } from "./types";
+import type { AiReactionRecord, MsPeak, MsSpectrumData } from "@/types/experiment";
+import { withAiReactionData } from "./aiReaction";
+import { getLibraryCompounds } from "./library";
 import { cleanDoi } from "./references";
 import { looseNumber } from "./stoich";
 import * as path from "@tauri-apps/api/path";
@@ -117,6 +120,7 @@ const num = (v: unknown): number | null =>
 
 function normaliseRow(raw: Partial<ReagentRow> | null | undefined): ReagentRow {
   const r = raw ?? {};
+  const smiles = typeof r.smiles === "string" ? r.smiles.trim() : "";
   return {
     id: typeof r.id === "string" ? r.id : uid(),
     name: typeof r.name === "string" ? r.name : "",
@@ -127,6 +131,35 @@ function normaliseRow(raw: Partial<ReagentRow> | null | undefined): ReagentRow {
     mass: num(r.mass),
     vol: num(r.vol),
     density: num(r.density),
+    ...(smiles ? { smiles } : {}),
+  };
+}
+
+function normaliseAiReaction(raw: unknown): AiReactionRecord | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const r = raw as Partial<AiReactionRecord>;
+  const text = (value: unknown) => (typeof value === "string" ? value : "");
+  const list = (value: unknown) =>
+    Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+  const yieldPercent =
+    r.yieldPercent === null
+      ? null
+      : typeof r.yieldPercent === "number" && Number.isFinite(r.yieldPercent)
+        ? r.yieldPercent
+        : null;
+  return {
+    reactionSmiles: text(r.reactionSmiles),
+    mappedCoreSmiles: text(r.mappedCoreSmiles),
+    reactantSmiles: text(r.reactantSmiles),
+    agentSmiles: list(r.agentSmiles),
+    productSmiles: text(r.productSmiles),
+    reagentNames: list(r.reagentNames),
+    solvent: text(r.solvent),
+    temperature: text(r.temperature),
+    time: text(r.time),
+    atmosphere: text(r.atmosphere),
+    yieldPercent,
+    updatedAt: text(r.updatedAt) || new Date(0).toISOString(),
   };
 }
 
@@ -243,6 +276,45 @@ function normalisePurificationGradient(raw: unknown): PurificationGradient | und
   };
 }
 
+function normaliseMsPeak(raw: unknown): MsPeak | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const mz = looseNumber(r.mz);
+  const intensity = looseNumber(r.intensity);
+  if (mz === null || intensity === null || !Number.isFinite(mz) || !Number.isFinite(intensity)) {
+    return null;
+  }
+  const peak: MsPeak = { mz, intensity: Math.max(0, intensity) };
+  const rawIntensity = looseNumber(r.rawIntensity);
+  if (rawIntensity !== null && Number.isFinite(rawIntensity)) {
+    peak.rawIntensity = rawIntensity;
+  }
+  return peak;
+}
+
+function normaliseMsSpectrum(raw: unknown): MsSpectrumData | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const s = raw as Record<string, unknown>;
+  const fileName = typeof s.fileName === "string" ? s.fileName.trim() : "";
+  const peaks = Array.isArray(s.peaks)
+    ? s.peaks.map(normaliseMsPeak).filter((p): p is MsPeak => p !== null)
+    : [];
+  if (!fileName && peaks.length === 0) return undefined;
+  const mzMin = looseNumber(s.mzMin);
+  const mzMax = looseNumber(s.mzMax);
+  const ionizationMode = typeof s.ionizationMode === "string" ? s.ionizationMode.trim() : "";
+  const targetNote = typeof s.targetNote === "string" ? s.targetNote.trim() : "";
+  const spectrum: MsSpectrumData = {
+    fileName: fileName || "spectrum",
+    peaks,
+  };
+  if (ionizationMode) spectrum.ionizationMode = ionizationMode;
+  if (targetNote) spectrum.targetNote = targetNote;
+  if (mzMin !== null && Number.isFinite(mzMin)) spectrum.mzMin = mzMin;
+  if (mzMax !== null && Number.isFinite(mzMax)) spectrum.mzMax = mzMax;
+  return spectrum;
+}
+
 function normaliseStructuredScheme(raw: unknown): StructuredReactionScheme | undefined {
   if (!raw || typeof raw !== "object") return undefined;
   const s = raw as Partial<Record<keyof StructuredReactionScheme, unknown>>;
@@ -311,6 +383,16 @@ export function normaliseExperiment(raw: Partial<Experiment>): Experiment | null
 
   const purificationGradient = normalisePurificationGradient(raw.purificationGradient);
   const structuredScheme = normaliseStructuredScheme(raw.structuredScheme);
+  const msSpectrum = normaliseMsSpectrum(raw.msSpectrum);
+  const reactantSmiles =
+    typeof raw.reactantSmiles === "string" && raw.reactantSmiles.trim()
+      ? raw.reactantSmiles.trim()
+      : undefined;
+  const productSmiles =
+    typeof raw.productSmiles === "string" && raw.productSmiles.trim()
+      ? raw.productSmiles.trim()
+      : undefined;
+  const aiReactionData = normaliseAiReaction(raw.aiReactionData);
 
   return {
     id: raw.id,
@@ -340,6 +422,10 @@ export function normaliseExperiment(raw: Partial<Experiment>): Experiment | null
       : [],
     units,
     columns,
+    ...(msSpectrum ? { msSpectrum } : {}),
+    ...(reactantSmiles ? { reactantSmiles } : {}),
+    ...(productSmiles ? { productSmiles } : {}),
+    ...(aiReactionData ? { aiReactionData } : {}),
   };
 }
 
@@ -395,13 +481,14 @@ export async function getAllExperiments(): Promise<Experiment[]> {
 
 /** Create or overwrite one experiment (`experiments/[id].json`). */
 export async function saveExperiment(experiment: Experiment): Promise<void> {
+  const prepared = withAiReactionData(experiment, getLibraryCompounds());
   if (!isTauri()) {
-    const rest = readFromStorage().filter((e) => e.id !== experiment.id);
-    writeToStorage([...rest, experiment]);
+    const rest = readFromStorage().filter((e) => e.id !== prepared.id);
+    writeToStorage([...rest, prepared]);
     return;
   }
   await initStorage();
-  await writeTextFile(await experimentFilePath(experiment.id), JSON.stringify(experiment, null, 2));
+  await writeTextFile(await experimentFilePath(prepared.id), JSON.stringify(prepared, null, 2));
 }
 
 /**

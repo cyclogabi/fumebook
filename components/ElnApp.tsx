@@ -4,9 +4,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import BackupModal, { type ImportMode } from "./BackupModal";
 import Dashboard from "./Dashboard";
 import ExperimentEditor from "./ExperimentEditor";
-import FumebookLogo from "./FumebookLogo";
 import ImportConflictModal from "./ImportConflictModal";
-import LibraryModal from "./LibraryModal";
+import LibraryModal, { type LibraryDraft } from "./LibraryModal";
 import OnboardingModal from "./OnboardingModal";
 import ParseProtocolModal from "./ParseProtocolModal";
 import Sidebar from "./Sidebar";
@@ -67,6 +66,7 @@ export default function ElnApp() {
   const [importOpen, setImportOpen] = useState(false);
   const [parseOpen, setParseOpen] = useState(false);
   const [libraryOpen, setLibraryOpen] = useState(false);
+  const [libraryDraft, setLibraryDraft] = useState<LibraryDraft | null>(null);
   const [profileOpen, setProfileOpen] = useState(false);
   const [toast, setToast] = useState<ToastMessage | null>(null);
   const toastSeq = useRef(0);
@@ -261,8 +261,9 @@ export default function ElnApp() {
     setImportOpen(true);
   }
 
-  function openLibrary() {
+  function openLibrary(draft?: LibraryDraft) {
     setDrawerOpen(false);
+    setLibraryDraft(draft ?? null);
     setLibraryOpen(true);
   }
 
@@ -417,10 +418,17 @@ export default function ElnApp() {
           <button
             type="button"
             onClick={() => select(null)}
-            className="flex items-center gap-2 text-left"
+            className="flex items-center gap-2.5 text-left"
           >
-            <FumebookLogo className="size-8" />
-            <span className="text-base font-bold tracking-tight text-fume-600">Fumebook</span>
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src="/logo.png"
+              alt="Fumebook Logo"
+              className="w-7 h-7 rounded-md object-contain"
+            />
+            <span className="text-base font-semibold tracking-tight text-zinc-900">
+              Fumebook
+            </span>
           </button>
 
           <div className="ml-auto flex items-center gap-2">
@@ -430,7 +438,7 @@ export default function ElnApp() {
               disabled={!initials}
               aria-label="Profile and settings"
               title={`Profile & settings: ${initials || "…"}, numbering from ${startNumber}`}
-              className="grid size-9 shrink-0 place-items-center rounded-full border border-zinc-300 bg-white font-mono text-xs font-bold tracking-wide text-zinc-600 shadow-sm hover:bg-zinc-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-fume-500 disabled:opacity-50"
+              className="grid size-9 shrink-0 place-items-center rounded-full border border-zinc-300 bg-white font-mono text-xs font-bold tracking-wide text-zinc-700 shadow-sm hover:bg-zinc-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-fume-500 disabled:opacity-50"
             >
               {initials || "··"}
             </button>
@@ -439,7 +447,7 @@ export default function ElnApp() {
               onClick={() => setParseOpen(true)}
               disabled={!loaded}
               title="Paste experimental text from a paper and fill in the reagents automatically"
-              className="rounded-md border border-fume-300 bg-fume-50 px-4 py-2 text-sm font-semibold text-fume-700 shadow-sm transition-colors hover:bg-fume-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-fume-500 disabled:opacity-50"
+              className="rounded-md border border-zinc-300 bg-white px-3.5 py-1.5 text-sm font-medium text-zinc-700 shadow-sm transition-colors hover:bg-zinc-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-fume-500 disabled:opacity-50"
             >
               ✨ Parse Protocol
             </button>
@@ -447,7 +455,7 @@ export default function ElnApp() {
               type="button"
               onClick={handleNew}
               disabled={!loaded}
-              className="flex items-center justify-center gap-2 rounded-lg border border-cyan-300 bg-[#E0FFFF] px-4 py-2 font-medium text-zinc-900 shadow-sm hover:bg-[#C6F2F2] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-400 disabled:opacity-50"
+              className="flex items-center justify-center gap-2 rounded-md bg-fume-600 px-3.5 py-1.5 text-sm font-medium text-white shadow-sm hover:bg-fume-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-fume-500 disabled:opacity-50"
             >
               + New Experiment
             </button>
@@ -520,7 +528,14 @@ export default function ElnApp() {
           onImportAsNew={() => resolveImportConflict("new-id")}
           onCancel={() => resolveImportConflict(null)}
         />
-        <LibraryModal open={libraryOpen} onClose={() => setLibraryOpen(false)} />
+        <LibraryModal
+          open={libraryOpen}
+          initialDraft={libraryDraft}
+          onClose={() => {
+            setLibraryOpen(false);
+            setLibraryDraft(null);
+          }}
+        />
         <ParseProtocolModal
           open={parseOpen}
           onClose={() => setParseOpen(false)}

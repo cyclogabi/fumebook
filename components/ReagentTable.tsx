@@ -4,7 +4,7 @@ import NumberInput, { cellInput } from "./NumberInput";
 import ReagentNameInput from "./ReagentNameInput";
 import { useEffect, useRef, useState } from "react";
 import type { ChemicalEntry } from "@/lib/chemicalDictionary";
-import { useLibrary, type LibraryCompound } from "@/lib/library";
+import { libraryCompoundSmiles, useLibrary, type LibraryCompound } from "@/lib/library";
 import {
   concentration,
   displayValue,
@@ -41,6 +41,15 @@ interface Props {
     compound: LibraryCompound,
     preferredZone?: "reactant" | "product",
   ) => Promise<string | null>;
+  /**
+   * Open the Personal Library modal pre-filled with this row's name, MW, and density
+   * so the user can paste a ChemDraw structure (Ctrl+V) and save it to their library.
+   */
+  onSaveToLibrary?: (reagent: {
+    name: string;
+    mw: number | null;
+    density: number | null;
+  }) => void;
 }
 
 /** How long the "added to the sketcher" confirmation stays under the table. */
@@ -58,7 +67,11 @@ export function applyLocalPick(rows: ReagentRow[], id: string, entry: ChemicalEn
   const target = rows.find((r) => r.id === id);
   if (!target) return rows;
 
-  let next = rows.map((r) => (r.id === id ? { ...r, name: entry.commonName } : r));
+  let next = rows.map((r) => {
+    if (r.id !== id) return r;
+    const { smiles: _previous, ...rest } = r;
+    return { ...rest, name: entry.commonName };
+  });
   if (target.role === "Reagent" || target.role === "Solvent") {
     next = setRole(next, id, entry.defaultRole);
   }
@@ -75,7 +88,12 @@ export function applyLocalPick(rows: ReagentRow[], id: string, entry: ChemicalEn
  */
 export function applyLibraryPick(rows: ReagentRow[], id: string, compound: LibraryCompound): ReagentRow[] {
   if (!rows.some((r) => r.id === id)) return rows;
-  let next = rows.map((r) => (r.id === id ? { ...r, name: compound.name } : r));
+  const smiles = libraryCompoundSmiles(compound);
+  let next = rows.map((r) => {
+    if (r.id !== id) return r;
+    const { smiles: _previous, ...rest } = r;
+    return smiles ? { ...rest, name: compound.name, smiles } : { ...rest, name: compound.name };
+  });
   next = editField(next, id, "mw", compound.mw ?? null);
   next = editField(next, id, "density", compound.density ?? null);
   return next;
@@ -87,6 +105,7 @@ export default function ReagentTable({
   onRows,
   onUnits,
   onInsertStructure,
+  onSaveToLibrary,
 }: Props) {
   const conc = concentration(rows);
   const { compounds: library } = useLibrary();
@@ -173,7 +192,7 @@ export default function ReagentTable({
                 <span className="normal-case">d</span>
                 <Sub>g/mL</Sub>
               </Th>
-              <th className="w-8 print:hidden" />
+              <th className="w-14 print:hidden" />
             </tr>
           </thead>
 
@@ -210,7 +229,14 @@ export default function ReagentTable({
                           emphasized={isLimiting}
                           className={`${cellInput} text-left ${isLimiting ? "font-medium" : ""} print:hidden`}
                           onNameChange={(name) =>
-                            onRows((cur) => cur.map((r) => (r.id === row.id ? { ...r, name } : r)))
+                            onRows((cur) =>
+                              cur.map((r) => {
+                                if (r.id !== row.id) return r;
+                                if (r.name === name) return r;
+                                const { smiles: _previous, ...rest } = r;
+                                return { ...rest, name };
+                              }),
+                            )
                           }
                           // Same path as typing an MW by hand, so n / mass / vol are recalculated
                           // by lib/stoich.ts (the limiting reagent also rescales the other rows).
@@ -312,17 +338,48 @@ export default function ReagentTable({
                   </td>
 
                   <td className="py-1 text-right print:hidden">
-                    <button
-                      type="button"
-                      title="Remove row"
-                      aria-label="Remove row"
-                      onClick={() => onRows((cur) => cur.filter((r) => r.id !== row.id))}
-                      className="rounded p-1 text-zinc-300 hover:bg-red-50 hover:text-red-600 group-hover/row:text-zinc-400"
-                    >
-                      <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-                        <path d="M4 4l8 8M12 4l-8 8" />
-                      </svg>
-                    </button>
+                    <div className="inline-flex items-center justify-end gap-0.5">
+                      {onSaveToLibrary && (
+                        <button
+                          type="button"
+                          title="Save to Library (paste ChemDraw structure)"
+                          aria-label="Save to Library"
+                          onClick={() =>
+                            onSaveToLibrary({
+                              name: row.name.trim(),
+                              mw: row.mw,
+                              density: row.density,
+                            })
+                          }
+                          className="rounded p-1 text-zinc-400 transition-colors hover:bg-fume-50 hover:text-fume-700 group-hover/row:text-zinc-500 print:hidden"
+                        >
+                          <svg
+                            viewBox="0 0 16 16"
+                            className="size-3.5"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="1.6"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            aria-hidden
+                          >
+                            <path d="M4 2.5h8a1 1 0 0 1 1 1v10l-5-3-5 3v-10a1 1 0 0 1 1-1Z" />
+                            <path d="M8 5v4M6 7h4" />
+                          </svg>
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        title="Remove row"
+                        aria-label="Remove row"
+                        onClick={() => onRows((cur) => cur.filter((r) => r.id !== row.id))}
+                        className="rounded p-1 text-zinc-300 hover:bg-red-50 hover:text-red-600 group-hover/row:text-zinc-400"
+                      >
+                        <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                          <path d="M4 4l8 8M12 4l-8 8" />
+                        </svg>
+                      </button>
+                    </div>
                   </td>
                 </tr>
               );

@@ -1,7 +1,12 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import MoleculeSection, { type MoleculeSectionHandle } from "./MoleculeSection";
+import { withAiReactionData } from "@/lib/aiReaction";
+import { applySavedReaction } from "@/lib/reactionLibrary";
+import { useLibrary } from "@/lib/library";
+import type { LibraryDraft } from "./LibraryModal";
+import MassSpecViewer from "./MassSpecViewer";
 import NmrRoom from "./NmrRoom";
 import ProductYieldCard from "./ProductYieldCard";
 import PurificationSection from "./PurificationSection";
@@ -9,6 +14,7 @@ import RichTextarea from "./RichTextarea";
 import ReagentTable from "./ReagentTable";
 import ReferencesSection from "./ReferencesSection";
 import TlcDropzone from "./TlcDropzone";
+import { useExperimentUndo } from "@/lib/experimentUndo";
 import type { ExperimentUpdate } from "@/lib/storage";
 import type { Experiment } from "@/lib/types";
 
@@ -18,8 +24,8 @@ interface Props {
   onDelete: () => void;
   /** Save just this experiment, attachments included, as [ID]_experiment.fumebook.json (native Save dialog). */
   onExport: () => void;
-  /** Open the Personal Library dialog. */
-  onOpenLibrary: () => void;
+  /** Open the Personal Library dialog, optionally pre-filled with a reagent row's name/MW/density. */
+  onOpenLibrary: (draft?: LibraryDraft) => void;
 }
 
 export function formatDate(iso: string): string {
@@ -41,6 +47,69 @@ export default function ExperimentEditor({
   const [nmrOpen, setNmrOpen] = useState(false);
   // Lets the reagent table drop a library compound's structure into the sketcher.
   const moleculeRef = useRef<MoleculeSectionHandle>(null);
+  const { compounds: library } = useLibrary();
+  const { update, undo, redo, canUndo, canRedo } = useExperimentUndo(experiment, onUpdate);
+  const undoRef = useRef(undo);
+  const redoRef = useRef(redo);
+  const onUpdateRef = useRef(onUpdate);
+  const experimentRef = useRef(experiment);
+  undoRef.current = undo;
+  redoRef.current = redo;
+  onUpdateRef.current = onUpdate;
+  experimentRef.current = experiment;
+
+  useEffect(() => {
+    if (nmrOpen) return;
+
+    function handleKeyDown(e: KeyboardEvent) {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+      const key = (e.key || "").toLowerCase();
+      const undoKey = key === "z" || e.code === "KeyZ";
+      const redoKey = key === "y" || e.code === "KeyY";
+      const isUndo = undoKey && !e.shiftKey;
+      const isRedo = redoKey || (undoKey && e.shiftKey);
+      if (!isUndo && !isRedo) return;
+      // A modal (library, confirm) keeps its own text editing. The sheet behind it still undoes
+      // from the toolbar; the shortcut stays with whichever field is focused inside the dialog.
+      const target = e.target;
+      if (target instanceof Element && target.closest("dialog, [role='dialog']")) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+      if (isUndo) undoRef.current();
+      else redoRef.current();
+    }
+
+    window.addEventListener("keydown", handleKeyDown, { capture: true });
+    return () => window.removeEventListener("keydown", handleKeyDown, { capture: true });
+  }, [nmrOpen]);
+
+  useEffect(() => {
+    const current = experimentRef.current;
+    const next = withAiReactionData(current, library ?? []);
+    if (next === current) return;
+    onUpdateRef.current({
+      reactantSmiles: next.reactantSmiles,
+      productSmiles: next.productSmiles,
+      aiReactionData: next.aiReactionData,
+    });
+  }, [experiment, library]);
+
+  function handleZoneSmiles(reactantSmiles: string | null, productSmiles: string | null) {
+    const current = experimentRef.current;
+    const nextReactant = reactantSmiles ?? "";
+    const nextProduct = productSmiles ?? "";
+    if (
+      (current.reactantSmiles ?? "") === nextReactant &&
+      (current.productSmiles ?? "") === nextProduct
+    ) {
+      return;
+    }
+    onUpdateRef.current({
+      reactantSmiles: nextReactant || undefined,
+      productSmiles: nextProduct || undefined,
+    });
+  }
 
   return (
     <div className="mx-auto w-full max-w-4xl print:max-w-none">
@@ -48,10 +117,34 @@ export default function ExperimentEditor({
 
       {/* Action bar (screen only) */}
       <div className="mb-3 flex items-center justify-between print:hidden">
-        <p className="text-sm text-zinc-500">
-          Notebook <span className="mx-1 text-zinc-300">/</span>
-          <span className="font-mono font-medium text-zinc-800">{experiment.id}</span>
-        </p>
+        <div className="flex items-center gap-3">
+          <p className="text-sm text-zinc-500">
+            Notebook <span className="mx-1 text-zinc-300">/</span>
+            <span className="font-mono font-medium text-zinc-800">{experiment.id}</span>
+          </p>
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={undo}
+              disabled={!canUndo}
+              title="Undo (Ctrl+Z)"
+              aria-label="Undo (Ctrl+Z)"
+              className="rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm font-medium text-zinc-700 shadow-sm hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Undo (↶)
+            </button>
+            <button
+              type="button"
+              onClick={redo}
+              disabled={!canRedo}
+              title="Redo (Ctrl+Y)"
+              aria-label="Redo (Ctrl+Y)"
+              className="rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm font-medium text-zinc-700 shadow-sm hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Redo (↷)
+            </button>
+          </div>
+        </div>
         <div className="flex items-center gap-2">
           <button
             type="button"
@@ -90,8 +183,8 @@ export default function ExperimentEditor({
 
           <input
             value={experiment.title}
-            onChange={(e) => onUpdate({ title: e.target.value })}
-            placeholder="Experiment title, e.g. Benzylation of 3-methylpropanol"
+            onChange={(e) => update({ title: e.target.value })}
+            placeholder="Experiment title"
             aria-label="Experiment title"
             className="-mx-2 w-[calc(100%+1rem)] rounded-md border border-transparent bg-transparent px-2 py-1 text-2xl font-semibold tracking-tight text-zinc-900 placeholder:text-zinc-300 hover:border-zinc-200 focus:border-fume-500 focus:outline-none print:hidden"
           />
@@ -105,21 +198,30 @@ export default function ExperimentEditor({
             ref={moleculeRef}
             experimentId={experiment.id}
             reactionScheme={experiment.reactionSchemeRxn}
-            onReactionSchemeChange={(reactionSchemeRxn) => onUpdate({ reactionSchemeRxn })}
+            onReactionSchemeChange={(reactionSchemeRxn) => update({ reactionSchemeRxn })}
             mode={experiment.moleculeMode}
-            onModeChange={(moleculeMode) => onUpdate({ moleculeMode })}
+            onModeChange={(moleculeMode) => update({ moleculeMode })}
             hasImage={experiment.moleculeImage}
-            onHasImageChange={(moleculeImage) => onUpdate({ moleculeImage })}
+            onHasImageChange={(moleculeImage) => update({ moleculeImage })}
             structuredScheme={experiment.structuredScheme}
-            onStructuredSchemeChange={(structuredScheme) => onUpdate({ structuredScheme })}
+            onStructuredSchemeChange={(structuredScheme) => update({ structuredScheme })}
             reagents={experiment.reagents}
-            onReagentsChange={(fn) => onUpdate((exp) => ({ reagents: fn(exp.reagents) }))}
+            onReagentsChange={(fn) => update((exp) => ({ reagents: fn(exp.reagents) }))}
             product={experiment.product}
             onProductChange={(patch) =>
-              onUpdate((exp) => ({ product: { ...exp.product, ...patch } }))
+              update((exp) => ({ product: { ...exp.product, ...patch } }))
             }
             secondaryProducts={experiment.secondaryProducts}
             onOpenLibrary={onOpenLibrary}
+            reactantSmiles={experiment.reactantSmiles}
+            productSmiles={experiment.productSmiles}
+            onZoneSmilesChange={handleZoneSmiles}
+            experimentCode={experiment.id}
+            experimentTitle={experiment.title}
+            onLoadReaction={(template) => {
+              // `update` pushes the open experiment onto the Ctrl+Z stack before replacing it.
+              update((exp) => applySavedReaction(exp, template));
+            }}
           />
 
           <section className="print:break-inside-avoid">
@@ -130,13 +232,14 @@ export default function ExperimentEditor({
               rows={experiment.reagents}
               units={experiment.units}
               columns={experiment.columns}
-              onRows={(fn) => onUpdate((exp) => ({ reagents: fn(exp.reagents) }))}
-              onUnits={(units) => onUpdate({ units })}
-              onColumns={(columns) => onUpdate({ columns })}
+              onRows={(fn) => update((exp) => ({ reagents: fn(exp.reagents) }))}
+              onUnits={(units) => update({ units })}
+              onColumns={(columns) => update({ columns })}
               onInsertStructure={async (compound, preferredZone) =>
                 (await moleculeRef.current?.insertCompound(compound, preferredZone)) ??
                 "The sketcher is not ready yet."
               }
+              onSaveToLibrary={(reagent) => onOpenLibrary(reagent)}
             />
           </section>
 
@@ -144,8 +247,8 @@ export default function ExperimentEditor({
             <RichTextarea
               label="Procedure"
               value={experiment.procedureText}
-              onChange={(procedureText) => onUpdate({ procedureText })}
-              placeholder="Describe the experimental procedure: setup, addition order, temperature, time…"
+              onChange={(procedureText) => update({ procedureText })}
+              placeholder="Experimental procedure"
               minRows={6}
             />
           </div>
@@ -154,10 +257,10 @@ export default function ExperimentEditor({
             <TlcDropzone
               images={experiment.tlcImages}
               onAdd={(added) =>
-                onUpdate((exp) => ({ tlcImages: [...exp.tlcImages, ...added] }))
+                update((exp) => ({ tlcImages: [...exp.tlcImages, ...added] }))
               }
               onRemove={(index) =>
-                onUpdate((exp) => ({ tlcImages: exp.tlcImages.filter((_, i) => i !== index) }))
+                update((exp) => ({ tlcImages: exp.tlcImages.filter((_, i) => i !== index) }))
               }
             />
           </div>
@@ -165,9 +268,9 @@ export default function ExperimentEditor({
           <PurificationSection
             experimentId={experiment.id}
             purificationText={experiment.purificationText}
-            onPurificationTextChange={(purificationText) => onUpdate({ purificationText })}
+            onPurificationTextChange={(purificationText) => update({ purificationText })}
             gradient={experiment.purificationGradient}
-            onGradientChange={(purificationGradient) => onUpdate({ purificationGradient })}
+            onGradientChange={(purificationGradient) => update({ purificationGradient })}
             product={experiment.product}
             secondaryProducts={experiment.secondaryProducts}
           />
@@ -177,31 +280,51 @@ export default function ExperimentEditor({
             product={experiment.product}
             rows={experiment.reagents}
             onChange={(patch) =>
-              onUpdate((exp) => ({ product: { ...exp.product, ...patch } }))
+              update((exp) => ({ product: { ...exp.product, ...patch } }))
             }
             secondaryProducts={experiment.secondaryProducts}
             onSecondaryChange={(fn) =>
-              onUpdate((exp) => ({ secondaryProducts: fn(exp.secondaryProducts ?? []) }))
+              update((exp) => ({ secondaryProducts: fn(exp.secondaryProducts ?? []) }))
             }
             productCdxml={experiment.structuredScheme?.productCdxml}
             productImage={experiment.structuredScheme?.productImage}
           />
-          <div className="print:hidden">
-            <button
-              type="button"
-              onClick={() => setNmrOpen(true)}
-              className="flex items-center gap-2 rounded-lg border border-cyan-300 bg-[#E0FFFF] px-4 py-2 font-semibold text-zinc-900 shadow-sm hover:bg-[#C6F2F2]"
-            >
-              🔬 Enter NMR Room
-            </button>
-          </div>
+          <section
+            className={
+              experiment.msSpectrum?.peaks.length
+                ? "print:break-inside-avoid"
+                : "print:hidden"
+            }
+          >
+            <h2 className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-zinc-500 print:hidden">
+              Characterization
+            </h2>
+            <div className="grid grid-cols-1 items-start gap-4 xl:grid-cols-2 print:grid-cols-1 print:gap-2">
+              <div className="print:hidden">
+                <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-zinc-500 xl:hidden">
+                  NMR
+                </p>
+                <button
+                  type="button"
+                  onClick={() => setNmrOpen(true)}
+                  className="flex w-full items-center justify-center gap-2 rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm font-semibold text-zinc-800 shadow-sm hover:bg-zinc-50 xl:min-h-[8rem]"
+                >
+                  🔬 Enter NMR Room
+                </button>
+              </div>
+              <MassSpecViewer
+                spectrum={experiment.msSpectrum}
+                onChange={(msSpectrum) => update({ msSpectrum })}
+              />
+            </div>
+          </section>
 
           <div className={!experiment.commentsText?.trim() ? "print:hidden" : ""}>
             <RichTextarea
               label="Comments"
               value={experiment.commentsText}
-              onChange={(commentsText) => onUpdate({ commentsText })}
-              placeholder="Observations, deviations, ideas for next time…"
+              onChange={(commentsText) => update({ commentsText })}
+              placeholder="Observations"
               minRows={2}
             />
           </div>
@@ -210,10 +333,10 @@ export default function ExperimentEditor({
             <ReferencesSection
               references={experiment.references}
               onAdd={(reference) =>
-                onUpdate((exp) => ({ references: [...exp.references, reference] }))
+                update((exp) => ({ references: [...exp.references, reference] }))
               }
               onRemove={(id) =>
-                onUpdate((exp) => ({ references: exp.references.filter((r) => r.id !== id) }))
+                update((exp) => ({ references: exp.references.filter((r) => r.id !== id) }))
               }
             />
           </div>

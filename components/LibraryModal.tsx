@@ -2,6 +2,7 @@
 
 import { useEffect, useId, useMemo, useRef, useState, type FormEvent } from "react";
 import {
+  extractCanonicalSmilesFailSafe,
   extractDualStreamClipboard,
   renderStructureToVectorSvg,
 } from "@/components/MoleculeSection";
@@ -26,6 +27,14 @@ const FORMAT_LABELS: Record<StructureFormat, string> = {
  * A typed number ("46.07", also "0,789" with a decimal comma) -> the number, `undefined` when
  * the field is empty, `null` when it is not a positive number.
  */
+/** SMILES for a structure about to be saved. Never throws — a failed conversion just omits SMILES. */
+async function smilesForSavedStructure(text: string, fileName?: string): Promise<string | undefined> {
+  const source = text.trim();
+  if (!source) return undefined;
+  if (detectFormat(source, fileName) === "smiles") return source;
+  return (await extractCanonicalSmilesFailSafe(source)) ?? undefined;
+}
+
 function parseOptionalNumber(text: string): number | undefined | null {
   const t = text.trim().replace(",", ".");
   if (t === "") return undefined;
@@ -33,9 +42,16 @@ function parseOptionalNumber(text: string): number | undefined | null {
   return Number.isFinite(value) && value > 0 ? value : null;
 }
 
+export interface LibraryDraft {
+  name: string;
+  mw?: number | null;
+  density?: number | null;
+}
+
 interface Props {
   open: boolean;
   onClose: () => void;
+  initialDraft?: LibraryDraft | null;
 }
 
 /**
@@ -43,28 +59,58 @@ interface Props {
  * Documents/Fumebook/library.json). Mounted only while open, so every opening starts fresh.
  */
 export default function LibraryModal(props: Props) {
-  return props.open ? <LibraryDialog onClose={props.onClose} /> : null;
+  return props.open ? (
+    <LibraryDialog onClose={props.onClose} initialDraft={props.initialDraft} />
+  ) : null;
 }
 
 const MAX_STRUCTURE_FILE_BYTES = 1_000_000;
+const KEY_PASTE_FALLBACK_MS = 150;
 
-function LibraryDialog({ onClose }: { onClose: () => void }) {
+function isPlainTextInput(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  const tag = target.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || target.isContentEditable;
+}
+
+function LibraryDialog({
+  onClose,
+  initialDraft,
+}: {
+  onClose: () => void;
+  initialDraft?: LibraryDraft | null;
+}) {
   const titleId = useId();
   const dialogRef = useRef<HTMLDialogElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const editFileRef = useRef<HTMLInputElement>(null);
-  const { compounds, error: libraryError, add, update, remove } = useLibrary();
+  const addPasteZoneRef = useRef<HTMLDivElement>(null);
+  const draftHydratedRef = useRef(false);
+  const { compounds, error: libraryError, add, update, upsert, remove } = useLibrary();
 
   const [query, setQuery] = useState("");
-  const [name, setName] = useState("");
+  const [name, setName] = useState(() => initialDraft?.name?.trim() ?? "");
   const [structure, setStructure] = useState("");
   const [addCdxml, setAddCdxml] = useState<string | undefined>(undefined);
   const [addImageDataUrl, setAddImageDataUrl] = useState<string | undefined>(undefined);
   /** Name of the file the structure came from (a `.cdxml` name marks the text as CDXML). */
   const [fileName, setFileName] = useState<string | undefined>(undefined);
-  const [mwText, setMwText] = useState("");
-  const [densityText, setDensityText] = useState("");
+  const [mwText, setMwText] = useState(() =>
+    initialDraft?.mw !== undefined && initialDraft?.mw !== null && initialDraft.mw > 0
+      ? String(initialDraft.mw)
+      : "",
+  );
+  const [densityText, setDensityText] = useState(() =>
+    initialDraft?.density !== undefined &&
+    initialDraft?.density !== null &&
+    initialDraft.density > 0
+      ? String(initialDraft.density)
+      : "",
+  );
   const [notes, setNotes] = useState("");
+  const [addBusy, setAddBusy] = useState(false);
+  const [addDragging, setAddDragging] = useState(false);
+  const [savedBanner, setSavedBanner] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
   /** Id of the compound whose delete button was pressed once ("Sure?" state). */
   const [confirmId, setConfirmId] = useState<string | null>(null);
@@ -88,7 +134,65 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     const dialog = dialogRef.current;
     if (dialog && !dialog.open) dialog.showModal();
-  }, []);
+    if (initialDraft) {
+      requestAnimationFrame(() => addPasteZoneRef.current?.focus());
+    }
+  }, [initialDraft]);
+
+  // If opened from a Reagents Table row whose compound already exists in the library,
+  // hydrate existing structure/notes so saving updates it in-place without losing anything.
+  useEffect(() => {
+    if (draftHydratedRef.current || !initialDraft?.name?.trim() || !compounds) return;
+    draftHydratedRef.current = true;
+    const key = initialDraft.name.trim().toLowerCase();
+    const existing = compounds.find((c) => c.name.trim().toLowerCase() === key);
+    if (!existing) return;
+    if (existing.structure || existing.cdxml) {
+      setStructure(existing.structure || existing.cdxml || "");
+    }
+    if (existing.cdxml) setAddCdxml(existing.cdxml);
+    if (existing.imageDataUrl) setAddImageDataUrl(existing.imageDataUrl);
+    if (existing.notes) setNotes(existing.notes);
+    if (!mwText && existing.mw !== undefined) setMwText(String(existing.mw));
+    if (!densityText && existing.density !== undefined) setDensityText(String(existing.density));
+  }, [compounds, densityText, initialDraft, mwText]);
+
+  // Global Ctrl+V / paste handler inside the Library modal when not typing into a plain text input
+  useEffect(() => {
+    let pasteHandledAt = 0;
+
+    function onPaste(e: ClipboardEvent) {
+      if (isPlainTextInput(e.target)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      pasteHandledAt = Date.now();
+      if (editingId) {
+        void handlePasteStructureForEdit();
+      } else {
+        void handlePasteStructureForAdd();
+      }
+    }
+
+    function onKeyDown(e: KeyboardEvent) {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey || e.key.toLowerCase() !== "v") return;
+      if (isPlainTextInput(e.target)) return;
+      window.setTimeout(() => {
+        if (Date.now() - pasteHandledAt < KEY_PASTE_FALLBACK_MS) return;
+        if (editingId) {
+          void handlePasteStructureForEdit();
+        } else {
+          void handlePasteStructureForAdd();
+        }
+      }, 30);
+    }
+
+    window.addEventListener("paste", onPaste, true);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("paste", onPaste, true);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  });
 
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -189,11 +293,11 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
     const mw = parseOptionalNumber(editMwText);
     const density = parseOptionalNumber(editDensityText);
     if (mw === null) {
-      setEditError("Molecular weight must be a positive number, e.g. 46.07.");
+      setEditError("Molecular weight must be a positive number.");
       return;
     }
     if (density === null) {
-      setEditError("Density must be a positive number, e.g. 0.789.");
+      setEditError("Density must be a positive number.");
       return;
     }
 
@@ -218,6 +322,9 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
         }
       }
 
+      const smiles = editClearStructure
+        ? null
+        : ((await smilesForSavedStructure(nextCdxml || trimmedStruct, editFileName)) ?? null);
       const result = update(id, {
         name: editName,
         mw: nextMw ?? null,
@@ -228,6 +335,7 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
         imageDataUrl: editClearStructure ? undefined : nextImage,
         fileName: editFileName,
         clearStructure: editClearStructure,
+        smiles,
       });
 
       if (!result.ok) {
@@ -244,8 +352,8 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
     e.preventDefault();
     const mw = parseOptionalNumber(mwText);
     const density = parseOptionalNumber(densityText);
-    if (mw === null) return setFormError("Molecular weight must be a positive number, e.g. 46.07.");
-    if (density === null) return setFormError("Density must be a positive number, e.g. 0.789.");
+    if (mw === null) return setFormError("Molecular weight must be a positive number.");
+    if (density === null) return setFormError("Density must be a positive number.");
 
     let nextCdxml = addCdxml;
     let nextImage = addImageDataUrl;
@@ -263,7 +371,8 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
       }
     }
 
-    const result = add({
+    const smiles = await smilesForSavedStructure(nextCdxml || structure, fileName);
+    const result = upsert({
       name,
       structure,
       cdxml: nextCdxml,
@@ -272,12 +381,14 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
       mw: nextMw,
       density,
       fileName,
+      smiles: smiles ?? null,
     });
     if (!result.ok) {
       setFormError(result.error);
       return;
     }
     setFormError(null);
+    setSavedBanner(`Saved "${result.compound.name}" to Personal Library.`);
     setName("");
     setStructure("");
     setAddCdxml(undefined);
@@ -289,7 +400,9 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
   }
 
   async function handlePasteStructureForAdd() {
+    setAddBusy(true);
     setFormError(null);
+    setSavedBanner(null);
     try {
       const extracted = await extractDualStreamClipboard();
       if (!extracted) {
@@ -307,6 +420,8 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
       }
     } catch (err) {
       setFormError(err instanceof Error ? err.message : "Could not paste structure.");
+    } finally {
+      setAddBusy(false);
     }
   }
 
@@ -316,7 +431,16 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
       setFormError("That file is too large to be a single structure.");
       return;
     }
+    setAddBusy(true);
+    setFormError(null);
+    setSavedBanner(null);
     try {
+      if (file.type.startsWith("image/") || /\.svg$/i.test(file.name)) {
+        const prepared = await imageFileToPng(file);
+        const dataUrl = await blobToDataUrl(prepared);
+        setAddImageDataUrl(dataUrl);
+        return;
+      }
       const { structure: text, note } = structureFromFile(file.name, await file.text());
       setStructure(text);
       setFileName(file.name);
@@ -335,6 +459,8 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
       }
     } catch {
       setFormError("The file could not be read.");
+    } finally {
+      setAddBusy(false);
     }
   }
 
@@ -379,24 +505,99 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
           </p>
         )}
 
-        {/* Add a compound */}
-        <form onSubmit={handleAdd} className="mt-4 space-y-2 rounded-lg border border-zinc-200 bg-zinc-50 p-3">
-          <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
-            Add a compound
-          </p>
+        {/* Add / Save a compound */}
+        <form onSubmit={handleAdd} className="mt-4 space-y-2.5 rounded-lg border border-zinc-200 bg-zinc-50 p-3.5">
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-600">
+              {initialDraft?.name ? "Save Reagent to Library" : "Add a compound"}
+            </p>
+            {savedBanner && (
+              <span className="rounded bg-emerald-100 px-2 py-0.5 text-[11px] font-semibold text-emerald-900">
+                {savedBanner}
+              </span>
+            )}
+          </div>
           <input
             value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="Name, e.g. 3-methylpropanol"
+            onChange={(e) => {
+              setName(e.target.value);
+              setSavedBanner(null);
+            }}
+            placeholder="Name"
             aria-label="Compound name"
             className="w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm placeholder:text-zinc-400 focus:border-fume-500 focus:outline-none"
           />
+
+          {/* Interactive ChemDraw Structure Ctrl+V Paste & Drop Target Zone */}
+          <div
+            ref={addPasteZoneRef}
+            tabIndex={0}
+            role="button"
+            aria-label="ChemDraw Structure Paste Target Zone"
+            onClick={() => addPasteZoneRef.current?.focus()}
+            onDragOver={(e) => {
+              e.preventDefault();
+              setAddDragging(true);
+            }}
+            onDragLeave={() => setAddDragging(false)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setAddDragging(false);
+              void handleStructureFile(e.dataTransfer.files?.[0]);
+            }}
+            className={`relative flex min-h-[110px] flex-col items-center justify-center rounded-md border-2 border-dashed bg-white p-3 text-center transition focus:outline-none ${
+              addDragging
+                ? "border-fume-500 bg-fume-50/40 ring-2 ring-fume-500/20"
+                : "border-zinc-300 hover:border-fume-400 focus:border-fume-500 focus:ring-2 focus:ring-fume-500/20"
+            }`}
+          >
+            {addImageDataUrl ? (
+              <div className="flex w-full flex-col items-center gap-1.5">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={addImageDataUrl}
+                  alt={name || "Pasted structure"}
+                  className="max-h-28 max-w-full object-contain"
+                />
+                <div className="flex items-center gap-2 text-[11px] text-zinc-500">
+                  <span className="font-medium text-emerald-800">
+                    {addCdxml ? "ChemDraw CDXML + image attached" : "Structure image attached"}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setAddImageDataUrl(undefined);
+                      setAddCdxml(undefined);
+                      setStructure("");
+                      setFileName(undefined);
+                    }}
+                    className="rounded border border-zinc-200 bg-zinc-50 px-1.5 py-0.5 text-[10px] font-medium text-zinc-600 hover:border-red-200 hover:bg-red-50 hover:text-red-700"
+                  >
+                    Clear structure
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-1">
+                <p className="text-xs font-medium text-zinc-700">
+                  {addBusy
+                    ? "Reading structure from clipboard…"
+                    : "Click here and press Ctrl+V to paste structure from ChemDraw"}
+                </p>
+                <p className="text-[11px] text-zinc-400">
+                  Captures editable CDXML + crisp structure image, or drop a .cdxml / .mol / image file
+                </p>
+              </div>
+            )}
+          </div>
+
           <textarea
             value={structure}
             onChange={(e) => setStructure(e.target.value)}
-            placeholder="SMILES (e.g. CC(C)CO), or paste a MOLfile or CDXML"
+            placeholder="SMILES, MOLfile, or CDXML"
             aria-label="Structure (SMILES, MOLfile or CDXML)"
-            rows={structure.includes("\n") ? 6 : 2}
+            rows={structure.includes("\n") ? 4 : 2}
             spellCheck={false}
             className="w-full resize-y rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 font-mono text-xs placeholder:font-sans placeholder:text-zinc-400 focus:border-fume-500 focus:outline-none"
           />
@@ -404,7 +605,7 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
             <input
               ref={fileRef}
               type="file"
-              accept=".mol,.sdf,.cdxml,.smi,.smiles,.txt,chemical/x-mdl-molfile"
+              accept=".mol,.sdf,.cdxml,.smi,.smiles,.txt,.png,.jpg,.jpeg,.svg,chemical/x-mdl-molfile,image/*"
               hidden
               onChange={(e) => {
                 void handleStructureFile(e.target.files?.[0]);
@@ -413,17 +614,18 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
             />
             <button
               type="button"
-              onClick={() => fileRef.current?.click()}
-              className="rounded-md border border-zinc-300 bg-white px-2 py-1 font-medium text-zinc-700 hover:bg-zinc-50"
+              onClick={() => void handlePasteStructureForAdd()}
+              disabled={addBusy}
+              className="rounded-md border border-fume-300 bg-white px-2.5 py-1 font-medium text-fume-800 hover:bg-fume-50 disabled:opacity-50"
             >
-              Choose file (.mol, .sdf, .cdxml)…
+              {addBusy ? "Pasting…" : "Paste from ChemDraw (Ctrl+V)"}
             </button>
             <button
               type="button"
-              onClick={() => void handlePasteStructureForAdd()}
+              onClick={() => fileRef.current?.click()}
               className="rounded-md border border-zinc-300 bg-white px-2 py-1 font-medium text-zinc-700 hover:bg-zinc-50"
             >
-              Paste structure from Clipboard
+              Choose file (.cdxml, .mol, .sdf)…
             </button>
             {detected && <span>Detected: {FORMAT_LABELS[detected]}</span>}
           </div>
@@ -434,7 +636,7 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
                 value={mwText}
                 onChange={(e) => setMwText(e.target.value)}
                 inputMode="decimal"
-                placeholder="e.g. 46.07"
+                placeholder="MW (g/mol)"
                 aria-label="Molecular weight (g/mol)"
                 className="mt-0.5 w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-fume-500 focus:outline-none"
               />
@@ -445,7 +647,7 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
                 value={densityText}
                 onChange={(e) => setDensityText(e.target.value)}
                 inputMode="decimal"
-                placeholder="liquids, e.g. 0.789"
+                placeholder="Density (g/mL)"
                 aria-label="Density (g/mL), optional"
                 className="mt-0.5 w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-fume-500 focus:outline-none"
               />
@@ -454,7 +656,7 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
           <input
             value={notes}
             onChange={(e) => setNotes(e.target.value)}
-            placeholder="Notes (optional): supplier, CAS, hazards…"
+            placeholder="Notes"
             aria-label="Notes"
             className="w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm placeholder:text-zinc-400 focus:border-fume-500 focus:outline-none"
           />
@@ -465,9 +667,9 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
             <button
               type="submit"
               disabled={compounds === null}
-              className="shrink-0 rounded-md bg-fume-600 px-3 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-fume-700 disabled:opacity-50"
+              className="shrink-0 rounded-md bg-fume-600 px-3.5 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-fume-700 disabled:opacity-50"
             >
-              Add to library
+              Save to Library
             </button>
           </div>
         </form>
@@ -533,7 +735,7 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
                             inputMode="decimal"
                             value={editMwText}
                             onChange={(e) => setEditMwText(e.target.value)}
-                            placeholder="e.g. 245.3"
+                            placeholder="MW (g/mol)"
                             aria-label="Edit molecular weight (g/mol)"
                             className="mt-0.5 w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 focus:border-fume-500 focus:outline-none"
                           />
@@ -545,7 +747,7 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
                             inputMode="decimal"
                             value={editDensityText}
                             onChange={(e) => setEditDensityText(e.target.value)}
-                            placeholder="optional"
+                            placeholder="Density (g/mL)"
                             aria-label="Edit density (g/mL)"
                             className="mt-0.5 w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 focus:border-fume-500 focus:outline-none"
                           />
@@ -558,7 +760,7 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
                           type="text"
                           value={editNotes}
                           onChange={(e) => setEditNotes(e.target.value)}
-                          placeholder="Formula, CAS, supplier, appearance…"
+                          placeholder="Notes"
                           aria-label="Edit molecular formula or notes"
                           className="mt-0.5 w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 focus:border-fume-500 focus:outline-none"
                         />
@@ -642,7 +844,7 @@ function LibraryDialog({ onClose }: { onClose: () => void }) {
                             setEditImageDataUrl(undefined);
                             setEditCdxml(undefined);
                           }}
-                          placeholder="Optional SMILES, MOLfile, or CDXML text…"
+                          placeholder="SMILES, MOLfile, or CDXML"
                           aria-label="Edit structure text"
                           rows={2}
                           spellCheck={false}

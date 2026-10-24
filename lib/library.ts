@@ -35,6 +35,8 @@ export interface LibraryCompound {
   cdxml?: string;
   /** Optional pre-rendered vector SVG or PNG data URL (`data:image/...`). */
   imageDataUrl?: string;
+  /** Canonical SMILES, stored so a reagent loaded from this compound carries it without a second conversion. */
+  smiles?: string;
 }
 
 export type CompoundInput = {
@@ -51,6 +53,11 @@ export type CompoundInput = {
   cdxml?: string;
   /** Optional rendered structure image data URL (`data:image/...`). */
   imageDataUrl?: string;
+  /**
+   * Canonical SMILES. `null` clears a previously stored value.
+   * Omitted: derive it from a SMILES structure, or keep the previous value when the structure did not change.
+   */
+  smiles?: string | null;
 };
 
 const APP_DIR_NAME = "Fumebook";
@@ -127,6 +134,46 @@ export function prepareForKetcher(structure: string): string {
   const trimmed = text.trim();
   if (format === "cdxml" && !trimmed.includes("\n")) return trimmed.replace(">", ">\n");
   return trimmed;
+}
+
+/**
+ * SMILES already stored on a library compound, or the structure itself when it was saved as SMILES.
+ * Molfiles and CDXML only contribute once `smiles` has been filled in at save time.
+ */
+export function libraryCompoundSmiles(
+  compound: Pick<LibraryCompound, "smiles" | "format" | "structure">,
+): string | undefined {
+  const explicit = compound.smiles?.trim();
+  if (explicit) return explicit;
+  if (compound.format === "smiles") {
+    const text = compound.structure.trim();
+    if (text && !/[\r\n]/.test(text)) return text;
+  }
+  return undefined;
+}
+
+/**
+ * Decide what to persist in `LibraryCompound.smiles`.
+ * A non-empty `inputSmiles` wins. `null` clears. A one-line SMILES structure is stored as itself.
+ * When the structure text was replaced and no SMILES was provided, a previous value is dropped.
+ */
+function resolveStoredSmiles(
+  inputSmiles: string | null | undefined,
+  format: StructureFormat,
+  structure: string,
+  previous?: string,
+  structureReplaced = false,
+): string | undefined {
+  if (inputSmiles === null) return undefined;
+  const explicit = typeof inputSmiles === "string" ? inputSmiles.trim() : "";
+  if (explicit) return explicit;
+  if (format === "smiles") {
+    const text = structure.trim();
+    if (text && !/[\r\n]/.test(text)) return text;
+  }
+  if (structureReplaced) return undefined;
+  const prev = previous?.trim();
+  return prev || undefined;
 }
 
 /** A positive, finite number, or undefined (for MW and density). */
@@ -228,6 +275,12 @@ function normaliseCompound(raw: unknown): LibraryCompound | null {
   if (density !== undefined) compound.density = density;
   if (rawCdxml) compound.cdxml = rawCdxml;
   if (rawImageDataUrl) compound.imageDataUrl = rawImageDataUrl;
+  const smiles = resolveStoredSmiles(
+    typeof r.smiles === "string" ? r.smiles : undefined,
+    compound.format,
+    compound.structure,
+  );
+  if (smiles) compound.smiles = smiles;
   return enrichStructureFields(compound);
 }
 
@@ -300,6 +353,11 @@ function startLoad() {
       readFailed = true;
       setError(`Could not read the library (${LIBRARY_FILE_NAME}): ${errorMessage(err)}`);
     });
+}
+
+/** Compounds currently in memory. Empty until the first load finishes. */
+export function getLibraryCompounds(): LibraryCompound[] {
+  return cache ? [...cache] : [];
 }
 
 function getSnapshot(): LibraryCompound[] | null {
@@ -426,6 +484,7 @@ export function useLibrary() {
           return { ok: false, error: `${label} must be a positive number.` };
         }
       }
+      const smiles = resolveStoredSmiles(input.smiles, format, structure || cdxml || "");
       const compound: LibraryCompound = enrichStructureFields({
         id: uid(),
         name,
@@ -436,6 +495,7 @@ export function useLibrary() {
         ...(density !== undefined ? { density } : {}),
         ...(cdxml ? { cdxml } : {}),
         ...(imageDataUrl ? { imageDataUrl } : {}),
+        ...(smiles ? { smiles } : {}),
       });
       const next = [...(getSnapshot() ?? []), compound].sort(byName);
       cache = next;
@@ -516,6 +576,17 @@ export function useLibrary() {
             : undefined;
       }
 
+      const structureReplaced =
+        Boolean(input.clearStructure) ||
+        ((input.structure !== undefined || input.cdxml !== undefined) &&
+          nextStructure !== prev.structure);
+      const smiles = resolveStoredSmiles(
+        input.smiles,
+        nextFormat,
+        nextStructure || nextCdxml || "",
+        prev.smiles,
+        structureReplaced,
+      );
       const updated: LibraryCompound = enrichStructureFields({
         id: prev.id,
         name,
@@ -526,6 +597,7 @@ export function useLibrary() {
         ...(density !== undefined ? { density } : {}),
         ...(nextCdxml ? { cdxml: nextCdxml } : {}),
         ...(nextImage ? { imageDataUrl: nextImage } : {}),
+        ...(smiles ? { smiles } : {}),
       });
 
       const next = current.map((c, i) => (i === existingIdx ? updated : c)).sort(byName);
@@ -575,16 +647,27 @@ export function useLibrary() {
         const nextStruct = structure || cdxml || prev.structure;
         const nextCdxml = cdxml ?? prev.cdxml;
         const nextImage = imageDataUrl ?? prev.imageDataUrl;
+        const nextFormat = nextStruct ? detectFormat(nextStruct, input.fileName) : prev.format;
+        const structureReplaced = Boolean((structure || cdxml) && (structure || cdxml) !== prev.structure);
+        const smiles = resolveStoredSmiles(
+          input.smiles,
+          nextFormat,
+          nextStruct,
+          prev.smiles,
+          structureReplaced,
+        );
+        const { smiles: _previousSmiles, ...prevWithoutSmiles } = prev;
         const updated: LibraryCompound = enrichStructureFields({
-          ...prev,
+          ...prevWithoutSmiles,
           name,
           structure: nextStruct,
-          format: nextStruct ? detectFormat(nextStruct, input.fileName) : prev.format,
+          format: nextFormat,
           notes: input.notes !== undefined ? input.notes.trim() : prev.notes,
           mw: mw ?? prev.mw,
           density: density ?? prev.density,
           ...(nextCdxml ? { cdxml: nextCdxml } : {}),
           ...(nextImage ? { imageDataUrl: nextImage } : {}),
+          ...(smiles ? { smiles } : {}),
         });
         const next = current.map((c, i) => (i === existingIdx ? updated : c)).sort(byName);
         cache = next;
@@ -597,16 +680,19 @@ export function useLibrary() {
         return { ok: false, error: "Draw a structure or enter a molecular weight first." };
       }
 
+      const createdFormat = detectFormat(structure || cdxml || "", input.fileName);
+      const createdSmiles = resolveStoredSmiles(input.smiles, createdFormat, structure || cdxml || "");
       const created: LibraryCompound = enrichStructureFields({
         id: uid(),
         name,
         structure: structure || cdxml || "",
-        format: detectFormat(structure || cdxml || "", input.fileName),
+        format: createdFormat,
         notes: (input.notes ?? "").trim(),
         ...(mw !== undefined ? { mw } : {}),
         ...(density !== undefined ? { density } : {}),
         ...(cdxml ? { cdxml } : {}),
         ...(imageDataUrl ? { imageDataUrl } : {}),
+        ...(createdSmiles ? { smiles: createdSmiles } : {}),
       });
       const next = [...current, created].sort(byName);
       cache = next;

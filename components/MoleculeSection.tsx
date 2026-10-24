@@ -24,6 +24,7 @@ import { dataUrlToTrimmedPngDataUrl, imageFileToPng } from "@/lib/images";
 import {
   describeProperties,
   detectFormat,
+  libraryCompoundSmiles,
   prepareForKetcher,
   searchLibrary,
   suggestDistinctLibraryName,
@@ -31,6 +32,15 @@ import {
   type CompoundInput,
   type LibraryCompound,
 } from "@/lib/library";
+import { pickJsonFile, saveJsonFile } from "@/lib/fileDialogs";
+import {
+  draftReactionTemplate,
+  formatReactionConditions,
+  reactionMatchesQuery,
+  useReactionLibrary,
+  type ReactionTemplateDraft,
+  type SavedReactionTemplate,
+} from "@/lib/reactionLibrary";
 import { editField, formatNumber, looseNumber } from "@/lib/stoich";
 import { blobToDataUrl, saveSchemeCdxml } from "@/lib/storage";
 import { isTauri } from "@/lib/tauri";
@@ -65,6 +75,19 @@ interface Props {
   secondaryProducts?: SecondaryProduct[];
   /** Open the Personal Library dialog. */
   onOpenLibrary: () => void;
+  /** Canonical SMILES already stored on the experiment (shown until a fresh extraction finishes). */
+  reactantSmiles?: string;
+  productSmiles?: string;
+  /** Silent background extraction result for the left and right zones. */
+  onZoneSmilesChange?: (reactantSmiles: string | null, productSmiles: string | null) => void;
+  /** Experiment id, e.g. GH055. Prefills the saved-reaction name. */
+  experimentCode: string;
+  experimentTitle: string;
+  /**
+   * Replace the open reaction with a saved template.
+   * The parent records the current experiment on the undo stack first.
+   */
+  onLoadReaction: (template: SavedReactionTemplate) => void;
   ref?: Ref<MoleculeSectionHandle>;
 }
 
@@ -114,16 +137,63 @@ type StandaloneStructService = ReturnType<
 >;
 
 let sharedStructServicePromise: Promise<StandaloneStructService> | null = null;
+/** Indigo's standalone service is not safe to call concurrently. */
+let indigoChain: Promise<unknown> = Promise.resolve();
 
-const INDIGO_LENIENT_OPTIONS: Record<string, string | number | boolean> = {
-  "ignore-stereochemistry-errors": true,
-  "ignore-bad-valence": true,
-  "mass-skip-error-on-pseudoatoms": true,
-  "gross-formula-add-rsites": true,
-  "gross-formula-add-isotopes": true,
-  ignoreStereochemistryErrors: true,
-  ignoreBadValence: true,
-};
+function withIndigoLock<T>(task: () => Promise<T>): Promise<T> {
+  const run = indigoChain.then(task, task);
+  indigoChain = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
+/**
+ * ChemDraw's clipboard Molfile is not a strict V2000 file: the comment header line is
+ * often missing, and unused bond-block integers are spaces (`   `) instead of `  0`.
+ * Indigo rejects both (`bad header ChemDraw…`, `readIntFix(3): "   "`), so a drawing
+ * never becomes SMILES. This rewrites only those defects and keeps wedge stereo.
+ */
+function normaliseV2000Molfile(molfile: string): string {
+  if (!/V2000/i.test(molfile) || /<CDXML[\s>]/i.test(molfile)) return molfile;
+  const lines = molfile.replace(/\r\n?/g, "\n").split("\n");
+  const countsIdx = lines.findIndex((line) => /V2000\s*$/i.test(line));
+  if (countsIdx < 0) return molfile;
+  const header = lines.slice(0, countsIdx);
+  while (header.length < 3) header.push("");
+  if (header.length > 3) header.splice(0, header.length - 3);
+  const countsLine = lines[countsIdx];
+  const nAtoms = parseInt(countsLine.slice(0, 3).trim(), 10);
+  const nBonds = parseInt(countsLine.slice(3, 6).trim(), 10);
+  const body = lines.slice(countsIdx + 1);
+  if (!Number.isFinite(nAtoms) || !Number.isFinite(nBonds) || nAtoms < 0 || nBonds < 0) {
+    return [...header, ...lines.slice(countsIdx)].join("\n");
+  }
+  const bonds = body.slice(nAtoms, nAtoms + nBonds).map(fixV2000BondLine);
+  return [
+    ...header,
+    countsLine.trimEnd(),
+    ...body.slice(0, nAtoms),
+    ...bonds,
+    ...body.slice(nAtoms + nBonds),
+  ].join("\n");
+}
+
+/** Blank 3-character bond fields (`   `) become `  0`. A real stereo flag (`  1`, `  6`) is kept. */
+function fixV2000BondLine(line: string): string {
+  if (!line || line.startsWith("M  ")) return line;
+  let next = line.trimEnd();
+  if (next.length < 21) next = next.padEnd(21, " ");
+  for (const start of [9, 12, 15, 18]) {
+    if (next.length < start + 3) next = next.padEnd(start + 3, " ");
+    const field = next.slice(start, start + 3);
+    if (field.trim() === "" || !/^[+-]?\d+$/.test(field.trim())) {
+      next = `${next.slice(0, start)}  0${next.slice(start + 3)}`;
+    }
+  }
+  return next;
+}
 
 /**
  * Strip wedge/hash bond stereo flags (columns 10–12 -> `  0`) from a V2000 Molfile copy
@@ -160,17 +230,15 @@ async function getStandaloneStructService(): Promise<StandaloneStructService> {
     sharedStructServicePromise = (async () => {
       const { StandaloneStructServiceProvider } = await import("ketcher-standalone");
       const provider = new StandaloneStructServiceProvider();
-      const service = provider.createStructService(INDIGO_LENIENT_OPTIONS);
+      const service = provider.createStructService({});
       // Prevent IndigoService.getStandardServerOptions from throwing
-      // "Cannot getting options because there are no ketcherId" when no <Editor> is mounted,
-      // and always include lenient stereochemistry/valence options for 3D perspective structures.
+      // "Cannot getting options because there are no ketcherId" when no <Editor> is mounted.
       const internal = service as unknown as {
         defaultOptions?: Record<string, unknown>;
         getStandardServerOptions?: (opts?: Record<string, unknown>) => Record<string, unknown>;
       };
       if (typeof internal.getStandardServerOptions === "function") {
         internal.getStandardServerOptions = (opts?: Record<string, unknown>) => ({
-          ...INDIGO_LENIENT_OPTIONS,
           ...(internal.defaultOptions ?? {}),
           ...(opts ?? {}),
         });
@@ -198,14 +266,14 @@ export async function renderStructureToVectorSvg(rawText: string): Promise<{
   const format = detectFormat(prepared);
   const service = await getStandaloneStructService();
 
-  let structForRender = prepared;
+  let structForRender = format === "mol" ? normaliseV2000Molfile(prepared) : prepared;
   if (format === "smiles") {
     const laidOut = await service.layout(
       {
         struct: prepared.trim(),
         output_format: "chemical/x-mdl-molfile" as never,
       },
-      INDIGO_LENIENT_OPTIONS,
+      {},
     );
     if (laidOut?.struct) {
       structForRender = laidOut.struct;
@@ -217,7 +285,6 @@ export async function renderStructureToVectorSvg(rawText: string): Promise<{
     b64 = await service.generateImageAsBase64(structForRender, {
       outputFormat: "svg",
       backgroundColor: "255, 255, 255",
-      ...INDIGO_LENIENT_OPTIONS,
     });
   } catch (err) {
     if (format === "mol") {
@@ -225,7 +292,6 @@ export async function renderStructureToVectorSvg(rawText: string): Promise<{
       b64 = await service.generateImageAsBase64(stripped, {
         outputFormat: "svg",
         backgroundColor: "255, 255, 255",
-        ...INDIGO_LENIENT_OPTIONS,
       });
       structForRender = stripped;
     } else {
@@ -242,7 +308,7 @@ export async function renderStructureToVectorSvg(rawText: string): Promise<{
           struct: structForRender,
           output_format: "chemical/x-cdxml" as never,
         },
-        INDIGO_LENIENT_OPTIONS,
+        {},
       );
       if (converted?.struct) {
         cdxml = converted.struct;
@@ -256,27 +322,86 @@ export async function renderStructureToVectorSvg(rawText: string): Promise<{
   return { svgDataUrl, cdxml, mw };
 }
 
+/**
+ * Convert CDXML / Molfile / SMILES to a daylight SMILES string.
+ * Perspective structures that Indigo rejects (wedged 3D stereocenters, e.g. cyclodextrins)
+ * are retried with bond stereo stripped so a flat connectivity SMILES is still produced.
+ * Failures are logged and return null — pasting and saving are never blocked.
+ */
+export function extractCanonicalSmilesFailSafe(structureText: string): Promise<string | null> {
+  const text = structureText.trim();
+  if (!text) return Promise.resolve(null);
+  if (detectFormat(text) === "smiles") return Promise.resolve(text);
+  return withIndigoLock(() => convertStructureToSmiles(text));
+}
+
+async function convertStructureToSmiles(text: string): Promise<string | null> {
+  const prepared = normaliseV2000Molfile(text);
+  try {
+
+    const service = await getStandaloneStructService();
+    const outputFormat = "chemical/x-daylight-smiles";
+    const readSmiles = (struct: string | undefined) => {
+      const line = struct
+        ?.split(/\r?\n/)
+        .map((row) => row.trim())
+        .find((row) => row !== "" && !row.startsWith("#") && !row.startsWith("<"));
+      return line || null;
+    };
+    const convertToSmiles = async (struct: string) => {
+      const converted = await service.convert(
+        { struct, output_format: outputFormat as never },
+        {},
+      );
+      return readSmiles(converted?.struct);
+    };
+
+    try {
+      const smiles = await convertToSmiles(prepared);
+      if (smiles) return smiles;
+    } catch (err) {
+      const stripped = stripMolfileBondStereo(prepared);
+      if (stripped === prepared) throw err;
+      const smiles = await convertToSmiles(stripped);
+      if (smiles) return smiles;
+      throw err;
+    }
+
+    const stripped = stripMolfileBondStereo(prepared);
+    if (stripped !== prepared) {
+      const smiles = await convertToSmiles(stripped);
+      if (smiles) return smiles;
+    }
+    console.warn("SMILES extraction skipped: Indigo returned no SMILES");
+    return null;
+  } catch (err) {
+    console.warn("SMILES extraction skipped:", err);
+    return null;
+  }
+}
+
 async function calculateMwWithIndigoFallback(struct: string): Promise<number | null> {
+  const prepared = normaliseV2000Molfile(struct);
   try {
     const service = await getStandaloneStructService();
     let res;
     try {
       res = await service.calculate(
         {
-          struct,
+          struct: prepared,
           properties: ["molecular-weight"],
         },
-        INDIGO_LENIENT_OPTIONS,
+        {},
       );
     } catch (innerErr) {
-      if (detectFormat(struct) === "mol") {
-        const stripped = stripMolfileBondStereo(struct);
+      if (detectFormat(prepared) === "mol") {
+        const stripped = stripMolfileBondStereo(prepared);
         res = await service.calculate(
           {
             struct: stripped,
             properties: ["molecular-weight"],
           },
-          INDIGO_LENIENT_OPTIONS,
+          {},
         );
       } else {
         throw innerErr;
@@ -378,7 +503,7 @@ export async function extractDualStreamClipboard(event?: ClipboardEvent): Promis
               struct: prepared,
               output_format: "chemical/x-cdxml" as never,
             },
-            INDIGO_LENIENT_OPTIONS,
+            {},
           );
           if (converted?.struct) {
             cdxml = converted.struct;
@@ -465,6 +590,12 @@ export default function MoleculeSection({
   onProductChange,
   secondaryProducts = [],
   onOpenLibrary,
+  reactantSmiles,
+  productSmiles,
+  onZoneSmilesChange,
+  experimentCode,
+  experimentTitle,
+  onLoadReaction,
   ref,
 }: Props) {
   const {
@@ -477,17 +608,51 @@ export default function MoleculeSection({
   const [reactantError, setReactantError] = useState<string | null>(null);
   const [productNotice, setProductNotice] = useState<string | null>(null);
   const [productError, setProductError] = useState<string | null>(null);
+  const [extractedSmiles, setExtractedSmiles] = useState<{
+    reactant: string | null;
+    product: string | null;
+  } | null>(null);
+  const [smilesCopied, setSmilesCopied] = useState(false);
+  const [saveReactionOpen, setSaveReactionOpen] = useState(false);
+  const [loadReactionOpen, setLoadReactionOpen] = useState(false);
+  const [reactionSavedFlash, setReactionSavedFlash] = useState(false);
 
   const schemeRef = useRef(structuredScheme);
   const onSchemeChangeRef = useRef(onStructuredSchemeChange);
   const onReagentsChangeRef = useRef(onReagentsChange);
   const onProductChangeRef = useRef(onProductChange);
+  const onZoneSmilesChangeRef = useRef(onZoneSmilesChange);
   useEffect(() => {
     schemeRef.current = structuredScheme;
     onSchemeChangeRef.current = onStructuredSchemeChange;
     onReagentsChangeRef.current = onReagentsChange;
     onProductChangeRef.current = onProductChange;
+    onZoneSmilesChangeRef.current = onZoneSmilesChange;
   });
+
+  // Paste, library load, and the ChemDraw file watcher all write zone CDXML.
+  // Extract SMILES after that write so the paste itself never waits on Indigo.
+  useEffect(() => {
+    let cancelled = false;
+    const reactantSrc = (structuredScheme?.reactantCdxml ?? "").trim();
+    const productSrc = (structuredScheme?.productCdxml ?? "").trim();
+    void (async () => {
+      const reactant = reactantSrc ? await extractCanonicalSmilesFailSafe(reactantSrc) : null;
+      const product = productSrc ? await extractCanonicalSmilesFailSafe(productSrc) : null;
+      if (cancelled) return;
+      setExtractedSmiles({ reactant, product });
+      onZoneSmilesChangeRef.current?.(reactant, product);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [structuredScheme?.reactantCdxml, structuredScheme?.productCdxml]);
+
+  useEffect(() => {
+    if (!reactionSavedFlash) return;
+    const timer = window.setTimeout(() => setReactionSavedFlash(false), 1600);
+    return () => window.clearTimeout(timer);
+  }, [reactionSavedFlash]);
 
   const patchStructured = useCallback((patch: Partial<StructuredReactionScheme>) => {
     const next: StructuredReactionScheme = { ...(schemeRef.current ?? {}), ...patch };
@@ -579,11 +744,16 @@ export default function MoleculeSection({
         patchStructured({ reactantImage: undefined, reactantCdxml: undefined });
         return;
       }
-      const { svgDataUrl, cdxml: normalizedCdxml, mw } =
-        await renderStructureToVectorSvg(incomingCdxml);
-      patchStructured({ reactantImage: svgDataUrl, reactantCdxml: normalizedCdxml });
-      if (mw !== null && mw > 0) {
-        syncZoneMetadata("reactant", { mw });
+      try {
+        const { svgDataUrl, cdxml: normalizedCdxml, mw } =
+          await renderStructureToVectorSvg(incomingCdxml);
+        patchStructured({ reactantImage: svgDataUrl, reactantCdxml: normalizedCdxml });
+        if (mw !== null && mw > 0) {
+          syncZoneMetadata("reactant", { mw });
+        }
+      } catch (err) {
+        console.warn("Indigo reactant CDXML render failed, keeping raw CDXML:", err);
+        patchStructured({ reactantCdxml: incomingCdxml });
       }
     },
     [patchStructured, syncZoneMetadata],
@@ -607,11 +777,16 @@ export default function MoleculeSection({
         patchStructured({ productImage: undefined, productCdxml: undefined });
         return;
       }
-      const { svgDataUrl, cdxml: normalizedCdxml, mw } =
-        await renderStructureToVectorSvg(incomingCdxml);
-      patchStructured({ productImage: svgDataUrl, productCdxml: normalizedCdxml });
-      if (mw !== null && mw > 0) {
-        syncZoneMetadata("product", { mw });
+      try {
+        const { svgDataUrl, cdxml: normalizedCdxml, mw } =
+          await renderStructureToVectorSvg(incomingCdxml);
+        patchStructured({ productImage: svgDataUrl, productCdxml: normalizedCdxml });
+        if (mw !== null && mw > 0) {
+          syncZoneMetadata("product", { mw });
+        }
+      } catch (err) {
+        console.warn("Indigo product CDXML render failed, keeping raw CDXML:", err);
+        patchStructured({ productCdxml: incomingCdxml });
       }
     },
     [patchStructured, syncZoneMetadata],
@@ -702,18 +877,31 @@ export default function MoleculeSection({
       try {
         stopZoneWatcher(targetZone);
         let svgDataUrl = compound.imageDataUrl ?? "";
-        let cdxml = compound.cdxml ?? "";
+        let cdxml = (compound.cdxml || compound.structure || "").trim();
         let computedMw: number | null = compound.mw ?? null;
 
-        const rawStruct = (compound.cdxml || compound.structure || "").trim();
-        if ((!svgDataUrl || !cdxml || computedMw === null) && rawStruct) {
-          const rendered = await renderStructureToVectorSvg(rawStruct);
-          if (!svgDataUrl) svgDataUrl = rendered.svgDataUrl;
-          if (!cdxml) cdxml = rendered.cdxml;
-          if (computedMw === null) computedMw = rendered.mw;
+        // If `compound.imageDataUrl` already exists, do NOT call Indigo to re-render the SVG
+        // (avoids Indigo crashing on 3D perspective structures such as cyclodextrins).
+        // Only invoke Indigo as a fallback when no pre-rendered `imageDataUrl` exists.
+        if (!svgDataUrl && cdxml) {
+          try {
+            const rendered = await renderStructureToVectorSvg(cdxml);
+            svgDataUrl = rendered.svgDataUrl;
+            if (!compound.cdxml && rendered.cdxml) {
+              cdxml = rendered.cdxml;
+            }
+            if (computedMw === null) {
+              computedMw = rendered.mw;
+            }
+          } catch (err) {
+            console.warn(
+              "Indigo structure rendering failed when loading library compound, skipping SVG render:",
+              err,
+            );
+          }
         }
 
-        if (!svgDataUrl && computedMw === null) {
+        if (!svgDataUrl && !cdxml && computedMw === null) {
           return `"${compound.name}" does not have a saved structure.`;
         }
 
@@ -813,6 +1001,58 @@ export default function MoleculeSection({
   );
 
   const activeChemDraw = selectedZone === "reactant" ? reactantChemDraw : productChemDraw;
+  const shownReactantSmiles = extractedSmiles
+    ? (extractedSmiles.reactant ?? "")
+    : (reactantSmiles ?? "");
+  const shownProductSmiles = extractedSmiles
+    ? (extractedSmiles.product ?? "")
+    : (productSmiles ?? "");
+  const aiReadySmiles = Boolean(shownReactantSmiles && shownProductSmiles);
+  const mappedCoreSmiles = `${shownReactantSmiles}>>${shownProductSmiles}`;
+  const reactionDraft = useMemo(
+    () =>
+      draftReactionTemplate({
+        experimentCode,
+        reactantName: limitingRow?.name,
+        reactantMw: limitingRow?.mw,
+        reactantImage: structuredScheme?.reactantImage,
+        reactantCdxml: structuredScheme?.reactantCdxml,
+        reactantSmiles: shownReactantSmiles,
+        productName: product.name,
+        productMw: product.mw,
+        productImage: structuredScheme?.productImage,
+        productCdxml: structuredScheme?.productCdxml,
+        productSmiles: shownProductSmiles,
+        solvent: structuredScheme?.solvent,
+        temperature: structuredScheme?.temperature,
+        time: structuredScheme?.duration,
+        atmosphere: structuredScheme?.atmosphere,
+        reagents,
+        library: library ?? [],
+      }),
+    [
+      experimentCode,
+      library,
+      limitingRow?.mw,
+      limitingRow?.name,
+      product.mw,
+      product.name,
+      reagents,
+      shownProductSmiles,
+      shownReactantSmiles,
+      structuredScheme,
+    ],
+  );
+  const defaultReactionName = `${experimentCode} ${experimentTitle}`.replace(/\s+/g, " ").trim();
+
+  function handleLoadReaction(template: SavedReactionTemplate) {
+    reactantChemDraw.stopWatching();
+    productChemDraw.stopWatching();
+    setReactantError(null);
+    setProductError(null);
+    setLoadReactionOpen(false);
+    onLoadReaction(template);
+  }
 
   function handleOpenSelectedInChemDraw() {
     if (selectedZone === "reactant") {
@@ -831,45 +1071,36 @@ export default function MoleculeSection({
       }`}
     >
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2 print:mb-1">
-        <h2 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
-          Reaction scheme
-        </h2>
+        <div className="flex flex-wrap items-center gap-2">
+          <h2 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
+            Reaction scheme
+          </h2>
+          {aiReadySmiles && (
+            <div className="flex items-center gap-1.5 print:hidden">
+              <span
+                title={mappedCoreSmiles}
+                className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 ring-1 ring-emerald-200"
+              >
+                AI-Ready SMILES ✓
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  void navigator.clipboard.writeText(mappedCoreSmiles).then(() => {
+                    setSmilesCopied(true);
+                    window.setTimeout(() => setSmilesCopied(false), 1500);
+                  });
+                }}
+                className="text-[10px] font-medium text-emerald-700 underline-offset-2 hover:underline"
+              >
+                {smilesCopied ? "Copied" : "Copy Reaction SMILES"}
+              </button>
+            </div>
+          )}
+        </div>
 
         {/* Central Hybrid Selection & ChemDraw Toolbar (screen only, hidden in print) */}
         <div className="flex flex-wrap items-center gap-2 print:hidden">
-          <div
-            role="group"
-            aria-label="Selected structure zone"
-            className="inline-flex items-center rounded-md border border-zinc-200 bg-zinc-100/80 p-0.5 text-[11px]"
-          >
-            <button
-              type="button"
-              onClick={() => setSelectedZone("reactant")}
-              aria-pressed={selectedZone === "reactant"}
-              className={`rounded px-2 py-0.5 font-medium transition-colors ${
-                selectedZone === "reactant"
-                  ? "bg-white text-fume-800 shadow-2xs"
-                  : "text-zinc-500 hover:text-zinc-800"
-              }`}
-              title="Select Reactant (Left) box as target for Ctrl+V, Library, and ChemDraw"
-            >
-              Reactant
-            </button>
-            <button
-              type="button"
-              onClick={() => setSelectedZone("product")}
-              aria-pressed={selectedZone === "product"}
-              className={`rounded px-2 py-0.5 font-medium transition-colors ${
-                selectedZone === "product"
-                  ? "bg-white text-fume-800 shadow-2xs"
-                  : "text-zinc-500 hover:text-zinc-800"
-              }`}
-              title="Select Product (Right) box as target for Ctrl+V, Library, and ChemDraw"
-            >
-              Product
-            </button>
-          </div>
-
           {activeChemDraw.supported && (
             <button
               type="button"
@@ -897,6 +1128,29 @@ export default function MoleculeSection({
                   : `Open ${selectedZone === "reactant" ? "Reactant" : "Product"} in ChemDraw`}
             </button>
           )}
+
+          <button
+            type="button"
+            onClick={() => {
+              setLoadReactionOpen(false);
+              setSaveReactionOpen(true);
+            }}
+            className="rounded-md bg-fume-600 px-2.5 py-1 text-xs font-semibold text-white shadow-sm transition-colors hover:bg-fume-700"
+            title="Save this reaction — structures, conditions, equivalents, and Reaction SMILES — as a reusable template"
+          >
+            {reactionSavedFlash ? "Saved ✓" : "Save Reaction"}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setSaveReactionOpen(false);
+              setLoadReactionOpen(true);
+            }}
+            className="rounded-md bg-fume-600 px-2.5 py-1 text-xs font-semibold text-white shadow-sm transition-colors hover:bg-fume-700"
+            title="Load a saved reaction template into this experiment"
+          >
+            Load Reaction
+          </button>
         </div>
       </div>
 
@@ -994,6 +1248,21 @@ export default function MoleculeSection({
           onManageLibrary={onOpenLibrary}
         />
       </div>
+
+      {saveReactionOpen && (
+        <SaveReactionDialog
+          initialName={defaultReactionName}
+          draft={reactionDraft}
+          onClose={() => setSaveReactionOpen(false)}
+          onSaved={() => {
+            setSaveReactionOpen(false);
+            setReactionSavedFlash(true);
+          }}
+        />
+      )}
+      {loadReactionOpen && (
+        <LoadReactionDialog onClose={() => setLoadReactionOpen(false)} onLoad={handleLoadReaction} />
+      )}
     </section>
   );
 }
@@ -1345,14 +1614,16 @@ function StructureZoneCard({
     };
   }
 
-  function handleSaveAsNewCompound(targetName: string) {
+  async function handleSaveAsNewCompound(targetName: string) {
     setError(null);
     const built = buildCompoundInput(targetName);
     if (!built.ok) {
       setError(built.error);
       return;
     }
-    const result = onAddToLibrary(built.input);
+    const source = (built.input.cdxml || built.input.structure || "").trim();
+    const smiles = source ? await extractCanonicalSmilesFailSafe(source) : null;
+    const result = onAddToLibrary({ ...built.input, smiles: smiles ?? null });
     if (!result.ok) {
       setError(result.error);
       return;
@@ -1362,14 +1633,16 @@ function StructureZoneCard({
     setTimeout(() => setSavedFlash(false), 3000);
   }
 
-  function handleUpdateExistingCompound(existingId: string) {
+  async function handleUpdateExistingCompound(existingId: string) {
     setError(null);
     const built = buildCompoundInput(saveName);
     if (!built.ok) {
       setError(built.error);
       return;
     }
-    const result = onUpdateInLibrary(existingId, built.input);
+    const source = (built.input.cdxml || built.input.structure || "").trim();
+    const smiles = source ? await extractCanonicalSmilesFailSafe(source) : null;
+    const result = onUpdateInLibrary(existingId, { ...built.input, smiles: smiles ?? null });
     if (!result.ok) {
       setError(result.error);
       return;
@@ -1409,7 +1682,7 @@ function StructureZoneCard({
         <span className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
           <span
             className={`inline-block size-2 rounded-full transition-colors ${
-              active ? "bg-fume-500" : "bg-zinc-300"
+              active ? "bg-fume-600" : "bg-zinc-300"
             }`}
             aria-hidden
           />
@@ -1469,12 +1742,12 @@ function StructureZoneCard({
               : `Click to select ${title}`
           }
           {...dropProps}
-          className={`group/zone relative flex min-h-36 w-full cursor-pointer items-center justify-center rounded-md border bg-white p-2.5 transition-all focus:outline-none print:min-h-0 print:cursor-default print:border-0 print:bg-transparent print:p-0 ${
+          className={`group/zone relative flex min-h-36 w-full cursor-pointer items-center justify-center rounded-md border bg-white p-2.5 transition-all focus:outline-none print:min-h-0 print:cursor-default print:border-0 print:border-gray-300 print:bg-transparent print:p-0 print:text-black print:ring-0 print:ring-transparent print:shadow-none ${
             dragging
-              ? "border-fume-500 bg-fume-50"
+              ? "border-fume-500 bg-fume-50 print:border-0 print:bg-transparent print:ring-0"
               : active
-                ? "border-fume-500 ring-2 ring-fume-500/20"
-                : "border-zinc-200 hover:border-fume-300"
+                ? "border-fume-500 ring-2 ring-fume-500/20 print:border-0 print:border-gray-300 print:bg-transparent print:text-black print:ring-0 print:ring-transparent print:shadow-none"
+                : "border-zinc-200 hover:border-fume-300 print:border-0"
           }`}
         >
           {/* eslint-disable-next-line @next/next/no-img-element -- embedded SVG or high-DPI PNG data URL */}
@@ -1534,11 +1807,11 @@ function StructureZoneCard({
               : `Click to select ${title}`
           }
           {...dropProps}
-          className={`group/zone relative flex min-h-36 w-full cursor-pointer flex-col items-center justify-center rounded-md border border-dashed px-3 py-4 text-center text-xs transition-all focus:outline-none print:hidden ${
+          className={`group/zone relative flex min-h-36 w-full cursor-pointer flex-col items-center justify-center rounded-md border border-dashed px-3 py-4 text-center text-xs transition-all focus:outline-none print:hidden print:border-gray-300 print:bg-transparent print:text-black print:ring-0 print:ring-transparent print:shadow-none ${
             dragging
               ? "border-fume-500 bg-fume-50 text-fume-700"
               : active
-                ? "border-fume-500 bg-fume-50/20 text-zinc-700 ring-2 ring-fume-500/20"
+                ? "border-fume-500 bg-fume-50/20 text-zinc-700 ring-2 ring-fume-500/20 print:border-gray-300 print:bg-transparent print:text-black print:ring-0 print:ring-transparent print:shadow-none"
                 : "border-zinc-300 bg-zinc-50/30 text-zinc-500 hover:border-fume-300 hover:bg-fume-50/15"
           }`}
         >
@@ -1765,7 +2038,7 @@ function StructureZoneCard({
                   }
                 }
               }}
-              placeholder="Compound name"
+              placeholder="Name"
               aria-label="Compound name for library"
               autoFocus
               className="w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 placeholder:text-zinc-400 focus:border-fume-500 focus:outline-none"
@@ -1786,7 +2059,7 @@ function StructureZoneCard({
                 inputMode="decimal"
                 value={saveDensityText}
                 onChange={(e) => setSaveDensityText(e.target.value)}
-                placeholder="d (g/mL, opt.)"
+                placeholder="Density (g/mL)"
                 aria-label="Density (g/mL)"
                 className="w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 placeholder:text-zinc-400 focus:border-fume-500 focus:outline-none"
               />
@@ -1876,6 +2149,7 @@ function CenterConditionsZone({
   const [newReagentEq, setNewReagentEq] = useState("1.0");
   const [pendingMw, setPendingMw] = useState<number | null>(null);
   const [pendingDensity, setPendingDensity] = useState<number | null>(null);
+  const [pendingSmiles, setPendingSmiles] = useState<string | undefined>();
   const lastAddedRowIdRef = useRef<string | null>(null);
 
   function commitTemp() {
@@ -1909,6 +2183,7 @@ function CenterConditionsZone({
     let resolvedMw = override?.mw !== undefined ? override.mw : pendingMw;
     let resolvedDensity =
       override?.density !== undefined ? override.density : pendingDensity;
+    let resolvedSmiles = pendingSmiles;
 
     // If user typed a known abbreviation/name (e.g. "NaH", "Et3N") without clicking the dropdown, check dictionary/library
     if (resolvedMw === null) {
@@ -1925,6 +2200,7 @@ function CenterConditionsZone({
         if (libHit && libHit.name.toLowerCase() === finalName.toLowerCase()) {
           resolvedMw = libHit.mw ?? null;
           resolvedDensity = libHit.density ?? null;
+          resolvedSmiles = resolvedSmiles ?? libraryCompoundSmiles(libHit);
         }
       }
     }
@@ -1947,8 +2223,16 @@ function CenterConditionsZone({
 
       const targetRow =
         blankIdx >= 0
-          ? { ...cur[blankIdx], name: finalName }
-          : { ...newRow("Reagent"), name: finalName };
+          ? {
+              ...cur[blankIdx],
+              name: finalName,
+              ...(resolvedSmiles ? { smiles: resolvedSmiles } : {}),
+            }
+          : {
+              ...newRow("Reagent"),
+              name: finalName,
+              ...(resolvedSmiles ? { smiles: resolvedSmiles } : {}),
+            };
       lastAddedRowIdRef.current = targetRow.id;
 
       let next =
@@ -1989,6 +2273,7 @@ function CenterConditionsZone({
     setNewReagentName(compound.name);
     setPendingMw(compound.mw ?? null);
     setPendingDensity(compound.density ?? null);
+    setPendingSmiles(libraryCompoundSmiles(compound));
     setTimeout(() => {
       eqInputRef.current?.focus();
       eqInputRef.current?.select();
@@ -2003,19 +2288,26 @@ function CenterConditionsZone({
     }
   }
 
+  const rawAtmosphere = structuredScheme?.atmosphere?.trim();
+  const formattedAtmosphere = rawAtmosphere
+    ? /^under\s+/i.test(rawAtmosphere)
+      ? rawAtmosphere
+      : `under ${rawAtmosphere}`
+    : undefined;
+
   const printedBelowParts = [
     structuredScheme?.solvent?.trim(),
     structuredScheme?.temperature?.trim(),
     structuredScheme?.duration?.trim(),
-    structuredScheme?.atmosphere?.trim(),
+    formattedAtmosphere,
   ].filter((x): x is string => Boolean(x));
 
   return (
-    <div className="flex w-full flex-col items-center justify-center px-1 py-1">
+    <div className="flex flex-col items-stretch w-max min-w-[120px] max-w-full mx-auto px-1 py-1">
       {/* ABOVE THE ARROW: Additional Reagents / Catalysts */}
-      <div className="flex min-h-8 w-full flex-col items-center justify-end gap-1 pb-1">
+      <div className="flex min-h-8 w-full flex-col items-center justify-end gap-1 pb-1 text-center">
         {arrowReagents.length > 0 && (
-          <div className="flex flex-wrap items-center justify-center gap-x-2 gap-y-0.5 text-center text-xs leading-snug text-zinc-800 print:text-[10.5px]">
+          <div className="flex w-full flex-wrap items-center justify-center gap-x-2 gap-y-0.5 text-center text-xs leading-snug text-zinc-800 print:text-[10.5px]">
             {arrowReagents.map((r, idx) => {
               const eqLabel =
                 r.eq !== null && r.eq > 0 ? ` (${formatNumber(r.eq)} eq)` : "";
@@ -2050,7 +2342,7 @@ function CenterConditionsZone({
         )}
 
         {/* Quick inline "+ Add Reagent" above the arrow (screen only) */}
-        <div className="w-full print:hidden">
+        <div className="w-full text-center print:hidden">
           {addingReagent ? (
             <div className="mx-auto flex max-w-xs items-center gap-1 rounded-md border border-zinc-200 bg-zinc-50/80 p-1 shadow-xs">
               <div className="min-w-0 flex-1">
@@ -2060,6 +2352,7 @@ function CenterConditionsZone({
                   onNameChange={(name) => {
                     setNewReagentName(name);
                     lastAddedRowIdRef.current = null;
+                    setPendingSmiles(undefined);
                   }}
                   onMolecularWeight={handlePubChemMw}
                   onPickLocal={handlePickLocal}
@@ -2124,8 +2417,9 @@ function CenterConditionsZone({
 
       {/* THE REACTION ARROW: Crisp full-width horizontal vector SVG arrow (───►) */}
       <svg
+        width="120"
         viewBox="0 0 240 16"
-        className="my-0.5 h-4 w-full text-zinc-800 print:my-0.5 print:h-3.5"
+        className="my-0.5 w-full h-auto text-zinc-800 print:my-0.5"
         aria-hidden
       >
         <line
@@ -2140,92 +2434,627 @@ function CenterConditionsZone({
         <polygon points="237,8 222,3.5 225,8 222,12.5" fill="currentColor" />
       </svg>
 
-      {/* BELOW THE ARROW: Solvent, Temp (°C), Time (h), Atmosphere */}
-      <div className="mt-1 flex w-full flex-col items-center gap-1.5 print:hidden">
-        {/* Solvent input with datalist */}
-        <input
-          type="text"
-          list={solventListId}
-          value={structuredScheme?.solvent ?? ""}
-          onChange={(e) => onPatchScheme({ solvent: e.target.value || undefined })}
-          placeholder="Solvent (e.g. dry THF, DCM)"
-          aria-label="Reaction solvent"
-          className="w-full rounded border border-zinc-200 bg-white px-2 py-0.5 text-center text-xs text-zinc-800 placeholder:text-zinc-300 focus:border-fume-500 focus:outline-none"
-        />
-        <datalist id={solventListId}>
-          {REACTION_SOLVENT_SUGGESTIONS.map((item) => (
-            <option key={item} value={item} />
-          ))}
-        </datalist>
+      {/* BELOW THE ARROW: Formatted conditions summary + interactive inputs */}
+      <div className="mt-0.5 flex w-full flex-col items-center gap-1.5 text-center">
+        {printedBelowParts.length > 0 && (
+          <div className="w-full text-center text-xs leading-snug text-zinc-800 print:text-[10.5px]">
+            {printedBelowParts.join(", ")}
+          </div>
+        )}
 
-        {/* Temp & Time side-by-side */}
-        <div className="grid w-full grid-cols-2 gap-1.5">
+        <div className="flex w-full flex-col items-center gap-1.5 text-center print:hidden">
+          {/* Solvent input with datalist */}
           <input
             type="text"
-            value={structuredScheme?.temperature ?? ""}
-            onChange={(e) => onPatchScheme({ temperature: e.target.value || undefined })}
-            onBlur={commitTemp}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                e.preventDefault();
-                commitTemp();
-              }
-            }}
-            placeholder="Temp (e.g. 80 °C, rt)"
-            aria-label="Reaction temperature"
-            title="Type a number like 80 or -78 to auto-append °C, or type rt / reflux"
-            className="w-full rounded border border-zinc-200 bg-white px-1.5 py-0.5 text-center text-xs text-zinc-800 placeholder:text-zinc-300 focus:border-fume-500 focus:outline-none"
+            list={solventListId}
+            size={Math.max(14, (structuredScheme?.solvent ?? "").length + 2)}
+            value={structuredScheme?.solvent ?? ""}
+            onChange={(e) => onPatchScheme({ solvent: e.target.value || undefined })}
+            placeholder="Solvent"
+            aria-label="Reaction solvent"
+            className="w-full rounded border border-zinc-200 bg-white px-2 py-0.5 text-center text-xs text-zinc-800 placeholder:text-zinc-300 focus:border-fume-500 focus:outline-none"
           />
-          <input
-            type="text"
-            value={structuredScheme?.duration ?? ""}
-            onChange={(e) => onPatchScheme({ duration: e.target.value || undefined })}
-            onBlur={commitDuration}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                e.preventDefault();
-                commitDuration();
-              }
-            }}
-            placeholder="Time (e.g. 16 h)"
-            aria-label="Reaction duration"
-            title="Type a number like 16 to auto-append h, or type 30 min / overnight"
-            className="w-full rounded border border-zinc-200 bg-white px-1.5 py-0.5 text-center text-xs text-zinc-800 placeholder:text-zinc-300 focus:border-fume-500 focus:outline-none"
-          />
-        </div>
+          <datalist id={solventListId}>
+            {REACTION_SOLVENT_SUGGESTIONS.map((item) => (
+              <option key={item} value={item} />
+            ))}
+          </datalist>
 
-        {/* Atmosphere pills */}
-        <div className="flex items-center justify-center gap-1">
-          <span className="text-[10px] text-zinc-400">Atm:</span>
-          {ATMOSPHERE_OPTIONS.map((atm) => {
-            const selected = structuredScheme?.atmosphere === atm;
-            return (
-              <button
-                key={atm}
-                type="button"
-                aria-pressed={selected}
-                onClick={() =>
-                  onPatchScheme({ atmosphere: selected ? undefined : atm })
+          {/* Temp & Time side-by-side */}
+          <div className="grid w-full grid-cols-2 gap-1.5">
+            <input
+              type="text"
+              size={Math.max(8, (structuredScheme?.temperature ?? "").length + 1)}
+              value={structuredScheme?.temperature ?? ""}
+              onChange={(e) => onPatchScheme({ temperature: e.target.value || undefined })}
+              onBlur={commitTemp}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  commitTemp();
                 }
-                className={`rounded border px-1.5 py-0.2 text-[10px] font-medium transition-colors ${
-                  selected
-                    ? "border-fume-500 bg-fume-50 text-fume-800"
-                    : "border-zinc-200 bg-white text-zinc-500 hover:border-zinc-300 hover:text-zinc-700"
-                }`}
-              >
-                {atm}
-              </button>
-            );
-          })}
+              }}
+              placeholder="Temperature"
+              aria-label="Reaction temperature"
+              title="Reaction temperature"
+              className="w-full rounded border border-zinc-200 bg-white px-1.5 py-0.5 text-center text-xs text-zinc-800 placeholder:text-zinc-300 focus:border-fume-500 focus:outline-none"
+            />
+            <input
+              type="text"
+              size={Math.max(8, (structuredScheme?.duration ?? "").length + 1)}
+              value={structuredScheme?.duration ?? ""}
+              onChange={(e) => onPatchScheme({ duration: e.target.value || undefined })}
+              onBlur={commitDuration}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  commitDuration();
+                }
+              }}
+              placeholder="Time"
+              aria-label="Reaction duration"
+              title="Reaction duration"
+              className="w-full rounded border border-zinc-200 bg-white px-1.5 py-0.5 text-center text-xs text-zinc-800 placeholder:text-zinc-300 focus:border-fume-500 focus:outline-none"
+            />
+          </div>
+
+          {/* Atmosphere pills */}
+          <div className="flex items-center justify-center gap-1">
+            <span className="text-[10px] text-zinc-400">under</span>
+            {ATMOSPHERE_OPTIONS.map((atm) => {
+              const selected = structuredScheme?.atmosphere === atm;
+              return (
+                <button
+                  key={atm}
+                  type="button"
+                  aria-pressed={selected}
+                  onClick={() =>
+                    onPatchScheme({ atmosphere: selected ? undefined : atm })
+                  }
+                  className={`rounded border px-1.5 py-0.2 text-[10px] font-medium transition-colors ${
+                    selected
+                      ? "border-fume-500 bg-fume-50 text-fume-800"
+                      : "border-zinc-200 bg-white text-zinc-500 hover:border-zinc-300 hover:text-zinc-700"
+                  }`}
+                >
+                  {atm}
+                </button>
+              );
+            })}
+          </div>
         </div>
       </div>
+    </div>
+  );
+}
 
-      {/* BELOW THE ARROW (Print only): Clean publication-style single/two-line summary */}
-      {printedBelowParts.length > 0 && (
-        <div className="mt-0.5 hidden text-center text-[10.5px] leading-snug text-zinc-800 print:block">
-          {printedBelowParts.join(", ")}
-        </div>
+function formatTemplateDate(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+}
+
+function reagentRecipeLabel(reagent: SavedReactionTemplate["reagentsTemplate"][number]): string {
+  if (reagent.isLimiting || reagent.role === "Limiting") return "limiting · 1 eq";
+  if (reagent.role === "Solvent") return "solvent";
+  const eq = reagent.equivalents > 0 ? `${formatNumber(reagent.equivalents)} eq` : "";
+  if (reagent.role === "Catalyst") return eq ? `catalyst · ${eq}` : "catalyst";
+  return eq || "eq not set";
+}
+
+function StructureThumb({ src, label }: { src?: string | null; label: string }) {
+  return (
+    <div className="flex h-16 w-[4.5rem] shrink-0 items-center justify-center overflow-hidden rounded border border-zinc-200 bg-white">
+      {src ? (
+        // eslint-disable-next-line @next/next/no-img-element -- saved SVG or PNG data URL
+        <img src={src} alt={label} className="max-h-14 max-w-[4.25rem] object-contain" />
+      ) : (
+        <span className="px-1 text-center text-[9px] leading-tight text-zinc-400">{label}</span>
       )}
     </div>
+  );
+}
+
+function MiniReactionScheme({
+  reactantImage,
+  reactantLabel,
+  productImage,
+  productLabel,
+  conditions,
+}: {
+  reactantImage?: string | null;
+  reactantLabel: string;
+  productImage?: string | null;
+  productLabel: string;
+  conditions: string;
+}) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <StructureThumb src={reactantImage} label={reactantLabel || "Reactant"} />
+      <div className="flex w-16 shrink-0 flex-col items-center gap-0.5">
+        <span aria-hidden className="text-base leading-none text-emerald-800">
+          ⟶
+        </span>
+        {conditions ? (
+          <span className="line-clamp-3 text-center text-[9px] leading-tight text-zinc-500">
+            {conditions}
+          </span>
+        ) : (
+          <span className="text-[9px] text-zinc-300">conditions</span>
+        )}
+      </div>
+      <StructureThumb src={productImage} label={productLabel || "Product"} />
+    </div>
+  );
+}
+
+function ReactionSmilesBox({
+  reactionSmiles,
+  mappedCoreSmiles,
+}: {
+  reactionSmiles: string;
+  mappedCoreSmiles: string;
+}) {
+  const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState<string | null>(null);
+
+  function copySmiles() {
+    const text = `${reactionSmiles}\n${mappedCoreSmiles}`;
+    void navigator.clipboard.writeText(text).then(
+      () => {
+        setCopyError(null);
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 1500);
+      },
+      () => setCopyError("Could not copy SMILES."),
+    );
+  }
+
+  return (
+    <div>
+      <div className="mb-1 flex items-center justify-between gap-2">
+        <span className="text-[10px] font-semibold uppercase tracking-wider text-emerald-800">
+          Encoded Reaction SMILES
+        </span>
+        <button
+          type="button"
+          onClick={copySmiles}
+          className="text-[10px] font-semibold text-emerald-800 underline-offset-2 hover:underline"
+        >
+          {copied ? "Copied" : "Copy SMILES"}
+        </button>
+      </div>
+      <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded-md border border-emerald-200 bg-emerald-50/70 p-2 font-mono text-[11px] leading-relaxed text-emerald-950">
+        {`Reactant>Agents>Product\n${reactionSmiles}\n\nReactant>>Product\n${mappedCoreSmiles}`}
+      </pre>
+      {copyError && <p className="mt-1 text-[11px] text-red-600">{copyError}</p>}
+    </div>
+  );
+}
+
+function HazmatStripe() {
+  return (
+    <div
+      aria-hidden
+      className="h-2 w-full bg-[repeating-linear-gradient(-45deg,#111827_0_7px,#facc15_7px_14px)]"
+    />
+  );
+}
+
+function SaveReactionDialog({
+  initialName,
+  draft,
+  onClose,
+  onSaved,
+}: {
+  initialName: string;
+  draft: ReactionTemplateDraft;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const titleId = useId();
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const nameRef = useRef<HTMLInputElement>(null);
+  const { reactions, saveReactionTemplate } = useReactionLibrary();
+  const [name, setName] = useState(initialName);
+  const [error, setError] = useState<string | null>(null);
+  const conditions = formatReactionConditions(draft);
+  const duplicate = reactions.some(
+    (item) => item.name.toLowerCase() === name.trim().toLowerCase(),
+  );
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (dialog && !dialog.open) dialog.showModal();
+    nameRef.current?.focus();
+    nameRef.current?.select();
+  }, []);
+
+  function commit() {
+    try {
+      saveReactionTemplate({ ...draft, name });
+      onSaved();
+    } catch (err) {
+      setError(messageOf(err));
+    }
+  }
+
+  return (
+    <dialog
+      ref={dialogRef}
+      aria-labelledby={titleId}
+      onClose={onClose}
+      onClick={(event) => {
+        if (event.target === dialogRef.current) onClose();
+      }}
+      className="m-auto max-h-[calc(100dvh-2rem)] w-[min(36rem,calc(100vw-2rem))] overflow-y-auto rounded-xl border border-emerald-900 bg-white p-0 text-zinc-900 shadow-2xl backdrop:bg-zinc-900/40 print:hidden"
+    >
+      <HazmatStripe />
+      <div className="p-5">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h2 id={titleId} className="text-base font-semibold tracking-tight text-emerald-950">
+              Save Reaction
+            </h2>
+            <p className="mt-0.5 text-sm text-zinc-500">
+              Structures, conditions, equivalents, and the encoded Reaction SMILES.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            className="rounded-md p-1.5 text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700"
+          >
+            ×
+          </button>
+        </div>
+
+        <label className="mt-4 block">
+          <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
+            Template name
+          </span>
+          <input
+            ref={nameRef}
+            value={name}
+            onChange={(event) => {
+              setName(event.target.value);
+              setError(null);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                commit();
+              }
+            }}
+            placeholder="GH055 Benzylation of alpha-CD"
+            aria-label="Reaction template name"
+            className="mt-1 w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-emerald-600 focus:outline-none"
+          />
+        </label>
+        {duplicate && (
+          <p className="mt-1.5 text-[11px] text-emerald-800">
+            A template with this name will be updated.
+          </p>
+        )}
+
+        <div className="mt-4 rounded-lg border border-emerald-200 bg-emerald-50/40 p-3">
+          <MiniReactionScheme
+            reactantImage={draft.reactantImage}
+            reactantLabel={draft.reactantName || "Reactant"}
+            productImage={draft.productImage}
+            productLabel={draft.productName || "Product"}
+            conditions={conditions}
+          />
+          <div className="mt-3">
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+              Reagents
+            </p>
+            {draft.reagentsTemplate.length === 0 ? (
+              <p className="mt-1 text-xs text-zinc-400">No named reagents yet.</p>
+            ) : (
+              <ul className="mt-1 space-y-0.5">
+                {draft.reagentsTemplate.map((reagent, index) => (
+                  <li
+                    key={`${reagent.name}-${index}`}
+                    className="flex items-baseline justify-between gap-3 text-xs text-zinc-800"
+                  >
+                    <span className="min-w-0 truncate">{reagent.name}</span>
+                    <span className="shrink-0 font-medium text-emerald-900">
+                      {reagentRecipeLabel(reagent)}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+          <div className="mt-3">
+            <ReactionSmilesBox
+              reactionSmiles={draft.reactionSmiles}
+              mappedCoreSmiles={draft.mappedCoreSmiles}
+            />
+          </div>
+        </div>
+
+        {error && (
+          <p role="alert" className="mt-3 text-sm text-red-600">
+            {error}
+          </p>
+        )}
+
+        <div className="mt-4 flex items-center justify-end gap-2">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md border border-zinc-200 bg-white px-3 py-1.5 text-sm font-medium text-zinc-600 hover:bg-zinc-50"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={commit}
+            disabled={!name.trim()}
+            className="rounded-md bg-fume-600 px-3 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-fume-700 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            {duplicate ? "Update template" : "Save"}
+          </button>
+        </div>
+      </div>
+    </dialog>
+  );
+}
+
+function LoadReactionDialog({
+  onClose,
+  onLoad,
+}: {
+  onClose: () => void;
+  onLoad: (template: SavedReactionTemplate) => void;
+}) {
+  const titleId = useId();
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const { reactions, deleteReactionTemplate, exportReactionLibraryJson, importReactionLibraryJson } =
+    useReactionLibrary();
+  const [query, setQuery] = useState("");
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [transferNote, setTransferNote] = useState<string | null>(null);
+  const [transferError, setTransferError] = useState<string | null>(null);
+  const [transferBusy, setTransferBusy] = useState(false);
+  const visible = reactions.filter((template) => reactionMatchesQuery(template, query));
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (dialog && !dialog.open) dialog.showModal();
+    searchRef.current?.focus();
+  }, []);
+
+  async function handleExport() {
+    setTransferBusy(true);
+    setTransferError(null);
+    setTransferNote(null);
+    try {
+      const saved = await saveJsonFile(
+        "fumebook_reaction_library.json",
+        exportReactionLibraryJson(),
+      );
+      if (saved) setTransferNote("Reaction library exported.");
+    } catch (err) {
+      setTransferError(messageOf(err));
+    } finally {
+      setTransferBusy(false);
+    }
+  }
+
+  async function handleImport() {
+    setTransferBusy(true);
+    setTransferError(null);
+    setTransferNote(null);
+    try {
+      const picked = await pickJsonFile();
+      if (!picked) return;
+      const result = importReactionLibraryJson(picked.text, "merge");
+      const parts = [
+        result.added ? `${result.added} added` : "",
+        result.updated ? `${result.updated} updated` : "",
+      ].filter(Boolean);
+      setTransferNote(parts.join(", ") + ".");
+    } catch (err) {
+      setTransferError(messageOf(err));
+    } finally {
+      setTransferBusy(false);
+    }
+  }
+
+  return (
+    <dialog
+      ref={dialogRef}
+      aria-labelledby={titleId}
+      onClose={onClose}
+      onClick={(event) => {
+        if (event.target === dialogRef.current) onClose();
+      }}
+      className="m-auto w-[min(44rem,calc(100vw-2rem))] rounded-xl border border-emerald-900 bg-white p-0 text-zinc-900 shadow-2xl backdrop:bg-zinc-900/40 print:hidden"
+    >
+      <div className="flex max-h-[calc(100dvh-2rem)] flex-col">
+      <HazmatStripe />
+      <div className="border-b border-zinc-200 p-5 pb-3">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h2 id={titleId} className="text-base font-semibold tracking-tight text-emerald-950">
+              Load Reaction
+            </h2>
+            <p className="mt-0.5 text-sm text-zinc-500">
+              Loads structures, conditions, and equivalents. Masses stay blank for a new scale.
+              Ctrl+Z restores this experiment.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            className="rounded-md p-1.5 text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700"
+          >
+            ×
+          </button>
+        </div>
+        <input
+          ref={searchRef}
+          value={query}
+          onChange={(event) => {
+            setQuery(event.target.value);
+            setConfirmDeleteId(null);
+          }}
+          placeholder="Search code, name, reagent, or SMILES"
+          aria-label="Search saved reactions"
+          className="mt-3 w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm placeholder:text-zinc-400 focus:border-emerald-600 focus:outline-none"
+        />
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto px-5 py-3">
+        {reactions.length === 0 ? (
+          <p className="py-6 text-center text-sm text-zinc-400">
+            No reactions saved yet. Use Save Reaction to store one.
+          </p>
+        ) : visible.length === 0 ? (
+          <p className="py-6 text-center text-sm text-zinc-400">No reactions match that search.</p>
+        ) : (
+          <ul className="space-y-2">
+            {visible.map((template) => {
+              const conditions = formatReactionConditions(template);
+              return (
+                <li
+                  key={template.id}
+                  className="rounded-lg border border-zinc-200 p-2.5 hover:border-emerald-300"
+                >
+                  <div className="flex flex-wrap items-start gap-3">
+                    <MiniReactionScheme
+                      reactantImage={template.reactantImage}
+                      reactantLabel={template.reactantName || "Reactant"}
+                      productImage={template.productImage}
+                      productLabel={template.productName || "Product"}
+                      conditions={conditions}
+                    />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-semibold text-zinc-900">
+                            {template.name}
+                          </p>
+                          <p className="text-[10px] text-zinc-500">
+                            {[template.experimentCode, formatTemplateDate(template.createdAt)]
+                              .filter(Boolean)
+                              .join(" · ")}
+                          </p>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() => onLoad(template)}
+                            className="rounded-md bg-fume-600 px-2 py-1 text-[11px] font-semibold text-white shadow-sm hover:bg-fume-700"
+                          >
+                            Load
+                          </button>
+                          {confirmDeleteId === template.id ? (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  deleteReactionTemplate(template.id);
+                                  setConfirmDeleteId(null);
+                                }}
+                                className="rounded-md bg-red-600 px-2 py-1 text-[11px] font-semibold text-white hover:bg-red-700"
+                              >
+                                Delete
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setConfirmDeleteId(null)}
+                                className="rounded-md border border-zinc-200 px-2 py-1 text-[11px] font-medium text-zinc-600 hover:bg-zinc-50"
+                              >
+                                Keep
+                              </button>
+                            </>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => setConfirmDeleteId(template.id)}
+                              aria-label={`Delete ${template.name}`}
+                              title={`Delete ${template.name}`}
+                              className="grid size-7 place-items-center rounded-md text-zinc-400 hover:bg-red-50 hover:text-red-600"
+                            >
+                              <svg
+                                viewBox="0 0 16 16"
+                                className="size-3.5"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="1.6"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                aria-hidden
+                              >
+                                <path d="M3.5 4.5h9M6.2 4.5V3.2h3.6v1.3M4.6 4.5l.4 8.2h6l.4-8.2" />
+                              </svg>
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      {conditions && (
+                        <span className="mt-1 inline-block max-w-full truncate rounded-full bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-800 ring-1 ring-emerald-200">
+                          {conditions}
+                        </span>
+                      )}
+                      <p
+                        className="mt-1 truncate font-mono text-[10px] text-zinc-600"
+                        title={template.reactionSmiles}
+                      >
+                        {template.reactionSmiles || "—"}
+                      </p>
+                      <p
+                        className="truncate font-mono text-[10px] text-zinc-400"
+                        title={template.mappedCoreSmiles}
+                      >
+                        {template.mappedCoreSmiles || "—"}
+                      </p>
+                    </div>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </div>
+
+      <div className="flex flex-wrap items-center justify-between gap-2 border-t border-zinc-200 px-5 py-3">
+        <p className="text-[11px] text-zinc-500">
+          {reactions.length} saved
+          {transferNote ? ` · ${transferNote}` : ""}
+          {transferError ? ` · ${transferError}` : ""}
+        </p>
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() => void handleExport()}
+            disabled={transferBusy}
+            className="rounded-md border border-zinc-200 bg-white px-2 py-1 text-[11px] font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50"
+          >
+            Export JSON
+          </button>
+          <button
+            type="button"
+            onClick={() => void handleImport()}
+            disabled={transferBusy}
+            className="rounded-md border border-emerald-800 bg-emerald-50 px-2 py-1 text-[11px] font-semibold text-emerald-950 hover:bg-emerald-100 disabled:opacity-50"
+          >
+            Import JSON
+          </button>
+        </div>
+      </div>
+      </div>
+    </dialog>
   );
 }

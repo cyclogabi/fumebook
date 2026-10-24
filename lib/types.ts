@@ -8,6 +8,16 @@
  */
 
 import { readInitials, readStartNumber } from "./initials";
+import type { ExperimentData, MsSpectrumData } from "@/types/experiment";
+
+export type {
+  AiReactionRecord,
+  ExperimentData,
+  MsIonizationMode,
+  MsPeak,
+  MsSpectrumData,
+} from "@/types/experiment";
+export { MS_IONIZATION_MODES } from "@/types/experiment";
 
 export const ROLES = ["Limiting", "Reagent", "Solvent", "Catalyst"] as const;
 export type Role = (typeof ROLES)[number];
@@ -41,6 +51,8 @@ export interface ReagentRow {
   vol: number | null;
   /** g/mL */
   density: number | null;
+  /** SMILES carried over from a Personal Library compound, when the row was filled from one. */
+  smiles?: string;
 }
 
 export const PRODUCT_MASS_UNITS = ["mg", "g"] as const;
@@ -153,7 +165,7 @@ export interface PurificationGradient {
   fractionTlcImage?: string;
 }
 
-export interface Experiment {
+export interface Experiment extends ExperimentData {
   id: string; // e.g. "GH00001"
   title: string;
   dateCreated: string; // ISO 8601
@@ -189,6 +201,8 @@ export interface Experiment {
   references: Reference[];
   units: Units;
   columns: Columns;
+  /** Optional ESI-MS (or related) spectrum parsed from an uploaded .xy / .txt / .csv / .jdx file. */
+  msSpectrum?: MsSpectrumData;
 }
 
 export const DEFAULT_UNITS: Units = { n: "mmol", mass: "mg", vol: "mL" };
