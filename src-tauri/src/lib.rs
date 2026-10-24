@@ -795,12 +795,30 @@ mod open_tests {
     }
 }
 
+fn load_embedded_window_icon() -> Option<tauri::image::Image<'static>> {
+    let bytes = include_bytes!("../icons/icon.ico");
+    let img = image::load_from_memory(bytes).ok()?.into_rgba8();
+    let (width, height) = img.dimensions();
+    Some(tauri::image::Image::new_owned(img.into_raw(), width, height))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .setup(|app| {
+            use tauri::Manager;
+            if let Some(icon) = load_embedded_window_icon()
+                .or_else(|| app.default_window_icon().cloned())
+            {
+                for window in app.webview_windows().values() {
+                    let _ = window.set_icon(icon.clone());
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             read_chemdraw_clipboard,
             read_clipboard_image_base64,

@@ -107,21 +107,21 @@ export default function ReferencesSection({ references, onAdd, onRemove }: Props
           <input
             value={title}
             onChange={(e) => setTitle(e.target.value)}
-            placeholder="Title, e.g. Williamson ether synthesis, J. Chem. Soc. 1852"
+            placeholder="Reference"
             aria-label="Reference title"
             className={`${inputClass} sm:col-span-2`}
           />
           <input
             value={doi}
             onChange={(e) => setDoi(e.target.value)}
-            placeholder="DOI, e.g. 10.1021/ja01234a001"
+            placeholder="DOI"
             aria-label="Reference DOI"
             className={`${inputClass} font-mono`}
           />
           <input
             value={url}
             onChange={(e) => setUrl(e.target.value)}
-            placeholder="Link (https://…)"
+            placeholder="Link"
             aria-label="Reference link"
             inputMode="url"
             className={inputClass}

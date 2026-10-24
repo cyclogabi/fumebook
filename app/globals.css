@@ -7,16 +7,18 @@
 
 @import "tailwindcss";
 
-/* Fumebook pastel pink: the app's accent colour (`bg-fume-500`, `text-fume-700`, …). */
+/* Clean, professional steel-slate accent palette (`bg-fume-600`, `text-fume-700`, …). */
 @theme {
-  --color-fume-50: #fff1f6;
-  --color-fume-100: #ffe3ee;
-  --color-fume-200: #ffc8dc;
-  --color-fume-300: #ffa6c6;
-  --color-fume-400: #f78fb8;
-  --color-fume-500: #ec6b9f;
-  --color-fume-600: #d94f88;
-  --color-fume-700: #b53a6d;
+  --color-fume-50: #f4f6f9;
+  --color-fume-100: #e6ecf2;
+  --color-fume-200: #cdd8e5;
+  --color-fume-300: #a6bbd1;
+  --color-fume-400: #7293b5;
+  --color-fume-500: #476d96;
+  --color-fume-600: #33547a;
+  --color-fume-700: #26405e;
+  --color-fume-800: #1c3047;
+  --color-fume-900: #142233;
 }
 
 @theme inline {

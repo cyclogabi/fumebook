@@ -55,7 +55,7 @@ export default function Dashboard({ experiments, onOpen, onNew, onParse, onImpor
             <button
               type="button"
               onClick={onNew}
-              className="flex items-center justify-center gap-2 rounded-lg border border-cyan-300 bg-[#E0FFFF] px-4 py-2 font-medium text-zinc-900 shadow-sm hover:bg-[#C6F2F2]"
+              className="flex items-center justify-center gap-2 rounded-md bg-fume-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-fume-700"
             >
               + New Experiment
             </button>

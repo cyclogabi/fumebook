@@ -363,7 +363,7 @@ export default function ReagentNameInput({
       <input
         ref={inputRef}
         value={value}
-        placeholder="e.g. 3-methylpropanol"
+        placeholder="Reagent name"
         aria-label="Reagent name"
         role="combobox"
         aria-autocomplete="list"

@@ -215,7 +215,7 @@ function ProfileDialog({ first, onClose }: { first: boolean; onClose?: () => voi
             <button
               type="submit"
               disabled={!canSave}
-              className="flex-1 rounded-lg border border-cyan-300 bg-[#E0FFFF] px-4 py-2 font-medium text-zinc-900 shadow-sm hover:bg-[#C6F2F2] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-400 disabled:cursor-not-allowed disabled:opacity-50"
+              className="flex-1 rounded-lg bg-fume-600 px-4 py-2 font-semibold text-white shadow-sm hover:bg-fume-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-fume-500 disabled:cursor-not-allowed disabled:opacity-50"
             >
               {first ? "Get started" : "Save"}
             </button>

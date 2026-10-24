@@ -379,7 +379,7 @@ export default function PurificationSection({
         label="Purification"
         value={purificationText}
         onChange={onPurificationTextChange}
-        placeholder="Work-up and purification: extraction, column conditions, recrystallization, distillation…"
+        placeholder="Purification notes"
         minRows={3}
         headerExtra={
           <div className="flex items-center gap-1.5">
@@ -534,7 +534,7 @@ export default function PurificationSection({
                     setSavePresetOpen(false);
                   }
                 }}
-                placeholder="e.g. Standard 0–20% EtOAc over 10 CV"
+                placeholder="Preset name"
                 aria-label="Gradient preset name"
                 className="min-w-[14rem] flex-1 rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 placeholder:text-zinc-400 focus:border-fume-500 focus:outline-none"
               />
@@ -565,7 +565,7 @@ export default function PurificationSection({
                 type="text"
                 list={columnListId}
                 value={gradient.columnSize ?? ""}
-                placeholder="e.g. 320g SiO₂"
+                placeholder="Column size"
                 onChange={(e) => patchGradient({ columnSize: e.target.value })}
                 className="rounded border border-zinc-200 bg-white px-2 py-1 text-xs text-zinc-900 placeholder:text-zinc-300 focus:border-fume-500 focus:outline-none"
               />
@@ -579,7 +579,7 @@ export default function PurificationSection({
             <SolventInput
               label="Solvent A (Weak)"
               value={gradient.solventA}
-              placeholder="e.g. Cyclohexane"
+              placeholder="Solvent A"
               suggestions={solventAOptions}
               onChange={(solventA) => patchGradient({ solventA })}
             />
@@ -587,7 +587,7 @@ export default function PurificationSection({
             <SolventInput
               label="Solvent B (Polar)"
               value={gradient.solventB}
-              placeholder="e.g. EtOAc"
+              placeholder="Solvent B"
               suggestions={solventBOptions}
               onChange={(solventB) => patchGradient({ solventB })}
             />

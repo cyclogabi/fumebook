@@ -71,8 +71,8 @@ export default function Sidebar({
           </button>
           <button
             type="button"
-            onClick={onOpenLibrary}
-            title="Your saved compounds (SMILES / MOLfile)"
+            onClick={() => onOpenLibrary()}
+            title="Your saved compounds (SMILES / MOLfile / CDXML)"
             className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-sm font-medium text-zinc-600 hover:bg-zinc-50"
           >
             <svg viewBox="0 0 16 16" className="size-3.5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden>

@@ -513,7 +513,7 @@ export default function ProductYieldCard({
                     setSavePromptOpen(false);
                   }
                 }}
-                placeholder="Compound name"
+                placeholder="Name"
                 aria-label="Product compound name for library"
                 autoFocus
                 className="w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 placeholder:text-zinc-400 focus:border-fume-500 focus:outline-none"
@@ -532,7 +532,7 @@ export default function ProductYieldCard({
                 inputMode="decimal"
                 value={saveDensityText}
                 onChange={(e) => setSaveDensityText(e.target.value)}
-                placeholder="d (g/mL, optional)"
+                placeholder="Density (g/mL)"
                 aria-label="Density (g/mL)"
                 className="w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 placeholder:text-zinc-400 focus:border-fume-500 focus:outline-none"
               />

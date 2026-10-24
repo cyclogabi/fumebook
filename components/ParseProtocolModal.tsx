@@ -193,9 +193,7 @@ function ParseDialog({ onClose, onParsed }: Props) {
           autoFocus
           disabled={busy}
           aria-label="Experimental text"
-          placeholder={
-            "e.g. To a solution of 3-methylpropanol (1.0 g, 11.3 mmol) in dry THF (20 mL) was added NaH (60% in oil, 0.54 g, 13.6 mmol) at 0 °C. After 30 min, benzyl bromide (1.6 mL, 13.5 mmol) was added…"
-          }
+          placeholder="Experimental procedure"
           className="mt-4 block w-full resize-y rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm leading-relaxed placeholder:text-zinc-400 focus:border-fume-500 focus:bg-white focus:outline-none disabled:opacity-60"
         />
 
