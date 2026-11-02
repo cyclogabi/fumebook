@@ -27,6 +27,7 @@ import {
 } from "@/lib/backup";
 import { installClipboardBridge } from "@/lib/clipboard";
 import { probeLocalAi } from "@/lib/localAi";
+import { triggerPrint } from "@/lib/print";
 import { pickJsonFile, saveJsonFile, saveJsonToBackupsFolder } from "@/lib/fileDialogs";
 import { getLibraryCompounds, mergeLibraryCompounds } from "@/lib/library";
 import { applyParsedLibrary } from "@/lib/libraryMatch";
@@ -118,10 +119,11 @@ export default function ElnApp() {
         void flushPendingSaves().catch(() => {});
         return;
       }
-      // Cmd+P / Ctrl+P: the system print sheet (Save as PDF on macOS).
+      // Cmd+P / Ctrl+P. preventDefault stops WKWebView from swallowing the key
+      // into a no-op `window.print()`; the native sheet is opened instead.
       if (!event.shiftKey && (key === "p" || event.code === "KeyP")) {
         event.preventDefault();
-        window.print();
+        void triggerPrint();
         return;
       }
       if (event.shiftKey) return;

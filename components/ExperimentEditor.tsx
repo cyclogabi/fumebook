@@ -17,6 +17,7 @@ import TlcDropzone from "./TlcDropzone";
 import { LabWidgetMenu, LabWidgetTray } from "./LabWidgetsBar";
 import { SidebarToggleButton } from "./Sidebar";
 import { useExperimentUndo } from "@/lib/experimentUndo";
+import { triggerPrint } from "@/lib/print";
 import type { ExperimentUpdate } from "@/lib/storage";
 import type { Experiment } from "@/lib/types";
 
@@ -153,7 +154,7 @@ export default function ExperimentEditor({
           <LabWidgetMenu enabled={enabledWidgets} onToggle={toggleWidget} />
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <button type="button" onClick={() => window.print()} title="Print or save PDF (Ctrl+P or Cmd+P)" className={barButton}>
+          <button type="button" onClick={() => void triggerPrint()} title="Print or save PDF (Ctrl+P or Cmd+P)" className={barButton}>
             Print / Save PDF
           </button>
           <button

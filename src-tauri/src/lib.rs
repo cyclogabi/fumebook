@@ -1104,6 +1104,13 @@ async fn read_ollama_response(response: reqwest::Response) -> Result<String, Str
     Ok(text)
 }
 
+/// Open the system print sheet. `window.print()` is a no-op in macOS WKWebView;
+/// `WebviewWindow::print` goes through `NSPrintOperation`.
+#[tauri::command]
+fn print_notebook(window: tauri::WebviewWindow) -> Result<(), String> {
+    window.print().map_err(|e| e.to_string())
+}
+
 /// Optional local Python helper. A standalone Mac install usually has nothing on port 8000,
 /// so any failure is a quiet `false` rather than an error the webview would log.
 #[tauri::command]
@@ -1235,7 +1242,8 @@ pub fn run() {
             save_svg_file,
             ollama_list_models,
             ollama_chat,
-            local_ai_health
+            local_ai_health,
+            print_notebook
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
