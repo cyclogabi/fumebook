@@ -53,14 +53,27 @@ export interface ReagentRow {
   density: number | null;
   /** SMILES carried over from a Personal Library compound, when the row was filled from one. */
   smiles?: string;
+  /** Set when Parse Protocol linked this row to a Personal Library compound. */
+  libraryMatch?: string;
 }
 
 export const PRODUCT_MASS_UNITS = ["mg", "g"] as const;
 export type ProductMassUnit = (typeof PRODUCT_MASS_UNITS)[number];
 
 /** Isolated product and yield bookkeeping for the experiment. */
+/** What an isolated fraction is, chosen by the chemist rather than inferred from its name. */
+export type IsolatedFractionRole = "target" | "recovered-sm" | "side";
+
+/**
+ * One isolated fraction. Fraction 1 lives here; further fractions live in `secondaryProducts`.
+ * This is not the reaction-scheme target. That name and molecular weight live on
+ * `structuredScheme.productLabel` / `productMw`. `isolatedRole: "target"` is an explicit link
+ * from this fraction to the scheme target for yield.
+ */
 export interface ProductInfo {
   name: string;
+  /** Target product, recovered starting material, or another isolated fraction. */
+  isolatedRole?: IsolatedFractionRole;
   /** g/mol */
   mw: number | null;
   /** mg, canonical - `massUnit` only controls how it is displayed / typed. */
@@ -72,19 +85,24 @@ export interface ProductInfo {
   elutionStartCv?: number | string;
   /** Optional flash chromatography elution end volume (CV). */
   elutionEndCv?: number | string;
+  /** Set when Parse Protocol linked this product to a Personal Library compound. */
+  libraryMatch?: string;
 }
 
 /**
- * An additional isolated product (side product, isomer, di-substituted product...) of the same
- * reaction. The primary product stays in `Experiment.product`; these only add to it.
+ * Another isolated fraction (F2, F3, ...) of the same reaction. Fraction 1 stays in
+ * `Experiment.product`. None of these rows is the reaction-scheme target unless its
+ * `isolatedRole` is `"target"`.
  *
  * Numbers may arrive as text (hand-edited / older files): an empty string means "not entered", and
  * loading turns numeric text into numbers.
  */
 export interface SecondaryProduct {
   id: string;
-  /** e.g. "Side product", "Isomer B", "Di-substituted". */
+  /** e.g. "GH055-F1", "Monol", "Recovered SM". */
   name: string;
+  /** Target product, recovered starting material, or another isolated fraction. */
+  isolatedRole?: IsolatedFractionRole;
   /** Molecular weight, g/mol. */
   mw: string | number;
   /** Isolated mass, in `massUnit` (it is converted, not reinterpreted, when the unit is toggled). */
@@ -128,8 +146,19 @@ export type MoleculeMode = (typeof MOLECULE_MODES)[number];
 export interface StructuredReactionScheme {
   reactantImage?: string;    // Data URL (SVG or high-res PNG) for Left Zone (Limiting Reagent / SM)
   reactantCdxml?: string;    // Optional raw CDXML / Molfile captured on paste
+  /** Manual "Match Molecule Scale" width in px. Absent = natural fit inside the box. */
+  reactantDisplayWidth?: number;
   productImage?: string;     // Data URL (SVG or high-res PNG) for Right Zone (Product)
   productCdxml?: string;     // Optional raw CDXML / Molfile captured on paste
+  /** Manual "Match Molecule Scale" width in px. Absent = natural fit inside the box. */
+  productDisplayWidth?: number;
+  /**
+   * Caption under the product structure. This is the reaction-scheme target only.
+   * It is not an isolated fraction and must not be copied into `Experiment.product`.
+   */
+  productLabel?: string;
+  /** Molecular weight of the drawn scheme target, g/mol. Independent of isolated fractions. */
+  productMw?: number;
   solvent?: string;          // Below arrow: e.g. "THF" or "DCM / H2O (4:1)"
   temperature?: string;      // Below arrow: e.g. "0 °C to rt" or "80 °C"
   duration?: string;         // Below arrow: e.g. "16 h"
@@ -224,11 +253,32 @@ export function uid(): string {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 }
 
+/** Next free chromatographic label, skipping names already used (`GH055-F1`, then `GH055-F2`, ...). */
+export function suggestFractionLabel(experimentId: string, usedNames: readonly string[]): string {
+  const id = experimentId.trim();
+  const used = new Set(usedNames.map((name) => name.trim().toUpperCase()).filter(Boolean));
+  for (let n = 1; n <= 30; n++) {
+    const label = id ? `${id}-F${n}` : `F${n}`;
+    if (!used.has(label.toUpperCase())) return label;
+  }
+  const fallback = used.size + 1;
+  return id ? `${id}-F${fallback}` : `F${fallback}`;
+}
+
 export function newSecondaryProduct(
   massUnit: ProductMassUnit = "mg",
   name = "",
+  isolatedRole?: IsolatedFractionRole,
 ): SecondaryProduct {
-  return { id: uid(), name, mw: "", mass: "", massUnit, stoichRatio: 1 };
+  return {
+    id: uid(),
+    name,
+    mw: "",
+    mass: "",
+    massUnit,
+    stoichRatio: 1,
+    ...(isolatedRole ? { isolatedRole } : {}),
+  };
 }
 
 export function newGradientPoint(cv = 0, percentB = 0): GradientPoint {
@@ -299,7 +349,7 @@ export function newExperiment(
     purificationText: "",
     commentsText: "",
     reagents: [newRow("Limiting"), newRow("Reagent")],
-    product: { ...DEFAULT_PRODUCT, name: id },
+    product: { ...DEFAULT_PRODUCT, name: `${id}-F1` },
     tlcImages: [],
     references: [],
     units: { ...DEFAULT_UNITS },

@@ -4,7 +4,7 @@ import NumberInput, { cellInput } from "./NumberInput";
 import ReagentNameInput from "./ReagentNameInput";
 import { useEffect, useRef, useState } from "react";
 import type { ChemicalEntry } from "@/lib/chemicalDictionary";
-import { libraryCompoundSmiles, useLibrary, type LibraryCompound } from "@/lib/library";
+import { findMatchingLibraryCompound, libraryCompoundSmiles, useLibrary, type LibraryCompound } from "@/lib/library";
 import {
   concentration,
   displayValue,
@@ -41,6 +41,8 @@ interface Props {
     compound: LibraryCompound,
     preferredZone?: "reactant" | "product",
   ) => Promise<string | null>;
+  /** Scheme box the chemist last selected. The main library-structure action uses this. */
+  activeZone?: "reactant" | "product";
   /**
    * Open the Personal Library modal pre-filled with this row's name, MW, and density
    * so the user can paste a ChemDraw structure (Ctrl+V) and save it to their library.
@@ -106,6 +108,7 @@ export default function ReagentTable({
   onUnits,
   onInsertStructure,
   onSaveToLibrary,
+  activeZone = "reactant",
 }: Props) {
   const conc = concentration(rows);
   const { compounds: library } = useLibrary();
@@ -120,15 +123,22 @@ export default function ReagentTable({
     [],
   );
 
-  async function sendCompoundToSelectedZone(compound: LibraryCompound) {
+  async function sendCompoundToSelectedZone(
+    compound: LibraryCompound,
+    zone?: "reactant" | "product",
+  ) {
     if (!onInsertStructure) return;
-    const problem = await onInsertStructure(compound, undefined);
+    const target = zone ?? activeZone;
+    const problem = await onInsertStructure(compound, target);
     setSketchStatus(
       problem
         ? { kind: "error", text: problem }
         : {
             kind: "ok",
-            text: `Loaded ${compound.name} structure & MW into the selected reaction scheme box.`,
+            text:
+              target === "product"
+                ? `Loaded ${compound.name} into the product box.`
+                : `Added ${compound.name} to the reactant box.`,
           },
     );
     if (statusTimer.current) clearTimeout(statusTimer.current);
@@ -147,29 +157,33 @@ export default function ReagentTable({
     );
     if (!hasStruct || !onInsertStructure) return;
     if (withStructure || isLimiting) {
-      await sendCompoundToSelectedZone(compound);
+      await sendCompoundToSelectedZone(compound, activeZone);
     }
   }
 
   const edit = (id: string, field: EditableField, value: number | null) =>
     onRows((current) => editField(current, id, field, value));
 
+  const round2 = (value: number) => Number(value.toFixed(2));
+
   /** Number cell shown/typed in the display unit, stored in canonical units. */
   const quantityCell = (row: ReagentRow, field: "n" | "mass" | "vol", label: string) => (
     <NumberInput
       ariaLabel={`${label} of ${row.name || "reagent"}`}
       value={displayValue(row[field], field, units)}
-      onCommit={(v) => edit(row.id, field, v === null ? null : toCanonical(v, units[field]))}
+      onCommit={(v) =>
+        edit(row.id, field, v === null ? null : toCanonical(round2(v), units[field]))
+      }
     />
   );
 
   return (
     <div>
       <div className="-mx-2 overflow-x-auto px-2 print:mx-0 print:overflow-visible print:px-0">
-        <table className="w-full min-w-[720px] table-fixed border-collapse text-sm print:min-w-0 print:text-xs">
+        <table className="w-full min-w-[960px] table-fixed border-collapse text-sm print:min-w-0 print:text-xs">
           <thead>
             <tr className="border-b border-zinc-300 text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
-              <Th align="left" className="w-auto">Reagent name</Th>
+              <Th align="left" className="min-w-[280px]">Reagent name</Th>
               <Th align="left" className="w-24">Role</Th>
               <Th className="w-[4.5rem]">
                 MW
@@ -207,12 +221,15 @@ export default function ReagentTable({
                 [row.mw, row.n, row.mass, row.vol, row.density, isLimiting ? null : row.eq].every(
                   (v) => v === null,
                 );
-              const matchedLibraryCompound =
-                library?.find(
-                  (c) =>
-                    c.name.trim().toLowerCase() === row.name.trim().toLowerCase() &&
-                    Boolean(c.cdxml?.trim() || c.imageDataUrl || c.structure?.trim()),
-                ) ?? null;
+              const matchedLibraryCompound = row.name.trim()
+                ? (library?.find((compound) => compound.name === row.libraryMatch) ??
+                  findMatchingLibraryCompound(
+                    row.name,
+                    undefined,
+                    row.mw ?? undefined,
+                    library ?? [],
+                  ))
+                : null;
 
               return (
                 <tr
@@ -221,19 +238,19 @@ export default function ReagentTable({
                     isLimiting ? "bg-fume-50/50 print:bg-transparent" : ""
                   } ${isBlank ? "print:hidden" : ""}`}
                 >
-                  <td className="py-1 pr-1 print:px-1.5 print:py-0.5">
-                    <div className="flex items-center gap-1">
-                      <div className="min-w-0 flex-1">
+                  <td className="min-w-[280px] py-1 pr-1 print:min-w-0 print:px-1.5 print:py-0.5">
+                    <div className="flex min-w-[200px] flex-1 flex-wrap items-center gap-1 print:min-w-0">
+                      <div className="min-w-[200px] flex-1 print:min-w-0">
                         <ReagentNameInput
                           value={row.name}
                           emphasized={isLimiting}
-                          className={`${cellInput} text-left ${isLimiting ? "font-medium" : ""} print:hidden`}
+                          className={`${cellInput} min-w-[200px] flex-1 text-left ${isLimiting ? "font-medium" : ""} print:min-w-0 print:hidden`}
                           onNameChange={(name) =>
                             onRows((cur) =>
                               cur.map((r) => {
                                 if (r.id !== row.id) return r;
                                 if (r.name === name) return r;
-                                const { smiles: _previous, ...rest } = r;
+                                const { smiles: _previous, libraryMatch: _match, ...rest } = r;
                                 return { ...rest, name };
                               }),
                             )
@@ -251,28 +268,15 @@ export default function ReagentTable({
                           canSketch={onInsertStructure !== undefined}
                         />
                       </div>
+
                       {matchedLibraryCompound && onInsertStructure && (
-                        <button
-                          type="button"
-                          onClick={() => void sendCompoundToSelectedZone(matchedLibraryCompound)}
-                          title={`Load "${matchedLibraryCompound.name}" structure & MW into the selected Reaction Scheme box`}
-                          aria-label={`Load ${matchedLibraryCompound.name} structure into selected reaction scheme box`}
-                          className="inline-flex shrink-0 items-center gap-0.5 rounded border border-fume-200 bg-fume-50/70 px-1.5 py-0.5 text-[10px] font-medium text-fume-700 transition-colors hover:border-fume-400 hover:bg-fume-100 print:hidden"
-                        >
-                          <svg
-                            viewBox="0 0 16 16"
-                            className="size-3"
-                            fill="none"
-                            stroke="currentColor"
-                            strokeWidth="1.6"
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            aria-hidden
-                          >
-                            <path d="M8 2l5 3v6l-5 3-5-3V5l5-3z" />
-                          </svg>
-                          <span>Scheme</span>
-                        </button>
+                        <LibraryStructureButton
+                          name={matchedLibraryCompound.name}
+                          activeZone={activeZone}
+                          onSend={(zone) =>
+                            void sendCompoundToSelectedZone(matchedLibraryCompound, zone)
+                          }
+                        />
                       )}
                     </div>
                   </td>
@@ -314,7 +318,7 @@ export default function ReagentTable({
                         ariaLabel={`Equivalents of ${row.name || "reagent"}`}
                         value={isLimiting ? 1 : row.eq}
                         readOnly={isLimiting}
-                        onCommit={(v) => edit(row.id, "eq", v)}
+                        onCommit={(v) => edit(row.id, "eq", v === null ? null : round2(v))}
                       />
                     )}
                   </td>
@@ -420,6 +424,94 @@ export default function ReagentTable({
 }
 
 // --- Small pieces ---------------------------------------------------------------
+
+function LibraryStructureButton({
+  name,
+  activeZone,
+  onSend,
+}: {
+  name: string;
+  activeZone: "reactant" | "product";
+  onSend: (zone: "reactant" | "product") => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    function onPointerDown(event: MouseEvent) {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onPointerDown);
+    return () => document.removeEventListener("mousedown", onPointerDown);
+  }, [open]);
+
+  const focused = activeZone === "product" ? "Product" : "Reactant";
+
+  return (
+    <div ref={rootRef} className="relative inline-flex shrink-0 print:hidden">
+      <button
+        type="button"
+        onClick={() => onSend(activeZone)}
+        title={`Load the saved ${name} structure into the focused ${focused} box`}
+        aria-label={`Use library structure for ${name} in the ${focused} box`}
+        className="inline-flex items-center gap-0.5 rounded-l border border-fume-200 bg-fume-50/70 px-1.5 py-0.5 text-[10px] font-medium text-fume-700 transition-colors hover:border-fume-400 hover:bg-fume-100"
+      >
+        <svg
+          viewBox="0 0 16 16"
+          className="size-3"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.6"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden
+        >
+          <path d="M8 2l5 3v6l-5 3-5-3V5l5-3z" />
+        </svg>
+        <span>Library</span>
+      </button>
+      <button
+        type="button"
+        aria-label={`Choose reactant or product for ${name}`}
+        aria-expanded={open}
+        title="Send this structure to the reactant box or the product box"
+        onClick={() => setOpen((current) => !current)}
+        className="rounded-r border border-l-0 border-fume-200 bg-fume-50/70 px-1 text-[10px] font-medium text-fume-700 hover:bg-fume-100"
+      >
+        ▾
+      </button>
+      {open && (
+        <div
+          role="menu"
+          className="absolute right-0 top-full z-30 mt-1 w-44 rounded-md border border-zinc-200 bg-white py-1 text-left shadow-md"
+        >
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              setOpen(false);
+              onSend("reactant");
+            }}
+            className="block w-full px-2 py-1 text-left text-[11px] text-zinc-700 hover:bg-fume-50"
+          >
+            → To Reactant{activeZone === "reactant" ? " (focused)" : ""}
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              setOpen(false);
+              onSend("product");
+            }}
+            className="block w-full px-2 py-1 text-left text-[11px] text-zinc-700 hover:bg-fume-50"
+          >
+            → To Product{activeZone === "product" ? " (focused)" : ""}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function Th({
   children,

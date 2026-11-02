@@ -21,8 +21,9 @@ export function toReagentRows(parsed: ParsedProtocol): ReagentRow[] {
     row.n = positive(raw.mmol);
     row.vol = positive(raw.volumeMl);
     row.eq = positive(raw.equiv) ?? (role === "Limiting" ? 1 : null);
-    // Molecular weight follows from mass / amount when both were stated.
-    if (row.mass !== null && row.n !== null && row.n > 0) row.mw = row.mass / row.n;
+    const statedMw = typeof raw.mw === "number" && Number.isFinite(raw.mw) && raw.mw > 0 ? raw.mw : null;
+    if (statedMw !== null) row.mw = Math.round(statedMw * 100) / 100;
+    else if (row.mass !== null && row.n !== null && row.n > 0) row.mw = row.mass / row.n;
     // Solvent rows only carry a volume (and density): no MW / mass / amount / equivalents.
     if (role === "Solvent") {
       row.mw = null;

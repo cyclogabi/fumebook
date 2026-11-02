@@ -30,6 +30,12 @@ tauri-plugin-shell = "2.5.0"
 arboard = "3.4"
 image = "0.24"
 base64 = "0.22"
+# Direct Ollama calls from the app process. The installed WebView cannot fetch
+# localhost or a Tailscale host (CORS, mixed content, and the app CSP).
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+# Native Save dialogs. default-features off matches the copy already pulled in by tauri-plugin-dialog
+# (Windows file dialogs do not need the Linux portal / GTK features).
+rfd = { version = "0.16", default-features = false }
 
 # Windows-only: reads ChemDraw's custom clipboard formats (see `read_chemdraw_clipboard`).
 [target.'cfg(windows)'.dependencies]

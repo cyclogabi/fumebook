@@ -533,25 +533,25 @@ function rowsFromTemplate(template: SavedReactionTemplate): ReagentRow[] {
 }
 
 /**
- * Fields to write onto the open experiment. Masses, mmol, and volumes are
+ * Fields to write onto the open experiment. Reagent masses, mmol, and volumes are
  * cleared so the saved equivalents wait for a new starting mass.
+ * The template's product name and molecular weight are written onto the reaction scheme
+ * only. Isolated fractions on `experiment` are left untouched.
  * Call this through the experiment undo updater so Ctrl+Z restores the previous reaction.
  */
 export function applySavedReaction(
-  experiment: Experiment,
+  _experiment: Experiment,
   template: SavedReactionTemplate,
 ): Partial<Experiment> {
+  const scheme = schemeFromTemplate(template) ?? {};
   const productName = template.productName?.trim();
+  if (productName) scheme.productLabel = productName;
+  if (template.productMw && template.productMw > 0) scheme.productMw = template.productMw;
   return {
-    structuredScheme: schemeFromTemplate(template),
+    structuredScheme: Object.keys(scheme).length > 0 ? scheme : undefined,
     reactantSmiles: template.reactantSmiles?.trim() || undefined,
     productSmiles: template.productSmiles?.trim() || undefined,
     reagents: rowsFromTemplate(template),
-    product: {
-      ...experiment.product,
-      ...(productName ? { name: productName } : {}),
-      mw: template.productMw && template.productMw > 0 ? template.productMw : null,
-    },
   };
 }
 

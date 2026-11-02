@@ -804,6 +804,8 @@ export default function PurificationSection({
               <img
                 src={fractionTlcImage}
                 alt="Consecutive column fractions TLC strip"
+                loading="eager"
+                decoding="sync"
                 className="h-full w-full object-contain"
               />
               <div className="absolute right-2 top-2 flex gap-1.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
@@ -858,7 +860,7 @@ export default function PurificationSection({
                   : "Drop panoramic TLC image of consecutive column tubes / fractions here"}
               </span>
               <span className="mt-0.5 text-[11px] text-zinc-400">
-                Sized for 1 TLC tall × 5–6 TLC plates wide · Click to browse or click here &amp; press Ctrl+V
+                Sized for 1 TLC tall × 5–6 TLC plates wide · Click to browse or click here and press Ctrl+V / Cmd+V
               </span>
             </div>
           )}
@@ -944,6 +946,8 @@ export default function PurificationSection({
               <img
                 src={fractionTlcImage}
                 alt="Column fractions TLC strip"
+                loading="eager"
+                decoding="sync"
                 className="mx-auto block max-h-24 w-auto max-w-full rounded-none border border-zinc-300 object-contain"
               />
             </div>

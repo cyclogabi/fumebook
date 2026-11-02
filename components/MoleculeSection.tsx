@@ -8,6 +8,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ClipboardEvent as ReactClipboardEvent,
   type DragEvent,
   type Ref,
 } from "react";
@@ -21,6 +22,12 @@ import {
   readClipboardText,
 } from "@/lib/clipboard";
 import { dataUrlToTrimmedPngDataUrl, imageFileToPng } from "@/lib/images";
+import { fetchPubChemCompound, fetchPubChemPngDataUrl } from "@/lib/pubchem";
+import {
+  buildReactionSchemeSvg,
+  downloadReactionSchemeSvg,
+  extractSvgDimensions,
+} from "@/lib/schemeSvg";
 import {
   describeProperties,
   detectFormat,
@@ -44,12 +51,11 @@ import {
 import { editField, formatNumber, looseNumber } from "@/lib/stoich";
 import { blobToDataUrl, saveSchemeCdxml } from "@/lib/storage";
 import { isTauri } from "@/lib/tauri";
+import { invoke } from "@tauri-apps/api/core";
 import {
   newRow,
   type MoleculeMode,
-  type ProductInfo,
   type ReagentRow,
-  type SecondaryProduct,
   type StructuredReactionScheme,
 } from "@/lib/types";
 
@@ -69,10 +75,6 @@ interface Props {
   /** Experiment reagents (synced with Left Zone Limiting Reagent & Center Zone Above-Arrow Reagents). */
   reagents: ReagentRow[];
   onReagentsChange: (fn: (rows: ReagentRow[]) => ReagentRow[]) => void;
-  /** Primary product & secondary products (synced with Right Zone Product label & MW). */
-  product: ProductInfo;
-  onProductChange?: (patch: Partial<ProductInfo>) => void;
-  secondaryProducts?: SecondaryProduct[];
   /** Open the Personal Library dialog. */
   onOpenLibrary: () => void;
   /** Canonical SMILES already stored on the experiment (shown until a fresh extraction finishes). */
@@ -88,6 +90,8 @@ interface Props {
    * The parent records the current experiment on the undo stack first.
    */
   onLoadReaction: (template: SavedReactionTemplate) => void;
+  /** The reactant or product box the chemist last clicked. */
+  onActiveZoneChange?: (zone: StructureZone) => void;
   ref?: Ref<MoleculeSectionHandle>;
 }
 
@@ -180,6 +184,99 @@ function normaliseV2000Molfile(molfile: string): string {
   ].join("\n");
 }
 
+function molField(value: number, width: number): string {
+  const text = String(Math.round(value));
+  return text.length >= width ? text.slice(-width) : text.padStart(width, " ");
+}
+
+function molCoord(value: number): string {
+  const fixed = value.toFixed(4);
+  return fixed.length >= 10 ? fixed.slice(0, 10) : fixed.padStart(10, " ");
+}
+
+function parseMolAtomsBonds(molfile: string): { atoms: string[]; bonds: string[] } | null {
+  const normalised = normaliseV2000Molfile(molfile);
+  if (!/V2000/i.test(normalised)) return null;
+  const lines = normalised.replace(/\r\n?/g, "\n").split("\n");
+  const countsIdx = lines.findIndex((line) => /V2000\s*$/i.test(line));
+  if (countsIdx < 0) return null;
+  const counts = lines[countsIdx] ?? "";
+  const nAtoms = parseInt(counts.slice(0, 3).trim(), 10);
+  const nBonds = parseInt(counts.slice(3, 6).trim(), 10);
+  if (!Number.isFinite(nAtoms) || !Number.isFinite(nBonds) || nAtoms <= 0) return null;
+  const body = lines.slice(countsIdx + 1);
+  const atoms = body.slice(0, nAtoms);
+  const bonds = body.slice(nAtoms, nAtoms + Math.max(0, nBonds));
+  if (atoms.length < nAtoms || atoms.some((line) => !line)) return null;
+  return { atoms, bonds };
+}
+
+/** Place `extra` to the right of `base` in one V2000 molfile. */
+function mergeMolfiles(base: string, extra: string): string | null {
+  const left = parseMolAtomsBonds(base);
+  const right = parseMolAtomsBonds(extra);
+  if (!left || !right) return null;
+  const xs = (lines: string[]) =>
+    lines.map((line) => parseFloat(line.slice(0, 10).trim())).filter((n) => Number.isFinite(n));
+  const leftX = xs(left.atoms);
+  const rightX = xs(right.atoms);
+  if (leftX.length === 0 || rightX.length === 0) return null;
+  const dx = Math.max(...leftX) - Math.min(...rightX) + 2.5;
+  const atoms = [
+    ...left.atoms,
+    ...right.atoms.map((line) => {
+      const x = parseFloat(line.slice(0, 10).trim());
+      return Number.isFinite(x) ? `${molCoord(x + dx)}${line.slice(10)}` : line;
+    }),
+  ];
+  const bonds = [
+    ...left.bonds,
+    ...right.bonds.map((line) => {
+      const a = parseInt(line.slice(0, 3).trim(), 10);
+      const b = parseInt(line.slice(3, 6).trim(), 10);
+      if (!Number.isFinite(a) || !Number.isFinite(b)) return line;
+      return `${molField(a + left.atoms.length, 3)}${molField(b + left.atoms.length, 3)}${line.slice(6)}`;
+    }),
+  ];
+  const counts = `${molField(atoms.length, 3)}${molField(bonds.length, 3)}  0  0  0  0  0  0  0  0999 V2000`;
+  return ["", "Fumebook", "", counts, ...atoms, ...bonds, "M  END", ""].join("\n");
+}
+
+async function structureToMolfile(structure: string): Promise<string | null> {
+  const prepared = prepareForKetcher(structure);
+  if (!prepared.trim()) return null;
+  const format = detectFormat(prepared);
+  if (format === "mol") return normaliseV2000Molfile(prepared);
+  const service = await getStandaloneStructService();
+  try {
+    if (format === "smiles") {
+      const laid = await service.layout(
+        { struct: prepared.trim(), output_format: "chemical/x-mdl-molfile" as never },
+        {},
+      );
+      return laid?.struct ? normaliseV2000Molfile(laid.struct) : null;
+    }
+    const converted = await service.convert(
+      { struct: prepared, output_format: "chemical/x-mdl-molfile" as never },
+      {},
+    );
+    return converted?.struct ? normaliseV2000Molfile(converted.struct) : null;
+  } catch (err) {
+    console.warn("Could not convert a structure to a molfile:", err);
+    return null;
+  }
+}
+
+/** Lay two structures side by side. Throws when either one cannot be read as coordinates. */
+async function mergeStructuresBeside(existing: string, incoming: string): Promise<string> {
+  const left = await structureToMolfile(existing);
+  const right = await structureToMolfile(incoming);
+  if (!left || !right) throw new Error("missing molfile");
+  const merged = mergeMolfiles(left, right);
+  if (!merged) throw new Error("could not merge");
+  return merged;
+}
+
 /** Blank 3-character bond fields (`   `) become `  0`. A real stereo flag (`  1`, `  6`) is kept. */
 function fixV2000BondLine(line: string): string {
   if (!line || line.startsWith("M  ")) return line;
@@ -257,6 +354,309 @@ async function getStandaloneStructService(): Promise<StandaloneStructService> {
  * `data:image/svg+xml;base64,...` data URL and compute its Molecular Weight (`MW`, g/mol)
  * using Indigo (`structService.generateImageAsBase64`, `structService.convert`, and `structService.calculate`).
  */
+/**
+ * Compute the molecular 2D coordinate span from a V2000 Molfile.
+ * Standard C-C bond length is ~1.5 Å in 2D coordinates.
+ * Using 30px per 1.5 Å standard bond gives 20 px/Å.
+ */
+export interface MolfileSpanResult {
+  spanX: number;
+  spanY: number;
+  width: number;
+  height: number;
+}
+
+export function computeMolfileSpan(molfile: string | undefined): MolfileSpanResult | null {
+  if (!molfile || !/V2000/i.test(molfile)) return null;
+  const lines = molfile.split(/\r?\n/);
+  const countsIdx = lines.findIndex((l) => /V2000\s*$/i.test(l));
+  if (countsIdx < 0) return null;
+  const countsLine = lines[countsIdx];
+  const nAtoms = parseInt(countsLine.slice(0, 3).trim(), 10);
+  if (!Number.isFinite(nAtoms) || nAtoms <= 0) return null;
+
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  let count = 0;
+  for (let i = countsIdx + 1; i < lines.length && count < nAtoms; i++) {
+    const line = lines[i];
+    if (line.startsWith("M  ")) break;
+    if (line.length >= 20) {
+      const x = parseFloat(line.slice(0, 10).trim());
+      const y = parseFloat(line.slice(10, 20).trim());
+      if (Number.isFinite(x) && Number.isFinite(y)) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        count++;
+      }
+    }
+  }
+  if (count === 0 || !Number.isFinite(minX)) return null;
+
+  const spanX = Math.max(0, maxX - minX);
+  const spanY = Math.max(0, maxY - minY);
+  // Natural base bond length: 30px per 1.5 Å bond = 20 px/Å + 34px padding for atom labels & margins (unclamped)
+  const rawW = Math.max(50, Math.round(spanX > 0 ? spanX * 20 + 34 : 70));
+  const rawH = Math.max(50, Math.round(spanY > 0 ? spanY * 20 + 34 : 70));
+
+  return { spanX, spanY, width: rawW, height: rawH };
+}
+
+/**
+ * Parse the coordinate span in Ångströms from either a V2000 Molfile or an SVG data URL.
+ */
+function parseStructureSpan(
+  source: string | undefined,
+  pad = 34,
+): { spanX: number; spanY: number } | null {
+  if (!source) return null;
+  if (/V2000/i.test(source)) {
+    const mol = computeMolfileSpan(source);
+    if (mol) return { spanX: mol.spanX, spanY: mol.spanY };
+  }
+  if (source.includes("image/svg+xml") || source.includes("<svg")) {
+    const dims = extractSvgDimensions(source);
+    if (dims && dims.width > 0 && dims.height > 0) {
+      return {
+        spanX: Math.max(0.5, (dims.width - pad) / 20),
+        spanY: Math.max(0.5, (dims.height - pad) / 20),
+      };
+    }
+  }
+  return null;
+}
+
+export interface SchemeScaleDimensions {
+  reactant?: { widthPx: number; heightPx: number };
+  product?: { widthPx: number; heightPx: number };
+  sharedPxPerAngstrom: number;
+}
+
+/**
+ * Coupled Pair-Scaling:
+ * The LARGER molecule of the (Reactant, Product) pair dictates the single shared
+ * `pxPerAngstrom` scale for BOTH molecules so bonds, rings, and atom letters always match.
+ */
+export function computeSharedSchemeScale(
+  reactantMol: string | undefined,
+  productMol: string | undefined,
+  maxBoxW = 220,
+  maxBoxH = 185,
+  pad = 34,
+): SchemeScaleDimensions {
+  const reactantSpan = parseStructureSpan(reactantMol, pad);
+  const productSpan = parseStructureSpan(productMol, pad);
+
+  const maxSpanX = Math.max(reactantSpan?.spanX || 1, productSpan?.spanX || 1);
+  const maxSpanY = Math.max(reactantSpan?.spanY || 1, productSpan?.spanY || 1);
+
+  // Single shared scale ensuring the larger molecule fits inside the box without exceeding 20 px/Å
+  const sharedPxPerAngstrom = Math.min(
+    20,
+    (maxBoxW - pad) / maxSpanX,
+    (maxBoxH - pad) / maxSpanY,
+  );
+
+  const result: SchemeScaleDimensions = {
+    sharedPxPerAngstrom,
+  };
+
+  if (reactantSpan) {
+    result.reactant = {
+      widthPx: Math.round(reactantSpan.spanX * sharedPxPerAngstrom + pad),
+      heightPx: Math.round(reactantSpan.spanY * sharedPxPerAngstrom + pad),
+    };
+  }
+
+  if (productSpan) {
+    result.product = {
+      widthPx: Math.round(productSpan.spanX * sharedPxPerAngstrom + pad),
+      heightPx: Math.round(productSpan.spanY * sharedPxPerAngstrom + pad),
+    };
+  }
+
+  return result;
+}
+
+const MATCHED_LARGE_PX = 210;
+const MATCHED_MIN_PX = 65;
+
+/** Longer axis of a 2D heavy-atom coordinate box (molfile units, usually Å). */
+export function coordinateBoundingSpan(spanX: number, spanY: number): number {
+  return Math.max(0, spanX, spanY);
+}
+
+/**
+ * Larger molecule is 210px wide. The smaller one is
+ * `round(max(65, 210 * smallerSpan / largerSpan))`.
+ */
+export function matchedDisplayWidths(
+  reactantSpan: number,
+  productSpan: number,
+): { reactantDisplayWidth: number; productDisplayWidth: number } {
+  const larger = Math.max(reactantSpan, productSpan);
+  const widthFor = (span: number) =>
+    span >= larger
+      ? MATCHED_LARGE_PX
+      : Math.round(Math.max(MATCHED_MIN_PX, (MATCHED_LARGE_PX * span) / larger));
+  return {
+    reactantDisplayWidth: widthFor(reactantSpan),
+    productDisplayWidth: widthFor(productSpan),
+  };
+}
+
+function mwTwoThirds(mw: number | null | undefined): number | null {
+  if (mw == null || !(mw > 0) || !Number.isFinite(mw)) return null;
+  return Math.pow(mw, 2 / 3);
+}
+
+/**
+ * Sizes for Match Molecule Scale.
+ * Both coordinate spans are used when each drawing has them.
+ * A custom image with no coordinates falls back to MW^(2/3) for both sides.
+ */
+export function scaleSizesForMatch(
+  reactantSpan: number | null,
+  productSpan: number | null,
+  reactantMw: number | null | undefined,
+  productMw: number | null | undefined,
+): { reactant: number; product: number } | null {
+  if (reactantSpan && reactantSpan > 0 && productSpan && productSpan > 0) {
+    return { reactant: reactantSpan, product: productSpan };
+  }
+  const reactant = mwTwoThirds(reactantMw);
+  const product = mwTwoThirds(productMw);
+  if (reactant && product) return { reactant, product };
+  return null;
+}
+
+function spanFromMolfileText(molfile: string | undefined): number | null {
+  if (!molfile || !/V2000/i.test(molfile)) return null;
+  const parsed = computeMolfileSpan(molfile);
+  if (!parsed) return null;
+  const span = coordinateBoundingSpan(parsed.spanX, parsed.spanY);
+  return span > 0.05 ? span : null;
+}
+
+/** 2D bounding span from a Molfile, or from CDXML / SMILES laid out by Indigo. */
+async function measureCoordinateSpan(source: string | undefined): Promise<number | null> {
+  const text = source?.trim() ?? "";
+  if (!text || text.startsWith("data:image/")) return null;
+  const direct = spanFromMolfileText(text);
+  if (direct) return direct;
+  try {
+    return await withIndigoLock(async () => {
+      const service = await getStandaloneStructService();
+      try {
+        const converted = await service.convert(
+          {
+            struct: text,
+            output_format: "chemical/x-mdl-molfile" as never,
+          },
+          {},
+        );
+        const fromConvert = spanFromMolfileText(converted?.struct);
+        if (fromConvert) return fromConvert;
+      } catch (err) {
+        console.warn("Indigo molfile conversion failed while measuring span:", err);
+      }
+      try {
+        const laidOut = await service.layout(
+          {
+            struct: text,
+            output_format: "chemical/x-mdl-molfile" as never,
+          },
+          {},
+        );
+        return spanFromMolfileText(laidOut?.struct);
+      } catch (err) {
+        console.warn("Indigo layout failed while measuring span:", err);
+        return null;
+      }
+    });
+  } catch (err) {
+    console.warn("Could not measure the structure's coordinates:", err);
+    return null;
+  }
+}
+
+/**
+ * Normalize an SVG's explicit width and height proportional to its molecular coordinate bounding
+ * box (constant 30px per standard 1.5 Å bond, unclamped so the SVG scales linearly with width/height).
+ */
+function normalizeSvgBondLength(b64Svg: string, molfile?: string): string {
+  let svgText = "";
+  try {
+    const cleanB64 = b64Svg.startsWith("data:")
+      ? b64Svg.slice(b64Svg.indexOf(",") + 1)
+      : b64Svg;
+    svgText =
+      typeof atob === "function"
+        ? atob(cleanB64)
+        : Buffer.from(cleanB64, "base64").toString("utf8");
+  } catch {
+    return b64Svg.startsWith("data:") ? b64Svg : `data:image/svg+xml;base64,${b64Svg}`;
+  }
+
+  let molDims: { width: number; height: number } | null = null;
+  if (molfile) {
+    molDims = computeMolfileSpan(molfile);
+  }
+
+  const vbMatch = svgText.match(
+    /\bviewBox=["']?([-\d.]+)[,\s]+([-\d.]+)[,\s]+([-\d.]+)[,\s]+([-\d.]+)["']/i,
+  );
+  const vbW = vbMatch ? parseFloat(vbMatch[3]) : 0;
+  const vbH = vbMatch ? parseFloat(vbMatch[4]) : 0;
+
+  let targetW: number;
+  let targetH: number;
+
+  if (molDims && molDims.width > 0 && molDims.height > 0) {
+    targetW = molDims.width;
+    targetH = molDims.height;
+  } else if (vbW > 0 && vbH > 0) {
+    targetW = Math.max(50, Math.round(vbW));
+    targetH = Math.max(50, Math.round(vbH));
+  } else {
+    targetW = 180;
+    targetH = 180;
+  }
+
+  const svgTagMatch = svgText.match(/<svg\b[^>]*>/i);
+  if (svgTagMatch) {
+    let newTag = svgTagMatch[0];
+    if (/\bwidth=["'][^"']*["']/i.test(newTag)) {
+      newTag = newTag.replace(/\bwidth=["'][^"']*["']/i, `width="${targetW}px"`);
+    } else {
+      newTag = newTag.replace(/<svg\b/i, `<svg width="${targetW}px"`);
+    }
+    if (/\bheight=["'][^"']*["']/i.test(newTag)) {
+      newTag = newTag.replace(/\bheight=["'][^"']*["']/i, `height="${targetH}px"`);
+    } else {
+      newTag = newTag.replace(/<svg\b/i, `<svg height="${targetH}px"`);
+    }
+    if (!/preserveAspectRatio/i.test(newTag)) {
+      newTag = newTag.replace(/<svg\b/i, `<svg preserveAspectRatio="xMidYMid meet"`);
+    }
+    svgText = svgText.replace(svgTagMatch[0], newTag);
+  }
+
+  try {
+    const encoded =
+      typeof btoa === "function"
+        ? btoa(svgText)
+        : Buffer.from(svgText, "utf8").toString("base64");
+    return `data:image/svg+xml;base64,${encoded}`;
+  } catch {
+    return `data:image/svg+xml;utf8,${encodeURIComponent(svgText)}`;
+  }
+}
+
 export async function renderStructureToVectorSvg(rawText: string): Promise<{
   svgDataUrl: string;
   cdxml: string;
@@ -281,24 +681,27 @@ export async function renderStructureToVectorSvg(rawText: string): Promise<{
   }
 
   let b64: string;
+  const renderOptions = {
+    outputFormat: "svg" as const,
+    backgroundColor: "255, 255, 255",
+    "bond-length": 30,
+    "render-bond-length": 30,
+    "bond-length-unit": "px",
+    "render-atom-ids-visible": false,
+    "render-output-format": "svg",
+  };
   try {
-    b64 = await service.generateImageAsBase64(structForRender, {
-      outputFormat: "svg",
-      backgroundColor: "255, 255, 255",
-    });
+    b64 = await service.generateImageAsBase64(structForRender, renderOptions);
   } catch (err) {
     if (format === "mol") {
       const stripped = stripMolfileBondStereo(structForRender);
-      b64 = await service.generateImageAsBase64(stripped, {
-        outputFormat: "svg",
-        backgroundColor: "255, 255, 255",
-      });
+      b64 = await service.generateImageAsBase64(stripped, renderOptions);
       structForRender = stripped;
     } else {
       throw err;
     }
   }
-  const svgDataUrl = b64.startsWith("data:") ? b64 : `data:image/svg+xml;base64,${b64}`;
+  const svgDataUrl = normalizeSvgBondLength(b64, structForRender);
 
   let cdxml = prepared;
   if (format !== "cdxml") {
@@ -321,6 +724,62 @@ export async function renderStructureToVectorSvg(rawText: string): Promise<{
   const mw = await calculateMwWithIndigoFallback(structForRender);
   return { svgDataUrl, cdxml, mw };
 }
+
+const CAS_PATTERN = /^\d{2,7}-\d{2}-\d$/;
+
+/** A SMILES string, rather than a chemical name or CAS number. */
+export function looksLikeSmiles(value: string): boolean {
+  const text = value.trim();
+  if (!text || /\s/.test(text) || text.length > 500) return false;
+  if (CAS_PATTERN.test(text)) return false;
+  return /[=#@\\/]/.test(text) || /^[A-Z][a-z]?\d*$/.test(text);
+}
+
+export interface DrawnStructure {
+  smiles: string;
+  imageDataUrl: string;
+  structureText: string;
+  mw: number | null;
+}
+
+/**
+ * Look up a chemical name or SMILES, render a vector SVG (falling back to a PubChem PNG),
+ * and return the image, SMILES, and MW. Used by the Auto-draw button and library imports.
+ */
+export async function drawFromNameOrSmiles(query: string): Promise<DrawnStructure | null> {
+  const text = query.trim();
+  if (!text) return null;
+
+  let smiles = looksLikeSmiles(text) ? text : "";
+  let mw: number | null = null;
+  if (!smiles) {
+    const record = await fetchPubChemCompound(text);
+    if (!record) return null;
+    smiles = record.smiles;
+    mw = record.mw;
+  }
+
+  try {
+    const rendered = await withIndigoLock(() => renderStructureToVectorSvg(smiles));
+    const structureText =
+      /<CDXML[\s>]/i.test(rendered.cdxml) || /\bM\s+END\b/.test(rendered.cdxml)
+        ? rendered.cdxml
+        : smiles;
+    return {
+      smiles,
+      imageDataUrl: rendered.svgDataUrl,
+      structureText,
+      mw: rendered.mw ?? mw,
+    };
+  } catch (err) {
+    console.warn("Indigo could not draw that structure, trying PubChem's image:", err);
+    if (looksLikeSmiles(text) && text === smiles) return null;
+    const imageDataUrl = await fetchPubChemPngDataUrl(text);
+    if (!imageDataUrl) return null;
+    return { smiles, imageDataUrl, structureText: smiles, mw };
+  }
+}
+
 
 /**
  * Convert CDXML / Molfile / SMILES to a daylight SMILES string.
@@ -417,17 +876,12 @@ async function calculateMwWithIndigoFallback(struct: string): Promise<number | n
 }
 
 /**
- * Dual-stream clipboard extractor for `Ctrl+V` pastes:
- * 1. Reads `read_clipboard_image_base64()` (Rust `arboard` + `CF_ENHMETAFILE` PNG reader)
- *    and `read_chemdraw_clipboard()` (Rust `CDXML` / `MDLCT` / `SMILES` reader).
- * 2. When `read_clipboard_image_base64()` returns a base64 PNG (or browser `event.clipboardData`
- *    provides a native image), passes it through `dataUrlToTrimmedPngDataUrl` (`trimCanvasWhiteBorder`)
- *    and uses it as `reactantImage` / `productImage` (preserving ChemDraw's pixel-perfect 3D perspective,
- *    red ring fills, bold wedges, and faded rear bonds).
- * 3. Uses the `CDXML` / `MDLCT` / `SMILES` string from `read_chemdraw_clipboard()` in a fail-safe
- *    background `try / catch` block to calculate `MW` via Indigo and save `CDXML` for ChemDraw editing.
- *    If Indigo throws a stereocenter or header validation error, logs a warning and still completes
- *    the image + CDXML paste with `mw: null`.
+ * Dual-stream clipboard extractor for `Ctrl+V` pastes.
+ * Image sources, in order: `clipboardData` `image/*` files and items, then
+ * `navigator.clipboard.read()` `image/png` (and other `image/*`), then the Tauri command that
+ * reads the clipboard PNG / BMP / EMF together with CDXML / MDLCT / Molfile bytes.
+ * A picture on the clipboard is stored as-is. Indigo may only fill SMILES and MW in the
+ * background; if it cannot parse a colored cartoon, the ChemDraw image and CDXML stay.
  */
 export async function extractDualStreamClipboard(event?: ClipboardEvent): Promise<{
   imageDataUrl: string;
@@ -435,45 +889,121 @@ export async function extractDualStreamClipboard(event?: ClipboardEvent): Promis
   structureText: string;
   mw: number | null;
 } | null> {
-  const items = Array.from(event?.clipboardData?.items ?? []).filter((i) => i.kind === "file");
-  const svgItem = items.find((i) => i.type === "image/svg+xml");
-  const rasterItem =
-    items.find((i) => i.type === "image/png") ??
-    items.find((i) => i.type.startsWith("image/"));
+  // 1. Synchronously extract all items, files, text, and html from event.clipboardData BEFORE any await!
+  const clipboardData = event?.clipboardData;
+  const files = Array.from(clipboardData?.files || []);
+  const items = Array.from(clipboardData?.items || []);
+  const text = clipboardData?.getData("text/plain") || "";
+  const html = clipboardData?.getData("text/html") || "";
 
-  const syncText = cleanClipboardText(event?.clipboardData?.getData("text/plain") ?? "");
-
-  // 1. Read the native clipboard image (`read_clipboard_image_base64`) and the chemical structure
-  //    (`read_chemdraw_clipboard`) sequentially so Windows `OpenClipboard` never contends between threads.
-  const rustPngDataUrl = await readClipboardImageBase64();
-  const chemDrawText = await readChemDrawClipboard();
-
-  let nativeImageUrl = "";
-  if (rustPngDataUrl) {
-    try {
-      nativeImageUrl = await dataUrlToTrimmedPngDataUrl(rustPngDataUrl);
-    } catch {
-      nativeImageUrl = rustPngDataUrl;
+  // Synchronously capture any image File or Blob before any async tick can invalidate them:
+  let imageBlob: Blob | File | null = null;
+  for (const f of files) {
+    if (f.type.startsWith("image/")) {
+      imageBlob = f;
+      break;
     }
-  } else if (svgItem) {
-    const file = svgItem.getAsFile();
-    if (file) {
-      const prepared = await imageFileToPng(file);
-      nativeImageUrl = await blobToDataUrl(prepared);
-    }
-  } else if (/^<(?:\?xml[^>]*>\s*)?<svg[\s>]/i.test(syncText.trim())) {
-    const svgBlob = new Blob([syncText.trim()], { type: "image/svg+xml" });
-    nativeImageUrl = await blobToDataUrl(svgBlob);
-  } else if (rasterItem) {
-    const file = rasterItem.getAsFile();
-    if (file) {
-      const prepared = await imageFileToPng(file);
-      nativeImageUrl = await blobToDataUrl(prepared);
+  }
+  if (!imageBlob) {
+    for (const item of items) {
+      if (item.type && item.type.indexOf("image") !== -1) {
+        const f = item.getAsFile();
+        if (f) {
+          imageBlob = f;
+          break;
+        }
+      }
     }
   }
 
-  // 2. Pick the chemical structure string (`CDXML` / `MDLCT` / `SMILES`)
-  let chemText = chemDrawText ?? "";
+  const syncText = cleanClipboardText(text);
+
+  // Start this during the paste gesture, before any await. Resolved after the sync image sources.
+  const navReadPromise: Promise<ClipboardItem[]> =
+    typeof navigator !== "undefined" && navigator.clipboard?.read
+      ? navigator.clipboard.read().catch(() => [])
+      : Promise.resolve([]);
+
+  let nativeImageUrl = "";
+
+  // 2. If an image file was found directly on the browser clipboard event (e.g. ChemDraw image copy):
+  if (imageBlob) {
+    try {
+      if (imageBlob.type === "image/svg+xml") {
+        nativeImageUrl = await blobToDataUrl(imageBlob);
+      } else {
+        const prepared = await imageFileToPng(imageBlob).catch(() => imageBlob);
+        const rawUrl = await blobToDataUrl(prepared);
+        nativeImageUrl = await dataUrlToTrimmedPngDataUrl(rawUrl).catch(() => rawUrl);
+      }
+    } catch (err) {
+      console.warn("Failed reading imageBlob:", err);
+    }
+  }
+
+  // 3. If clipboard text contains raw SVG XML:
+  const svgSource = syncText.trim();
+  const looksLikeSvg =
+    svgSource.startsWith("<svg") ||
+    (svgSource.startsWith("<?xml") && /<svg[\s>]/i.test(svgSource));
+  if (!nativeImageUrl && looksLikeSvg) {
+    try {
+      const svgBlob = new Blob([syncText.trim()], { type: "image/svg+xml" });
+      nativeImageUrl = await blobToDataUrl(svgBlob);
+    } catch {}
+  }
+
+  // 4. If HTML contains an embedded data:image <img>:
+  if (!nativeImageUrl && html) {
+    const match = html.match(/<img[^>]+src=["'](data:image\/[^"']+)["']/i);
+    if (match) {
+      nativeImageUrl = match[1];
+    }
+  }
+
+  // 5. navigator.clipboard.read() — image/png first, then any other image/*.
+  //    Awaited before the Rust clipboard calls so the two never hold the clipboard together.
+  try {
+    const navItems = await navReadPromise;
+    if (!nativeImageUrl) {
+      for (const item of navItems) {
+        const imageType =
+          item.types.find((t) => t === "image/png") ||
+          item.types.find((t) => t.startsWith("image/"));
+        if (!imageType) continue;
+        const blob = await item.getType(imageType);
+        const rawUrl = await blobToDataUrl(blob);
+        nativeImageUrl = await dataUrlToTrimmedPngDataUrl(rawUrl).catch(() => rawUrl);
+        break;
+      }
+    }
+  } catch {
+    // Permission denied or no image items.
+  }
+
+  // 6. Tauri: clipboard PNG / BMP / EMF, and CDXML / MDLCT / Molfile bytes. The picture, when
+  //    present, is the one shown. Structure text is kept beside it and is never drawn over it.
+  let tauriChemDrawText: string | null = null;
+  if (isTauri() || (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window)) {
+    if (!nativeImageUrl) {
+      try {
+        const rustPngDataUrl = await readClipboardImageBase64();
+        if (rustPngDataUrl) {
+          nativeImageUrl = await dataUrlToTrimmedPngDataUrl(rustPngDataUrl).catch(() => rustPngDataUrl);
+        }
+      } catch (err) {
+        console.warn("readClipboardImageBase64 failed:", err);
+      }
+    }
+    try {
+      tauriChemDrawText = await readChemDrawClipboard();
+    } catch (err) {
+      console.warn("readChemDrawClipboard failed:", err);
+    }
+  }
+
+  // 7. Pick the chemical structure string (CDXML / Molfile / SMILES)
+  let chemText = tauriChemDrawText ?? "";
   if (!chemText && isValidChemicalText(syncText)) {
     chemText = syncText;
   }
@@ -484,39 +1014,42 @@ export async function extractDualStreamClipboard(event?: ClipboardEvent): Promis
     }
   }
 
-  // 3. When we have a native clipboard image, use it directly as the displayed structure
-  //    and use `chemText` strictly in a fail-safe background block to calculate MW via Indigo.
+  // 8. A clipboard picture is the drawing. Indigo may only attach CDXML / MW; it must not
+  //    replace colored cartoons (cyclodextrin ring fills, fonts) with a monochrome render.
   if (nativeImageUrl) {
     let mw: number | null = null;
     let cdxml = "";
     if (chemText) {
-      const prepared = prepareForKetcher(chemText);
-      const format = detectFormat(prepared);
-      if (format === "cdxml") {
-        cdxml = prepared;
-      } else {
-        cdxml = prepared;
-        try {
-          const service = await getStandaloneStructService();
-          const converted = await service.convert(
-            {
-              struct: prepared,
-              output_format: "chemical/x-cdxml" as never,
-            },
-            {},
-          );
-          if (converted?.struct) {
-            cdxml = converted.struct;
-          }
-        } catch (err) {
-          console.warn("Indigo CDXML conversion failed during paste, keeping raw structure:", err);
-        }
-      }
-
       try {
-        mw = await calculateMwWithIndigoFallback(prepared);
+        const prepared = prepareForKetcher(chemText);
+        const format = detectFormat(prepared);
+        cdxml = prepared;
+        if (format !== "cdxml") {
+          try {
+            const service = await getStandaloneStructService();
+            const converted = await service.convert(
+              {
+                struct: prepared,
+                output_format: "chemical/x-cdxml" as never,
+              },
+              {},
+            );
+            if (converted?.struct) {
+              cdxml = converted.struct;
+            }
+          } catch (err) {
+            console.warn("Indigo CDXML conversion failed during paste, keeping raw structure:", err);
+          }
+        }
+        try {
+          mw = await calculateMwWithIndigoFallback(prepared);
+        } catch (err) {
+          console.warn("Indigo MW calculation failed, skipping MW:", err);
+          mw = null;
+        }
       } catch (err) {
-        console.warn("Indigo MW calculation failed, skipping MW:", err);
+        console.warn("Indigo could not read this ChemDraw paste; keeping the clipboard image:", err);
+        cdxml = chemText;
         mw = null;
       }
     }
@@ -528,7 +1061,7 @@ export async function extractDualStreamClipboard(event?: ClipboardEvent): Promis
     };
   }
 
-  // 4. Text-only structure paste (e.g. copied SMILES or Molfile text without a clipboard bitmap)
+  // 9. Text-only structure paste (e.g. copied SMILES or Molfile text without a clipboard bitmap)
   if (chemText) {
     try {
       const rendered = await renderStructureToVectorSvg(chemText);
@@ -545,6 +1078,50 @@ export async function extractDualStreamClipboard(event?: ClipboardEvent): Promis
   }
 
   return null;
+}
+
+/** PNG payload for a structure image. An existing PNG is kept; SVG is rasterised. */
+async function structureImagePngBase64(dataUrl: string): Promise<string> {
+  if (/^data:image\/png;base64,/i.test(dataUrl)) {
+    return dataUrl.slice(dataUrl.indexOf(",") + 1);
+  }
+  const img = new Image();
+  img.src = dataUrl;
+  await img.decode();
+  const dims = extractSvgDimensions(dataUrl);
+  const width = Math.max(1, Math.round(img.naturalWidth || dims?.width || 600));
+  const height = Math.max(1, Math.round(img.naturalHeight || dims?.height || 400));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Canvas is not supported in this browser.");
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, width, height);
+  ctx.drawImage(img, 0, 0, width, height);
+  const pngUrl = canvas.toDataURL("image/png");
+  const comma = pngUrl.indexOf(",");
+  return comma >= 0 ? pngUrl.slice(comma + 1) : pngUrl;
+}
+
+/**
+ * Copy a structure out of a reactant or product box: `image/png` for Word and PowerPoint,
+ * plus CDXML / Molfile / SMILES so ChemDraw can paste the same drawing.
+ */
+export async function copyStructureOut(imageDataUrl: string, structureText: string): Promise<void> {
+  const pngBase64 = await structureImagePngBase64(imageDataUrl);
+  const text = structureText.trim();
+  if (isTauri()) {
+    await invoke("write_structure_clipboard", { pngBase64, text });
+    return;
+  }
+  const binary = atob(pngBase64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  const pngBlob = new Blob([bytes], { type: "image/png" });
+  const payload: Record<string, Blob> = { "image/png": pngBlob };
+  if (text) payload["text/plain"] = new Blob([text], { type: "text/plain" });
+  await navigator.clipboard.write([new ClipboardItem(payload)]);
 }
 
 /** Auto-append `°C` if the user typed a plain number (e.g. `80`, `-78`, `0`, or `-78 to 0`). */
@@ -586,9 +1163,6 @@ export default function MoleculeSection({
   onStructuredSchemeChange,
   reagents,
   onReagentsChange,
-  product,
-  onProductChange,
-  secondaryProducts = [],
   onOpenLibrary,
   reactantSmiles,
   productSmiles,
@@ -596,6 +1170,7 @@ export default function MoleculeSection({
   experimentCode,
   experimentTitle,
   onLoadReaction,
+  onActiveZoneChange,
   ref,
 }: Props) {
   const {
@@ -604,6 +1179,13 @@ export default function MoleculeSection({
     update: updateLibraryCompound,
   } = useLibrary();
   const [selectedZone, setSelectedZone] = useState<StructureZone>("reactant");
+  const selectedZoneRef = useRef(selectedZone);
+  selectedZoneRef.current = selectedZone;
+  const onActiveZoneChangeRef = useRef(onActiveZoneChange);
+  onActiveZoneChangeRef.current = onActiveZoneChange;
+  useEffect(() => {
+    onActiveZoneChangeRef.current?.(selectedZone);
+  }, [selectedZone]);
   const [reactantNotice, setReactantNotice] = useState<string | null>(null);
   const [reactantError, setReactantError] = useState<string | null>(null);
   const [productNotice, setProductNotice] = useState<string | null>(null);
@@ -616,17 +1198,17 @@ export default function MoleculeSection({
   const [saveReactionOpen, setSaveReactionOpen] = useState(false);
   const [loadReactionOpen, setLoadReactionOpen] = useState(false);
   const [reactionSavedFlash, setReactionSavedFlash] = useState(false);
+  const [scaleBusy, setScaleBusy] = useState(false);
+  const [schemeNotice, setSchemeNotice] = useState<string | null>(null);
 
   const schemeRef = useRef(structuredScheme);
   const onSchemeChangeRef = useRef(onStructuredSchemeChange);
   const onReagentsChangeRef = useRef(onReagentsChange);
-  const onProductChangeRef = useRef(onProductChange);
   const onZoneSmilesChangeRef = useRef(onZoneSmilesChange);
   useEffect(() => {
     schemeRef.current = structuredScheme;
     onSchemeChangeRef.current = onStructuredSchemeChange;
     onReagentsChangeRef.current = onReagentsChange;
-    onProductChangeRef.current = onProductChange;
     onZoneSmilesChangeRef.current = onZoneSmilesChange;
   });
 
@@ -655,17 +1237,51 @@ export default function MoleculeSection({
   }, [reactionSavedFlash]);
 
   const patchStructured = useCallback((patch: Partial<StructuredReactionScheme>) => {
-    const next: StructuredReactionScheme = { ...(schemeRef.current ?? {}), ...patch };
+    const prev = schemeRef.current ?? {};
+    const next: StructuredReactionScheme = { ...prev, ...patch };
+    const imageChanged =
+      (patch.reactantImage !== undefined && patch.reactantImage !== prev.reactantImage) ||
+      (patch.productImage !== undefined && patch.productImage !== prev.productImage);
+    if (
+      imageChanged &&
+      patch.reactantDisplayWidth === undefined &&
+      patch.productDisplayWidth === undefined
+    ) {
+      next.reactantDisplayWidth = undefined;
+      next.productDisplayWidth = undefined;
+    }
     const cleaned: StructuredReactionScheme = {};
     if (next.reactantImage) cleaned.reactantImage = next.reactantImage;
     if (next.reactantCdxml?.trim()) cleaned.reactantCdxml = next.reactantCdxml;
+    if (
+      typeof next.reactantDisplayWidth === "number" &&
+      Number.isFinite(next.reactantDisplayWidth) &&
+      next.reactantDisplayWidth > 0
+    ) {
+      cleaned.reactantDisplayWidth = Math.round(next.reactantDisplayWidth);
+    }
     if (next.productImage) cleaned.productImage = next.productImage;
     if (next.productCdxml?.trim()) cleaned.productCdxml = next.productCdxml;
+    if (
+      typeof next.productDisplayWidth === "number" &&
+      Number.isFinite(next.productDisplayWidth) &&
+      next.productDisplayWidth > 0
+    ) {
+      cleaned.productDisplayWidth = Math.round(next.productDisplayWidth);
+    }
     if (next.solvent?.trim()) cleaned.solvent = next.solvent;
     if (next.temperature?.trim()) cleaned.temperature = next.temperature;
     if (next.duration?.trim()) cleaned.duration = next.duration;
     if (next.atmosphere?.trim()) cleaned.atmosphere = next.atmosphere;
     if (next.extraArrowNotes?.trim()) cleaned.extraArrowNotes = next.extraArrowNotes;
+    if (next.productLabel?.trim()) cleaned.productLabel = next.productLabel.trim();
+    if (
+      typeof next.productMw === "number" &&
+      Number.isFinite(next.productMw) &&
+      next.productMw > 0
+    ) {
+      cleaned.productMw = next.productMw;
+    }
     const result = Object.keys(cleaned).length > 0 ? cleaned : undefined;
     schemeRef.current = result;
     onSchemeChangeRef.current(result);
@@ -673,8 +1289,8 @@ export default function MoleculeSection({
 
   /**
    * Apply a molecular weight (and optional name / density) calculated from a structure
-   * or picked from the Personal Library into either the Limiting Reagent row (`reactant`)
-   * or the Primary Product (`product`).
+   * or picked from the Personal Library. The reactant zone writes the limiting reagent.
+   * The product zone writes the reaction-scheme target only, never an isolated fraction.
    */
   const syncZoneMetadata = useCallback(
     (
@@ -710,19 +1326,19 @@ export default function MoleculeSection({
           return next;
         });
       } else {
-        const patch: Partial<ProductInfo> = {};
+        const patch: Partial<StructuredReactionScheme> = {};
         if (meta.name !== undefined && meta.name.trim() !== "") {
-          patch.name = meta.name.trim();
+          patch.productLabel = meta.name.trim();
         }
         if (meta.mw !== undefined && meta.mw !== null && meta.mw > 0) {
-          patch.mw = meta.mw;
+          patch.productMw = meta.mw;
         }
         if (Object.keys(patch).length > 0) {
-          onProductChangeRef.current?.(patch);
+          patchStructured(patch);
         }
       }
     },
-    [],
+    [patchStructured],
   );
 
   // ChemDraw round-trip hooks for Reactant (`reactant.cdxml`) and Product (`product.cdxml`)
@@ -774,22 +1390,27 @@ export default function MoleculeSection({
   const loadProductCdxml = useCallback(
     async (incomingCdxml: string) => {
       if (!hasCdxmlContent(incomingCdxml)) {
-        patchStructured({ productImage: undefined, productCdxml: undefined });
+        patchStructured({
+          productImage: undefined,
+          productCdxml: undefined,
+          productMw: undefined,
+        });
         return;
       }
       try {
         const { svgDataUrl, cdxml: normalizedCdxml, mw } =
           await renderStructureToVectorSvg(incomingCdxml);
-        patchStructured({ productImage: svgDataUrl, productCdxml: normalizedCdxml });
-        if (mw !== null && mw > 0) {
-          syncZoneMetadata("product", { mw });
-        }
+        patchStructured({
+          productImage: svgDataUrl,
+          productCdxml: normalizedCdxml,
+          productMw: mw !== null && mw > 0 ? mw : undefined,
+        });
       } catch (err) {
         console.warn("Indigo product CDXML render failed, keeping raw CDXML:", err);
         patchStructured({ productCdxml: incomingCdxml });
       }
     },
-    [patchStructured, syncZoneMetadata],
+    [patchStructured],
   );
 
   const reactantChemDraw = useChemDrawLink({
@@ -834,7 +1455,7 @@ export default function MoleculeSection({
    * - Stops any active ChemDraw watcher on that zone,
    * - Clears its image and CDXML,
    * - Clears the Limiting Reagent's `name`, `mw`, and `density` (for `reactant`)
-   *   or the Primary Product's `mw` (for `product`).
+   *   or the scheme target's molecular weight (for `product`). Isolated fractions are not touched.
    */
   const clearZone = useCallback(
     (zone: StructureZone) => {
@@ -854,8 +1475,11 @@ export default function MoleculeSection({
       } else {
         setProductError(null);
         setProductNotice(null);
-        patchStructured({ productImage: undefined, productCdxml: undefined });
-        onProductChangeRef.current?.({ mw: null });
+        patchStructured({
+          productImage: undefined,
+          productCdxml: undefined,
+          productMw: undefined,
+        });
       }
     },
     [patchStructured, stopZoneWatcher],
@@ -873,12 +1497,37 @@ export default function MoleculeSection({
       compound: LibraryCompound,
       targetZone: StructureZone,
       applyName = false,
+      append = false,
     ): Promise<string | null> => {
       try {
         stopZoneWatcher(targetZone);
         let svgDataUrl = compound.imageDataUrl ?? "";
         let cdxml = (compound.cdxml || compound.structure || "").trim();
         let computedMw: number | null = compound.mw ?? null;
+        const existingCdxml =
+          targetZone === "reactant" ? (schemeRef.current?.reactantCdxml ?? "").trim() : "";
+        const shouldAppend = append && targetZone === "reactant" && existingCdxml.length > 0;
+
+        // A second reactant is placed beside the drawing already in the box.
+        // The product box is replaced, so a library scaffold can be the editing template.
+        if (shouldAppend) {
+          const incoming = cdxml || (compound.structure ?? "").trim();
+          if (!incoming) {
+            return `The reactant box already has a structure. "${compound.name}" has no coordinates to add beside it, so the existing drawing was kept.`;
+          }
+          try {
+            const merged = await mergeStructuresBeside(existingCdxml, incoming);
+            const rendered = await renderStructureToVectorSvg(merged);
+            patchStructured({
+              reactantImage: rendered.svgDataUrl,
+              reactantCdxml: rendered.cdxml,
+            });
+            return null;
+          } catch (err) {
+            console.warn("Could not append a library structure beside the reactant:", err);
+            return `The reactant box already has a structure, and "${compound.name}" could not be added beside it. The existing drawing was kept.`;
+          }
+        }
 
         // If `compound.imageDataUrl` already exists, do NOT call Indigo to re-render the SVG
         // (avoids Indigo crashing on 3D perspective structures such as cyclodextrins).
@@ -937,21 +1586,23 @@ export default function MoleculeSection({
     [experimentId, patchStructured, stopZoneWatcher, syncZoneMetadata],
   );
 
-  useImperativeHandle(
-    ref,
-    () => ({
-      async insertCompound(compound, preferredZone) {
-        const targetZone: StructureZone = preferredZone ?? selectedZone;
-        setSelectedZone(targetZone);
-        return loadLibraryCompoundIntoZone(
-          compound,
-          targetZone,
-          targetZone === "reactant",
-        );
-      },
-    }),
-    [selectedZone, loadLibraryCompoundIntoZone],
+  const insertCompound = useCallback(
+    async (compound: LibraryCompound, preferredZone?: StructureZone) => {
+      const targetZone = preferredZone ?? selectedZoneRef.current;
+      setSelectedZone(targetZone);
+      // Reactant gains the molecule beside anything already drawn. Product is replaced
+      // and its saved picture is shown immediately, without waiting on a Ketcher canvas.
+      return loadLibraryCompoundIntoZone(
+        compound,
+        targetZone,
+        false,
+        targetZone === "reactant",
+      );
+    },
+    [loadLibraryCompoundIntoZone],
   );
+
+  useImperativeHandle(ref, () => ({ insertCompound }), [insertCompound]);
 
   // Limiting reagent info for Left Zone caption
   const limitingRow = useMemo(
@@ -968,26 +1619,109 @@ export default function MoleculeSection({
     [reagents],
   );
 
-  // Primary product resolved name & MW for Right Zone caption
-  const primaryProductName = useMemo(() => {
-    const idPrefix = experimentId.trim();
-    const fallback =
-      secondaryProducts.length > 0
-        ? idPrefix
-          ? `${idPrefix}-F1`
-          : "F1"
-        : idPrefix || "Product";
-    const rawName = product.name.trim();
-    if (
-      rawName === "" ||
-      (secondaryProducts.length > 0 &&
-        idPrefix !== "" &&
-        rawName.toUpperCase() === idPrefix.toUpperCase())
-    ) {
-      return fallback;
+  // Scheme-target caption. Empty until the chemist names the drawn product.
+  const schemeProductLabel = structuredScheme?.productLabel?.trim() ?? "";
+  const primaryProductName = schemeProductLabel || experimentId.trim() || "Target";
+  const schemeProductMw =
+    typeof structuredScheme?.productMw === "number" && structuredScheme.productMw > 0
+      ? structuredScheme.productMw
+      : null;
+
+  const scaleMatched = Boolean(
+    structuredScheme?.reactantDisplayWidth && structuredScheme?.productDisplayWidth,
+  );
+  const bothStructures = Boolean(
+    structuredScheme?.reactantImage && structuredScheme?.productImage,
+  );
+
+  async function handleMatchScale() {
+    if (scaleMatched) {
+      patchStructured({
+        reactantDisplayWidth: undefined,
+        productDisplayWidth: undefined,
+      });
+      setSchemeNotice(null);
+      return;
     }
-    return rawName;
-  }, [experimentId, product.name, secondaryProducts.length]);
+    if (!structuredScheme?.reactantImage || !structuredScheme?.productImage) return;
+    setScaleBusy(true);
+    setSchemeNotice(null);
+    try {
+      const reactantSpan = await measureCoordinateSpan(
+        structuredScheme.reactantCdxml || shownReactantSmiles,
+      );
+      const productSpan = await measureCoordinateSpan(
+        structuredScheme.productCdxml || shownProductSmiles,
+      );
+      const sizes = scaleSizesForMatch(
+        reactantSpan,
+        productSpan,
+        limitingRow?.mw,
+        schemeProductMw,
+      );
+      if (!sizes) {
+        setSchemeNotice(
+          "Could not match scale. A drawing without coordinates needs a molecular weight on both sides.",
+        );
+        return;
+      }
+      patchStructured(matchedDisplayWidths(sizes.reactant, sizes.product));
+    } catch (err) {
+      console.warn("Match Molecule Scale failed:", err);
+      setSchemeNotice("Could not match scale.");
+    } finally {
+      setScaleBusy(false);
+    }
+  }
+
+  function handleResetScale() {
+    patchStructured({
+      reactantDisplayWidth: undefined,
+      productDisplayWidth: undefined,
+    });
+    setSchemeNotice(null);
+  }
+
+  async function handleDownloadScheme() {
+    const above = arrowReagents
+      .map((r, idx) => {
+        const eqLabel = r.eq !== null && r.eq > 0 ? ` (${formatNumber(r.eq)} eq)` : "";
+        const catLabel = r.role === "Catalyst" ? ", cat." : "";
+        const prefix = arrowReagents.length > 1 ? `${idx + 1}. ` : "";
+        return `${prefix}${r.name}${eqLabel}${catLabel}`;
+      })
+      .join(", ");
+    const atmosphere = structuredScheme?.atmosphere?.trim() ?? "";
+    const below = [
+      structuredScheme?.solvent?.trim(),
+      structuredScheme?.temperature?.trim(),
+      structuredScheme?.duration?.trim(),
+      atmosphere
+        ? /^under\s+/i.test(atmosphere)
+          ? atmosphere
+          : `under ${atmosphere}`
+        : "",
+      structuredScheme?.extraArrowNotes?.trim(),
+    ]
+      .filter((part): part is string => Boolean(part))
+      .join(", ");
+    const svg = buildReactionSchemeSvg({
+      reactantImage: structuredScheme?.reactantImage,
+      reactantLabel: limitingRow?.name.trim() || "Reactant",
+      productImage: structuredScheme?.productImage,
+      productLabel: primaryProductName,
+      above,
+      below,
+      reactantDisplayWidth: structuredScheme?.reactantDisplayWidth,
+      productDisplayWidth: structuredScheme?.productDisplayWidth,
+    });
+    const filename = `${experimentCode || experimentId || "reaction"}-scheme.svg`;
+    try {
+      await downloadReactionSchemeSvg(filename, svg);
+    } catch (err) {
+      setSchemeNotice(err instanceof Error ? err.message : "Could not download the scheme SVG.");
+    }
+  }
 
   const hasStructuredVisualContent = Boolean(
     structuredScheme?.reactantImage ||
@@ -1018,8 +1752,8 @@ export default function MoleculeSection({
         reactantImage: structuredScheme?.reactantImage,
         reactantCdxml: structuredScheme?.reactantCdxml,
         reactantSmiles: shownReactantSmiles,
-        productName: product.name,
-        productMw: product.mw,
+        productName: schemeProductLabel,
+        productMw: schemeProductMw,
         productImage: structuredScheme?.productImage,
         productCdxml: structuredScheme?.productCdxml,
         productSmiles: shownProductSmiles,
@@ -1035,9 +1769,9 @@ export default function MoleculeSection({
       library,
       limitingRow?.mw,
       limitingRow?.name,
-      product.mw,
-      product.name,
       reagents,
+      schemeProductLabel,
+      schemeProductMw,
       shownProductSmiles,
       shownReactantSmiles,
       structuredScheme,
@@ -1129,6 +1863,35 @@ export default function MoleculeSection({
             </button>
           )}
 
+          {bothStructures && (
+            <button
+              type="button"
+              onClick={() => void handleMatchScale()}
+              disabled={scaleBusy}
+              className="rounded-md border border-zinc-300 bg-white px-2.5 py-1 text-xs font-semibold text-zinc-800 shadow-2xs transition-colors hover:bg-zinc-50 disabled:opacity-60"
+              title="Scale the smaller structure so its bonds match the larger one. Click again to reset."
+            >
+              {scaleBusy ? "Matching scale…" : "⚖️ Match Molecule Scale"}
+            </button>
+          )}
+          {scaleMatched && (
+            <button
+              type="button"
+              onClick={handleResetScale}
+              className="rounded-md px-2 py-1 text-xs font-medium text-zinc-500 underline-offset-2 hover:underline"
+              title="Restore both structures to their natural size"
+            >
+              Reset Scale
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => void handleDownloadScheme()}
+            className="rounded-md border border-zinc-300 bg-white px-2.5 py-1 text-xs font-semibold text-zinc-800 shadow-2xs transition-colors hover:bg-zinc-50"
+            title="Download this reaction scheme as an SVG file"
+          >
+            Download Scheme SVG
+          </button>
           <button
             type="button"
             onClick={() => {
@@ -1153,9 +1916,12 @@ export default function MoleculeSection({
           </button>
         </div>
       </div>
+      {schemeNotice && (
+        <p className="mb-2 text-xs text-amber-700 print:hidden">{schemeNotice}</p>
+      )}
 
       {/* 3-Zone Structured Reaction Scheme: [Reactant Zone] -> [Arrow + Conditions] -> [Product Zone] */}
-      <div className="grid grid-cols-1 items-center gap-3 md:grid-cols-[1fr_minmax(220px,1.1fr)_1fr] print:grid-cols-[1fr_minmax(175px,1.05fr)_1fr] print:gap-2">
+      <div className="grid grid-cols-1 items-stretch gap-3 md:grid-cols-[1fr_minmax(220px,1.1fr)_1fr] print:grid-cols-[1fr_minmax(175px,1.05fr)_1fr] print:items-start print:gap-2">
         {/* LEFT ZONE: Limiting Reagent / Starting Material */}
         <StructureZoneCard
           experimentId={experimentId}
@@ -1164,7 +1930,9 @@ export default function MoleculeSection({
           active={selectedZone === "reactant"}
           onActivate={() => setSelectedZone("reactant")}
           imageDataUrl={structuredScheme?.reactantImage}
+          displayWidth={structuredScheme?.reactantDisplayWidth}
           cdxml={structuredScheme?.reactantCdxml}
+          smiles={shownReactantSmiles}
           chemDrawWatching={reactantChemDraw.watching}
           chemDrawJustUpdated={reactantChemDraw.justUpdated}
           chemDrawBusy={reactantChemDraw.busy}
@@ -1195,6 +1963,7 @@ export default function MoleculeSection({
           onAddToLibrary={addLibraryCompound}
           onUpdateInLibrary={updateLibraryCompound}
           onManageLibrary={onOpenLibrary}
+          onSmiles={(smiles) => onZoneSmilesChangeRef.current?.(smiles, shownProductSmiles || null)}
         />
 
         {/* CENTER ZONE: Above-Arrow Reagents, Vector Arrow, Below-Arrow Conditions */}
@@ -1215,7 +1984,9 @@ export default function MoleculeSection({
           active={selectedZone === "product"}
           onActivate={() => setSelectedZone("product")}
           imageDataUrl={structuredScheme?.productImage}
+          displayWidth={structuredScheme?.productDisplayWidth}
           cdxml={structuredScheme?.productCdxml}
+          smiles={shownProductSmiles}
           chemDrawWatching={productChemDraw.watching}
           chemDrawJustUpdated={productChemDraw.justUpdated}
           chemDrawBusy={productChemDraw.busy}
@@ -1235,10 +2006,12 @@ export default function MoleculeSection({
           }}
           onClear={() => clearZone("product")}
           captionName={primaryProductName}
-          captionNamePlaceholder={false}
-          captionMw={product.mw}
+          captionNamePlaceholder={!schemeProductLabel}
+          captionEditable
+          onCaptionChange={(value) => patchStructured({ productLabel: value })}
+          captionMw={schemeProductMw}
           captionDensity={null}
-          defaultLibraryName={primaryProductName}
+          defaultLibraryName={schemeProductLabel || "Target"}
           library={library ?? []}
           onPickFromLibrary={(compound) =>
             loadLibraryCompoundIntoZone(compound, "product", true)
@@ -1246,6 +2019,7 @@ export default function MoleculeSection({
           onAddToLibrary={addLibraryCompound}
           onUpdateInLibrary={updateLibraryCompound}
           onManageLibrary={onOpenLibrary}
+          onSmiles={(smiles) => onZoneSmilesChangeRef.current?.(shownReactantSmiles || null, smiles)}
         />
       </div>
 
@@ -1276,7 +2050,11 @@ interface StructureZoneCardProps {
   active: boolean;
   onActivate: () => void;
   imageDataUrl?: string;
+  /** Manual match-scale width in px. Omitted drawings use the box's natural fit. */
+  displayWidth?: number;
   cdxml?: string;
+  /** SMILES used when copying out, if the zone has no CDXML / Molfile. */
+  smiles?: string;
   chemDrawWatching: boolean;
   chemDrawJustUpdated: boolean;
   chemDrawBusy: "open" | "reload" | null;
@@ -1292,6 +2070,9 @@ interface StructureZoneCardProps {
   onClear: () => void;
   captionName: string;
   captionNamePlaceholder?: boolean;
+  /** When set, the caption is an editable scheme-target name and does not write a fraction. */
+  captionEditable?: boolean;
+  onCaptionChange?: (name: string) => void;
   captionMw: number | null;
   captionDensity: number | null;
   defaultLibraryName: string;
@@ -1305,6 +2086,7 @@ interface StructureZoneCardProps {
     input: CompoundInput & { clearStructure?: boolean },
   ) => { ok: true; compound: LibraryCompound } | { ok: false; error: string };
   onManageLibrary: () => void;
+  onSmiles?: (smiles: string) => void;
 }
 
 function StructureZoneCard({
@@ -1314,7 +2096,9 @@ function StructureZoneCard({
   active,
   onActivate,
   imageDataUrl,
+  displayWidth,
   cdxml,
+  smiles,
   chemDrawWatching,
   chemDrawJustUpdated,
   chemDrawBusy,
@@ -1326,6 +2110,8 @@ function StructureZoneCard({
   onClear,
   captionName,
   captionNamePlaceholder = false,
+  captionEditable = false,
+  onCaptionChange,
   captionMw,
   captionDensity,
   defaultLibraryName,
@@ -1334,6 +2120,7 @@ function StructureZoneCard({
   onAddToLibrary,
   onUpdateInLibrary,
   onManageLibrary,
+  onSmiles,
 }: StructureZoneCardProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const boxRef = useRef<HTMLDivElement>(null);
@@ -1352,6 +2139,52 @@ function StructureZoneCard({
   const [saveName, setSaveName] = useState("");
   const [saveMwText, setSaveMwText] = useState("");
   const [saveDensityText, setSaveDensityText] = useState("");
+  const [autoDrawOpen, setAutoDrawOpen] = useState(false);
+  const [autoDrawQuery, setAutoDrawQuery] = useState("");
+  const [copiedFlash, setCopiedFlash] = useState(false);
+
+  const imageRef = useRef(imageDataUrl);
+  const cdxmlRef = useRef(cdxml);
+  const smilesRef = useRef(smiles);
+  const onSmilesRef = useRef(onSmiles);
+  const copyOutRef = useRef<() => Promise<void>>(async () => {});
+  const cancelKeyPasteRef = useRef<() => void>(() => {});
+
+  async function copyOut() {
+    const image = imageRef.current;
+    if (!image) return;
+    const text = (cdxmlRef.current || smilesRef.current || "").trim();
+    try {
+      await copyStructureOut(image, text);
+      setCopiedFlash(true);
+      window.setTimeout(() => setCopiedFlash(false), 1200);
+    } catch (err) {
+      setError(`Could not copy structure: ${messageOf(err)}`);
+    }
+  }
+
+  async function handleAutoDraw() {
+    const query = autoDrawQuery.trim();
+    if (!query) return;
+    onActivate();
+    setBusy(true);
+    setError(null);
+    try {
+      const drawn = await drawFromNameOrSmiles(query);
+      if (!drawn) {
+        setError(`PubChem has no structure for "${query}".`);
+        return;
+      }
+      onUpdate(drawn.imageDataUrl, drawn.structureText, drawn.mw);
+      onSmiles?.(drawn.smiles);
+      setAutoDrawOpen(false);
+      setAutoDrawQuery("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not draw that structure.");
+    } finally {
+      setBusy(false);
+    }
+  }
 
   const error = localError ?? externalError;
   const setError = useCallback(
@@ -1367,6 +2200,11 @@ function StructureZoneCard({
   useEffect(() => {
     onUpdateRef.current = onUpdate;
     onStopWatchingRef.current = onStopWatching;
+    imageRef.current = imageDataUrl;
+    cdxmlRef.current = cdxml;
+    smilesRef.current = smiles;
+    onSmilesRef.current = onSmiles;
+    copyOutRef.current = copyOut;
   });
 
   // Close library picker on outside click / Escape
@@ -1445,52 +2283,236 @@ function StructureZoneCard({
     }
   }
 
-  /**
-   * Handle Ctrl+V paste into this selected zone using the Dual-Stream Paste Handler:
-   * - When BOTH a clipboard image (`image/png`, `image/svg+xml`, or ChemDraw's `CF_ENHMETAFILE` / `CF_DIB`)
-   *   AND `CDXML` / `Molfile` / `SMILES` are present, uses the native clipboard image (trimmed at full
-   *   lossless resolution) as `reactantImage` / `productImage` while saving `CDXML` to disk and
-   *   auto-calculating `MW` in the background!
-   * - When only `CDXML` / `Molfile` / `SMILES` is present, renders directly via `renderStructureToVectorSvg`.
-   * - When only an image is present, uses the trimmed lossless image.
-   */
-  const handlePasteContent = useCallback(
-    async (event?: ClipboardEvent) => {
-      onStopWatchingRef.current();
-      setBusy(true);
-      setError(null);
-      try {
-        const extracted = await extractDualStreamClipboard(event);
-        if (extracted) {
-          onUpdateRef.current(
-            extracted.imageDataUrl,
-            extracted.cdxml || undefined,
-            extracted.mw,
-          );
-          if (isTauri() && extracted.cdxml && /<CDXML[\s>]/i.test(extracted.cdxml)) {
-            await saveSchemeCdxml(experimentId, extracted.cdxml, zone).catch(() => {});
-          }
-          return;
-        }
+  /** Store raw CDXML text and draw it. The clipboard image path never calls this. */
+  async function applyPastedCdxml(textData: string) {
+    onStopWatchingRef.current();
+    setError(null);
+    const rendered = await renderStructureToVectorSvg(textData);
+    const nextCdxml = rendered.cdxml || textData;
+    onUpdateRef.current(rendered.svgDataUrl, nextCdxml, rendered.mw);
+    if (isTauri() && /<CDXML[\s>]/i.test(nextCdxml)) {
+      await saveSchemeCdxml(experimentId, nextCdxml, zone).catch(() => {});
+    }
+  }
 
-        setError(
-          "Clipboard does not contain a structure or image. Copy a structure in ChemDraw (Ctrl+C) and press Ctrl+V.",
-        );
-      } catch (err) {
-        setError(`Could not paste into ${title}: ${messageOf(err)}`);
-      } finally {
-        setBusy(false);
+  /** SMILES or chemical name when the clipboard has no picture and no CDXML. */
+  async function applyPastedSmilesOrName(text: string) {
+    onStopWatchingRef.current();
+    setError(null);
+    onSmilesRef.current?.(text);
+    const drawn = await drawFromNameOrSmiles(text);
+    if (drawn) {
+      onUpdateRef.current(drawn.imageDataUrl, drawn.structureText, drawn.mw);
+      onSmilesRef.current?.(drawn.smiles);
+      return;
+    }
+    const rendered = await renderStructureToVectorSvg(text);
+    onUpdateRef.current(rendered.svgDataUrl, rendered.cdxml, rendered.mw);
+  }
+
+  /**
+   * Desktop fallback for ChemDraw copies whose cartoon is an EMF / DIB and never
+   * appears as an `image/*` item on the browser paste event.
+   */
+  async function pasteFromNativeClipboard(
+    event?: ClipboardEvent | ReactClipboardEvent<HTMLDivElement>,
+  ) {
+    onStopWatchingRef.current();
+    setBusy(true);
+    setError(null);
+    try {
+      const nativeEvent =
+        event && typeof ClipboardEvent !== "undefined" && event instanceof ClipboardEvent
+          ? event
+          : event && "nativeEvent" in event && event.nativeEvent instanceof ClipboardEvent
+            ? event.nativeEvent
+            : undefined;
+      const clipboardSources: DataTransfer[] = [];
+      if (event?.clipboardData) clipboardSources.push(event.clipboardData);
+      if (nativeEvent?.clipboardData && nativeEvent.clipboardData !== event?.clipboardData) {
+        clipboardSources.push(nativeEvent.clipboardData);
       }
-    },
-    [experimentId, setError, title, zone],
-  );
+
+      // Grab image blobs synchronously. DataTransferItem.getAsFile() is invalid after the first await.
+      let imageBlob: Blob | null = null;
+      for (const clipboardData of clipboardSources) {
+        const files = Array.from(clipboardData.files || []);
+        const items = Array.from(clipboardData.items || []);
+        for (const file of files) {
+          if (file.type && file.type.startsWith("image/")) {
+            imageBlob = file;
+            break;
+          }
+        }
+        if (!imageBlob) {
+          for (const item of items) {
+            if (item.type && item.type.indexOf("image") !== -1) {
+              const blob = item.getAsFile();
+              if (blob) {
+                imageBlob = blob;
+                break;
+              }
+            }
+          }
+        }
+        if (imageBlob) break;
+      }
+
+      let extracted: { imageDataUrl: string; cdxml: string; mw: number | null } | null = null;
+      try {
+        const dual = await extractDualStreamClipboard(nativeEvent);
+        if (dual) {
+          extracted = { imageDataUrl: dual.imageDataUrl, cdxml: dual.cdxml, mw: dual.mw };
+        }
+      } catch (err) {
+        console.warn("extractDualStreamClipboard failed:", err);
+      }
+
+      // A bitmap on the paste event is the cartoon. Keep any CDXML or MW the parser found,
+      // but never replace this picture with a redrawn structure.
+      if (imageBlob) {
+        const cartoon = imageBlob;
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = (e) => resolve((e.target?.result as string) || "");
+          reader.onerror = reject;
+          reader.readAsDataURL(cartoon);
+        });
+        if (dataUrl) {
+          extracted = {
+            imageDataUrl: dataUrl,
+            cdxml: extracted?.cdxml ?? "",
+            mw: extracted?.mw ?? null,
+          };
+        }
+      }
+
+      if (!extracted) {
+        throw new Error("Clipboard does not contain a structure or image.");
+      }
+
+      onUpdateRef.current(extracted.imageDataUrl, extracted.cdxml || undefined, extracted.mw);
+      if (isTauri() && extracted.cdxml && /<CDXML[\s>]/i.test(extracted.cdxml)) {
+        await saveSchemeCdxml(experimentId, extracted.cdxml, zone).catch(() => {});
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /**
+   * Image-first paste on the reactant / product structure box.
+   * A ChemDraw cartoon is stored as the raw clipboard data URL and returned
+   * before any structure parser can replace it or raise an error.
+   */
+  const handlePaste = async (event?: ClipboardEvent | ReactClipboardEvent<HTMLDivElement>) => {
+    if (event && (isTextField(event.target) || document.querySelector("dialog[open]"))) {
+      return;
+    }
+    if (event) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+    cancelKeyPasteRef.current();
+    onActivate();
+
+    try {
+      const clipboardData = event?.clipboardData;
+      if (!clipboardData) {
+        await pasteFromNativeClipboard(event);
+        return;
+      }
+
+      const items = Array.from(clipboardData.items || []);
+      const files = Array.from(clipboardData.files || []);
+
+      let imageBlob: Blob | null = null;
+
+      for (const file of files) {
+        if (file.type && file.type.startsWith("image/")) {
+          imageBlob = file;
+          break;
+        }
+      }
+
+      if (!imageBlob) {
+        for (const item of items) {
+          if (item.type && item.type.indexOf("image") !== -1) {
+            const blob = item.getAsFile();
+            if (blob) {
+              imageBlob = blob;
+              break;
+            }
+          }
+        }
+      }
+
+      if (imageBlob) {
+        const reader = new FileReader();
+        reader.onload = (loadEvent) => {
+          const dataUrl = loadEvent.target?.result;
+          if (typeof dataUrl === "string" && dataUrl) {
+            onStopWatchingRef.current();
+            setError(null);
+            onUpdateRef.current(dataUrl);
+          }
+        };
+        reader.onerror = () => {
+          console.error("Paste error:", reader.error);
+          alert(
+            "Could not paste structure. Make sure you copied an image or structure from ChemDraw.",
+          );
+        };
+        reader.readAsDataURL(imageBlob);
+        return;
+      }
+
+      const textData = clipboardData.getData("text/plain") || "";
+      const htmlData = clipboardData.getData("text/html") || "";
+      const embeddedImage = htmlData.match(/src=["'](data:image\/[^"']+)["']/i)?.[1];
+      if (embeddedImage) {
+        onStopWatchingRef.current();
+        setError(null);
+        onUpdateRef.current(embeddedImage);
+        return;
+      }
+
+      const trimmedText = textData.trim();
+      try {
+        await pasteFromNativeClipboard(event);
+        return;
+      } catch (nativeErr) {
+        console.warn("Native clipboard paste failed:", nativeErr);
+      }
+
+      if (
+        trimmedText.toLowerCase().startsWith("<cdxml") ||
+        trimmedText.startsWith("<?xml")
+      ) {
+        await applyPastedCdxml(textData);
+        return;
+      }
+
+      if (trimmedText) {
+        await applyPastedSmilesOrName(trimmedText);
+        return;
+      }
+
+      throw new Error("Clipboard does not contain a structure or image.");
+    } catch (err) {
+      console.error("Paste error:", err);
+      alert(
+        "Could not paste structure. Make sure you copied an image or structure from ChemDraw.",
+      );
+    }
+  };
 
   const handleFilesRef = useRef(handleFiles);
-  const handlePasteRef = useRef(handlePasteContent);
+  const handlePasteRef = useRef(handlePaste);
   const activeRef = useRef(active);
   useEffect(() => {
     handleFilesRef.current = handleFiles;
-    handlePasteRef.current = handlePasteContent;
+    handlePasteRef.current = handlePaste;
     activeRef.current = active;
   });
 
@@ -1503,20 +2525,29 @@ function StructureZoneCard({
     };
 
     const onPaste = (event: ClipboardEvent) => {
-      if (!activeRef.current || event.defaultPrevented) return;
+      if (!activeRef.current) return;
       if (isTextField(event.target) || document.querySelector("dialog[open]")) return;
       cancelKeyPaste();
-      event.preventDefault();
-      event.stopPropagation();
+      if (event.defaultPrevented || boxRef.current?.contains(event.target as Node)) return;
       void handlePasteRef.current(event);
     };
 
+    cancelKeyPasteRef.current = cancelKeyPaste;
+
     const onKeyDown = (event: KeyboardEvent) => {
       if (!activeRef.current || event.defaultPrevented) return;
-      if (!(event.ctrlKey || event.metaKey) || event.altKey || event.key.toLowerCase() !== "v") {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
+      const key = event.key.toLowerCase();
+      if (isTextField(event.target) || document.querySelector("dialog[open]")) return;
+      if (key === "c") {
+        const selected = window.getSelection?.()?.toString() ?? "";
+        if (selected.trim() || !imageRef.current) return;
+        event.preventDefault();
+        event.stopPropagation();
+        void copyOutRef.current();
         return;
       }
-      if (isTextField(event.target) || document.querySelector("dialog[open]")) return;
+      if (key !== "v") return;
       cancelKeyPaste();
       keyPasteTimer = setTimeout(() => {
         keyPasteTimer = null;
@@ -1528,6 +2559,7 @@ function StructureZoneCard({
     document.addEventListener("keydown", onKeyDown);
     return () => {
       cancelKeyPaste();
+      cancelKeyPasteRef.current = () => {};
       document.removeEventListener("paste", onPaste);
       document.removeEventListener("keydown", onKeyDown);
     };
@@ -1557,6 +2589,7 @@ function StructureZoneCard({
   const canSaveToLibrary = Boolean(
     imageDataUrl ||
       cdxml?.trim() ||
+      smiles?.trim() ||
       (!captionNamePlaceholder && captionName.trim() !== "" && captionMw !== null && captionMw > 0),
   );
 
@@ -1585,6 +2618,7 @@ function StructureZoneCard({
   function buildCompoundInput(targetName: string): {
     ok: true;
     input: CompoundInput;
+    source: string;
   } | {
     ok: false;
     error: string;
@@ -1601,55 +2635,76 @@ function StructureZoneCard({
     ) {
       return { ok: false, error: "Density must be a positive number." };
     }
+    const raw = (cdxml ?? "").trim();
+    const knownSmiles = smiles?.trim() || (raw && detectFormat(raw) === "smiles" ? raw : "");
+    const realCdxml = raw && /<CDXML[\s>]/i.test(raw) ? raw : undefined;
+    const molfile = raw && detectFormat(raw) === "mol" ? raw : "";
+    const structure = realCdxml || molfile || knownSmiles || undefined;
+    const image =
+      imageDataUrl && imageDataUrl.trim().startsWith("data:image/") ? imageDataUrl.trim() : undefined;
+    if (!structure && !image && parsedMw === undefined) {
+      return { ok: false, error: "Draw a structure or enter a molecular weight before saving." };
+    }
     return {
       ok: true,
+      source: realCdxml || molfile || raw,
       input: {
         name: targetName.trim(),
         mw: parsedMw,
         density: parsedDensity,
-        cdxml: cdxml?.trim() || undefined,
-        structure: cdxml?.trim() || undefined,
-        imageDataUrl,
+        cdxml: realCdxml,
+        structure,
+        imageDataUrl: image,
+        smiles: knownSmiles || null,
       },
     };
   }
 
-  async function handleSaveAsNewCompound(targetName: string) {
+  function finishLibrarySave(
+    compoundId: string,
+    compoundName: string,
+    source: string,
+    storedSmiles?: string,
+  ) {
+    setSavePromptOpen(false);
+    setSavedFlash(true);
+    setTimeout(() => setSavedFlash(false), 3000);
+    const raw = source.trim();
+    if (storedSmiles?.trim() || !raw || detectFormat(raw) === "smiles") return;
+    void extractCanonicalSmilesFailSafe(raw).then((next) => {
+      if (!next) return;
+      onUpdateInLibrary(compoundId, { name: compoundName, smiles: next });
+    });
+  }
+
+  function handleSaveAsNewCompound(targetName: string) {
     setError(null);
     const built = buildCompoundInput(targetName);
     if (!built.ok) {
       setError(built.error);
       return;
     }
-    const source = (built.input.cdxml || built.input.structure || "").trim();
-    const smiles = source ? await extractCanonicalSmilesFailSafe(source) : null;
-    const result = onAddToLibrary({ ...built.input, smiles: smiles ?? null });
+    const result = onAddToLibrary(built.input);
     if (!result.ok) {
       setError(result.error);
       return;
     }
-    setSavePromptOpen(false);
-    setSavedFlash(true);
-    setTimeout(() => setSavedFlash(false), 3000);
+    finishLibrarySave(result.compound.id, result.compound.name, built.source, result.compound.smiles);
   }
 
-  async function handleUpdateExistingCompound(existingId: string) {
+  function handleUpdateExistingCompound(existingId: string) {
     setError(null);
     const built = buildCompoundInput(saveName);
     if (!built.ok) {
       setError(built.error);
       return;
     }
-    const source = (built.input.cdxml || built.input.structure || "").trim();
-    const smiles = source ? await extractCanonicalSmilesFailSafe(source) : null;
-    const result = onUpdateInLibrary(existingId, { ...built.input, smiles: smiles ?? null });
+    const result = onUpdateInLibrary(existingId, built.input);
     if (!result.ok) {
       setError(result.error);
       return;
     }
-    setSavePromptOpen(false);
-    setSavedFlash(true);
-    setTimeout(() => setSavedFlash(false), 3000);
+    finishLibrarySave(result.compound.id, result.compound.name, built.source, result.compound.smiles);
   }
 
   const filteredLibrary = useMemo(() => {
@@ -1664,7 +2719,7 @@ function StructureZoneCard({
     <div
       ref={boxRef}
       onClick={onActivate}
-      className="flex flex-col items-center print:w-full"
+      className="flex h-full w-full flex-col print:h-auto print:w-full"
     >
       <input
         ref={fileInputRef}
@@ -1678,15 +2733,15 @@ function StructureZoneCard({
       />
 
       {/* Zone top label + selection state + Clear × button (screen only) */}
-      <div className="mb-1 flex w-full items-center justify-between gap-1 px-0.5 print:hidden">
-        <span className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+      <div className="mb-1 flex h-10 min-h-10 w-full shrink-0 items-center justify-between gap-1 overflow-hidden px-0.5 print:hidden">
+        <span className="flex min-w-0 items-center gap-1.5 whitespace-nowrap text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
           <span
             className={`inline-block size-2 rounded-full transition-colors ${
               active ? "bg-fume-600" : "bg-zinc-300"
             }`}
             aria-hidden
           />
-          <span className={active ? "text-fume-800" : ""}>{title}</span>
+          <span className={`truncate ${active ? "text-fume-800" : ""}`}>{title}</span>
           {active && (
             <span className="rounded bg-fume-50 px-1.5 py-0.2 text-[9px] font-semibold normal-case tracking-normal text-fume-700">
               Selected
@@ -1694,7 +2749,7 @@ function StructureZoneCard({
           )}
         </span>
 
-        <div className="flex items-center gap-1">
+        <div className="flex shrink-0 items-center gap-1 whitespace-nowrap">
           <button
             type="button"
             onClick={(e) => {
@@ -1707,6 +2762,20 @@ function StructureZoneCard({
           >
             Upload
           </button>
+          {imageDataUrl && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onActivate();
+                void copyOut();
+              }}
+              className="rounded px-1.5 py-0.2 text-[10px] font-medium text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700"
+              title="Copy this structure image and its CDXML or SMILES"
+            >
+              {copiedFlash ? "Copied" : "Copy"}
+            </button>
+          )}
           {hasClearableData && (
             <button
               type="button"
@@ -1736,13 +2805,14 @@ function StructureZoneCard({
               handleBoxClick();
             }
           }}
+          onPaste={(e) => void handlePaste(e)}
           title={
             active
-              ? `${title} selected — press Ctrl+V to paste or click "Open in ChemDraw"`
+              ? `${title} selected — press Ctrl+V or Cmd+V to paste or click "Open in ChemDraw"`
               : `Click to select ${title}`
           }
           {...dropProps}
-          className={`group/zone relative flex min-h-36 w-full cursor-pointer items-center justify-center rounded-md border bg-white p-2.5 transition-all focus:outline-none print:min-h-0 print:cursor-default print:border-0 print:border-gray-300 print:bg-transparent print:p-0 print:text-black print:ring-0 print:ring-transparent print:shadow-none ${
+          className={`group/zone relative flex min-h-[220px] w-full flex-1 cursor-pointer items-center justify-center rounded-md border bg-white p-2.5 transition-all focus:outline-none print:h-auto print:min-h-0 print:flex-none print:cursor-default print:border-0 print:border-gray-300 print:bg-transparent print:p-0 print:text-black print:ring-0 print:ring-transparent print:shadow-none ${
             dragging
               ? "border-fume-500 bg-fume-50 print:border-0 print:bg-transparent print:ring-0"
               : active
@@ -1754,7 +2824,10 @@ function StructureZoneCard({
           <img
             src={imageDataUrl}
             alt={title}
-            className="mx-auto block max-h-40 w-auto max-w-full object-contain print:mx-auto print:max-h-36"
+            loading="eager"
+            decoding="sync"
+            style={displayWidth ? { width: `${displayWidth}px` } : undefined}
+            className="mx-auto block h-auto w-auto max-w-full max-h-[185px] object-contain select-none print:mx-auto print:max-h-36"
           />
 
           {/* ChemDraw status pill (strictly hidden in print; auto-stops after Ctrl+S update; dismissible with ×) */}
@@ -1801,13 +2874,14 @@ function StructureZoneCard({
               handleBoxClick();
             }
           }}
+          onPaste={(e) => void handlePaste(e)}
           title={
             active
-              ? `${title} selected — press Ctrl+V to paste, pick from Library, or click "Open in ChemDraw"`
+              ? `${title} selected — press Ctrl+V or Cmd+V to paste, pick from Library, or click "Open in ChemDraw"`
               : `Click to select ${title}`
           }
           {...dropProps}
-          className={`group/zone relative flex min-h-36 w-full cursor-pointer flex-col items-center justify-center rounded-md border border-dashed px-3 py-4 text-center text-xs transition-all focus:outline-none print:hidden print:border-gray-300 print:bg-transparent print:text-black print:ring-0 print:ring-transparent print:shadow-none ${
+          className={`group/zone relative flex min-h-[220px] w-full flex-1 cursor-pointer flex-col items-center justify-center rounded-md border border-dashed px-3 py-4 text-center text-xs transition-all focus:outline-none print:hidden print:border-gray-300 print:bg-transparent print:text-black print:ring-0 print:ring-transparent print:shadow-none ${
             dragging
               ? "border-fume-500 bg-fume-50 text-fume-700"
               : active
@@ -1824,9 +2898,51 @@ function StructureZoneCard({
           </span>
           <span className="mt-1 text-[10px] text-zinc-500">
             {active
-              ? "Press Ctrl+V to paste from ChemDraw, load from Library, or click “Open in ChemDraw” above"
-              : "Select this box to paste (Ctrl+V), load from Library, or open in ChemDraw"}
+              ? "Press Ctrl+V or Cmd+V to paste from ChemDraw, load from Library, or click “Open in ChemDraw” above"
+              : "Select this box to paste (Ctrl+V or Cmd+V), load from Library, or open in ChemDraw"}
           </span>
+          {autoDrawOpen ? (
+            <form
+              onClick={(event) => event.stopPropagation()}
+              onKeyDown={(event) => event.stopPropagation()}
+              onSubmit={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                void handleAutoDraw();
+              }}
+              className="mt-2 flex w-full max-w-[16rem] gap-1 print:hidden"
+            >
+              <input
+                type="text"
+                value={autoDrawQuery}
+                onChange={(e) => setAutoDrawQuery(e.target.value)}
+                onKeyDown={(e) => e.stopPropagation()}
+                placeholder="Name, CAS, or SMILES"
+                aria-label="Chemical name, CAS, or SMILES"
+                autoFocus
+                className="min-w-0 flex-1 rounded border border-zinc-300 bg-white px-2 py-1 text-[11px] text-zinc-900 placeholder:text-zinc-400 focus:border-fume-500 focus:outline-none"
+              />
+              <button
+                type="submit"
+                disabled={busy || !autoDrawQuery.trim()}
+                className="rounded bg-fume-600 px-2.5 py-1 text-[10px] font-semibold text-white hover:bg-fume-700 disabled:opacity-50"
+              >
+                {busy ? "Drawing…" : "Draw"}
+              </button>
+            </form>
+          ) : (
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                onActivate();
+                setAutoDrawOpen(true);
+              }}
+              className="mt-2 rounded border border-fume-200 bg-white px-2 py-0.5 text-[10px] font-semibold text-fume-800 hover:bg-fume-50 print:hidden"
+            >
+              ✨ Auto-Draw from Name / SMILES
+            </button>
+          )}
 
           {(chemDrawWatching || chemDrawJustUpdated || chemDrawBusy !== null) && (
             <span className="mt-1.5 inline-flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50/95 px-2.5 py-0.5 text-[10px] font-medium text-emerald-800 shadow-2xs print:hidden">
@@ -1859,21 +2975,45 @@ function StructureZoneCard({
         </div>
       )}
 
+      <div className="mt-auto flex w-full shrink-0 flex-col items-center print:mt-0">
       {/* Subtle bottom caption synced with Limiting Reagent or Product */}
       <div
-        className={`mt-1 flex flex-wrap items-center justify-center gap-x-1.5 text-center text-[11px] leading-tight print:mt-0.5 print:text-[10px] ${
+        className={`mt-1 flex min-h-8 w-full flex-wrap items-center justify-center gap-x-1.5 text-center text-[11px] leading-tight print:mt-0.5 print:min-h-0 print:text-[10px] ${
           !imageDataUrl && captionNamePlaceholder ? "print:hidden" : ""
         }`}
       >
-        <span
-          className={
-            captionNamePlaceholder
-              ? "italic text-zinc-400 print:hidden"
-              : "font-semibold text-zinc-800"
-          }
-        >
-          {captionName}
-        </span>
+        {captionEditable ? (
+          <>
+            <input
+              type="text"
+              value={captionNamePlaceholder ? "" : captionName}
+              placeholder={captionName}
+              aria-label="Reaction scheme target"
+              onClick={(e) => e.stopPropagation()}
+              onChange={(e) => onCaptionChange?.(e.target.value)}
+              className="w-44 max-w-full rounded border border-transparent bg-transparent px-1 text-center text-[11px] font-semibold text-zinc-800 placeholder:font-normal placeholder:italic placeholder:text-zinc-400 hover:border-zinc-200 focus:border-fume-500 focus:bg-white focus:outline-none print:hidden"
+            />
+            <span
+              className={
+                captionNamePlaceholder
+                  ? "hidden italic text-zinc-400 print:inline"
+                  : "hidden font-semibold text-zinc-800 print:inline"
+              }
+            >
+              {captionName}
+            </span>
+          </>
+        ) : (
+          <span
+            className={
+              captionNamePlaceholder
+                ? "italic text-zinc-400 print:hidden"
+                : "font-semibold text-zinc-800"
+            }
+          >
+            {captionName}
+          </span>
+        )}
         {captionMw !== null && captionMw > 0 && (
           <span className="text-zinc-500">
             · MW {formatNumber(captionMw)} g/mol
@@ -1884,7 +3024,7 @@ function StructureZoneCard({
       {/* Compact Library Actions underneath the zone: Load from Library + "+ Save to Library" */}
       <div
         ref={pickerRef}
-        className="relative mt-1 flex flex-wrap items-center justify-center gap-1.5 print:hidden"
+        className="relative mt-1 flex min-h-7 w-full flex-nowrap items-center justify-center gap-1.5 print:hidden"
       >
         <button
           type="button"
@@ -1968,6 +3108,8 @@ function StructureZoneCard({
                         <img
                           src={comp.imageDataUrl}
                           alt=""
+                          loading="eager"
+                          decoding="sync"
                           className="size-8 shrink-0 rounded border border-zinc-100 bg-white object-contain p-0.5"
                         />
                       )}
@@ -2118,6 +3260,7 @@ function StructureZoneCard({
           {error}
         </p>
       )}
+      </div>
     </div>
   );
 }
@@ -2307,7 +3450,7 @@ function CenterConditionsZone({
       {/* ABOVE THE ARROW: Additional Reagents / Catalysts */}
       <div className="flex min-h-8 w-full flex-col items-center justify-end gap-1 pb-1 text-center">
         {arrowReagents.length > 0 && (
-          <div className="flex w-full flex-wrap items-center justify-center gap-x-2 gap-y-0.5 text-center text-xs leading-snug text-zinc-800 print:text-[10.5px]">
+          <div className="flex w-full flex-wrap items-center justify-center gap-x-2 gap-y-0.5 text-center text-sm font-medium text-slate-800 leading-snug print:text-[11px]">
             {arrowReagents.map((r, idx) => {
               const eqLabel =
                 r.eq !== null && r.eq > 0 ? ` (${formatNumber(r.eq)} eq)` : "";
@@ -2315,12 +3458,12 @@ function CenterConditionsZone({
               return (
                 <span
                   key={r.id}
-                  className="group/pill inline-flex items-center gap-0.5 rounded px-1 py-0.5 font-medium text-zinc-800 hover:bg-zinc-100 print:p-0"
+                  className="group/pill inline-flex items-center gap-0.5 rounded px-1 py-0.5 font-medium text-slate-800 hover:bg-slate-100 print:p-0"
                 >
                   <span>
                     {arrowReagents.length > 1 ? `${idx + 1}. ` : ""}
                     {r.name}
-                    <span className="font-normal text-zinc-600">
+                    <span className="font-normal text-slate-600">
                       {eqLabel}
                       {catLabel}
                     </span>
@@ -2437,7 +3580,7 @@ function CenterConditionsZone({
       {/* BELOW THE ARROW: Formatted conditions summary + interactive inputs */}
       <div className="mt-0.5 flex w-full flex-col items-center gap-1.5 text-center">
         {printedBelowParts.length > 0 && (
-          <div className="w-full text-center text-xs leading-snug text-zinc-800 print:text-[10.5px]">
+          <div className="w-full text-center text-sm text-slate-700 leading-snug print:text-[11px]">
             {printedBelowParts.join(", ")}
           </div>
         )}
@@ -2452,7 +3595,7 @@ function CenterConditionsZone({
             onChange={(e) => onPatchScheme({ solvent: e.target.value || undefined })}
             placeholder="Solvent"
             aria-label="Reaction solvent"
-            className="w-full rounded border border-zinc-200 bg-white px-2 py-0.5 text-center text-xs text-zinc-800 placeholder:text-zinc-300 focus:border-fume-500 focus:outline-none"
+            className="w-full rounded border border-zinc-200 bg-white px-2 py-1 text-center text-sm text-slate-700 placeholder:text-zinc-400 focus:border-fume-500 focus:outline-none"
           />
           <datalist id={solventListId}>
             {REACTION_SOLVENT_SUGGESTIONS.map((item) => (
@@ -2477,7 +3620,7 @@ function CenterConditionsZone({
               placeholder="Temperature"
               aria-label="Reaction temperature"
               title="Reaction temperature"
-              className="w-full rounded border border-zinc-200 bg-white px-1.5 py-0.5 text-center text-xs text-zinc-800 placeholder:text-zinc-300 focus:border-fume-500 focus:outline-none"
+              className="w-full rounded border border-zinc-200 bg-white px-1.5 py-1 text-center text-sm text-slate-700 placeholder:text-zinc-400 focus:border-fume-500 focus:outline-none"
             />
             <input
               type="text"
@@ -2494,12 +3637,12 @@ function CenterConditionsZone({
               placeholder="Time"
               aria-label="Reaction duration"
               title="Reaction duration"
-              className="w-full rounded border border-zinc-200 bg-white px-1.5 py-0.5 text-center text-xs text-zinc-800 placeholder:text-zinc-300 focus:border-fume-500 focus:outline-none"
+              className="w-full rounded border border-zinc-200 bg-white px-1.5 py-1 text-center text-sm text-slate-700 placeholder:text-zinc-400 focus:border-fume-500 focus:outline-none"
             />
           </div>
 
           {/* Atmosphere pills */}
-          <div className="flex items-center justify-center gap-1">
+          <div className="flex items-center justify-center gap-1.5 text-sm text-slate-700">
             <span className="text-[10px] text-zinc-400">under</span>
             {ATMOSPHERE_OPTIONS.map((atm) => {
               const selected = structuredScheme?.atmosphere === atm;
@@ -2551,7 +3694,13 @@ function StructureThumb({ src, label }: { src?: string | null; label: string }) 
     <div className="flex h-16 w-[4.5rem] shrink-0 items-center justify-center overflow-hidden rounded border border-zinc-200 bg-white">
       {src ? (
         // eslint-disable-next-line @next/next/no-img-element -- saved SVG or PNG data URL
-        <img src={src} alt={label} className="max-h-14 max-w-[4.25rem] object-contain" />
+        <img
+          src={src}
+          alt={label}
+          loading="eager"
+          decoding="sync"
+          className="max-h-14 max-w-[4.25rem] object-contain"
+        />
       ) : (
         <span className="px-1 text-center text-[9px] leading-tight text-zinc-400">{label}</span>
       )}

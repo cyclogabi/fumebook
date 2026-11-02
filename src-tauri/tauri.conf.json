@@ -10,17 +10,14 @@
     "beforeBuildCommand": "npm run build"
   },
   "app": {
-    "windows": [
-      {
-        "label": "main",
-        "title": "Fumebook ELN",
-        "width": 800,
-        "height": 600,
-        "resizable": true,
-        "fullscreen": false,
-        "dragDropEnabled": false
-      }
-    ],
+"windows": [
+  {
+    "title": "Fumebook",
+    "width": 1200,
+    "height": 800,
+    "label": "main"
+  }
+],
     "security": {
       "csp": "default-src 'self'; connect-src 'self' https://api.groq.com https://pubchem.ncbi.nlm.nih.gov ipc: http://ipc.localhost; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; worker-src 'self' blob:; frame-src 'self' blob: data:;"
     }

@@ -353,6 +353,12 @@ export function experimentProblem(raw: unknown): string | null {
         }
       }
     }
+    for (const numField of ["reactantDisplayWidth", "productDisplayWidth", "productMw"] as const) {
+      const val = s[numField];
+      if (val !== undefined && val !== null && typeof val !== "number") {
+        return `structuredScheme.${numField} must be a number`;
+      }
+    }
     for (const txtField of [
       "reactantCdxml",
       "productCdxml",
@@ -361,6 +367,7 @@ export function experimentProblem(raw: unknown): string | null {
       "duration",
       "atmosphere",
       "extraArrowNotes",
+      "productLabel",
     ] as const) {
       if (s[txtField] !== undefined && s[txtField] !== null && !isStr(s[txtField])) {
         return `structuredScheme.${txtField} must be text`;

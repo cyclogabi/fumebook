@@ -1,18 +1,53 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import type { Experiment } from "@/lib/types";
 
 interface Props {
   experiments: Experiment[];
   selectedId: string | null;
+  /** Mobile drawer. Desktop uses `collapsed` instead. */
   open: boolean;
+  /** Desktop icon rail. The full experiment list is hidden until this is false. */
+  collapsed: boolean;
   onSelect: (id: string | null) => void;
   onClose: () => void;
+  onNew: () => void;
   onExportBackup: () => void;
   onImportBackup: () => void;
   onImportExperiment: () => void;
   onOpenLibrary: () => void;
+}
+
+function PanelLeftIcon({ open }: { open: boolean }) {
+  return (
+    <svg viewBox="0 0 24 24" className="size-5" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <path d="M9 3v18" />
+      {open ? <path d="M16 9l-3 3 3 3" /> : <path d="M13 9l3 3-3 3" />}
+    </svg>
+  );
+}
+
+/** Header and notebook toolbar control for the sidebar. */
+export function SidebarToggleButton({
+  expanded,
+  onClick,
+}: {
+  expanded: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label={expanded ? "Close sidebar" : "Open sidebar"}
+      title={expanded ? "Close sidebar (Ctrl+B)" : "Open sidebar (Ctrl+B)"}
+      className="inline-flex shrink-0 items-center justify-center whitespace-nowrap rounded-md p-1.5 text-zinc-600 hover:bg-zinc-100"
+    >
+      <PanelLeftIcon open={expanded} />
+    </button>
+  );
 }
 
 /** Sort GH experiments newest first by their numeric suffix. */
@@ -25,8 +60,10 @@ export default function Sidebar({
   experiments,
   selectedId,
   open,
+  collapsed,
   onSelect,
   onClose,
+  onNew,
   onExportBackup,
   onImportBackup,
   onImportExperiment,
@@ -53,12 +90,37 @@ export default function Sidebar({
         />
       )}
 
+      <style>{`
+        @media (min-width: 64rem) {
+          aside[data-collapsed="true"] { width: 3.5rem; }
+          aside[data-collapsed="true"] [data-sidebar-full] { display: none; }
+          aside[data-collapsed="true"] [data-sidebar-rail] { display: flex; }
+        }
+      `}</style>
       <aside
-        className={`fixed bottom-0 left-0 top-14 z-30 flex w-72 flex-col border-r border-zinc-200 bg-white transition-transform lg:sticky lg:bottom-auto lg:z-0 lg:h-[calc(100dvh-3.5rem)] lg:translate-x-0 print:hidden ${
+        data-collapsed={collapsed ? "true" : "false"}
+        className={`fixed bottom-0 left-0 top-14 z-30 flex w-64 shrink-0 flex-col overflow-hidden border-r border-zinc-200 bg-white transition-all duration-200 print:hidden lg:sticky lg:bottom-auto lg:z-0 lg:h-[calc(100dvh-3.5rem)] lg:translate-x-0 ${
           open ? "translate-x-0" : "-translate-x-full"
         }`}
         aria-label="Experiments"
       >
+        <div data-sidebar-rail className={`hidden w-14 flex-col items-center gap-1 px-1.5 py-2`}>
+          <RailButton label="Dashboard" active={selectedId === null} onClick={() => onSelect(null)}>
+            <path d="M3 10.5 8 4l5 6.5" />
+            <path d="M4.2 9.2V14h7.6V9.2" />
+          </RailButton>
+          <RailButton label="Personal Library" onClick={onOpenLibrary}>
+            <path d="M3 2.5h7a2 2 0 0 1 2 2v9H5a2 2 0 0 1-2-2v-9ZM3 11.5a2 2 0 0 1 2-2h7" />
+          </RailButton>
+          <RailButton label="New Experiment" onClick={onNew}>
+            <path d="M8 3.5v9M3.5 8h9" />
+          </RailButton>
+          <RailButton label="Backup" onClick={onExportBackup}>
+            <path d="M8 2v8M4.5 7 8 10.5 11.5 7M3 13h10" />
+          </RailButton>
+        </div>
+
+        <div data-sidebar-full className="flex min-h-0 min-w-64 flex-1 flex-col">
         <div className="space-y-2 border-b border-zinc-200 p-3">
           <button
             type="button"
@@ -166,7 +228,36 @@ export default function Sidebar({
             </button>
           </div>
         </div>
+        </div>
       </aside>
     </>
+  );
+}
+
+function RailButton({
+  label,
+  active,
+  onClick,
+  children,
+}: {
+  label: string;
+  active?: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      title={label}
+      aria-label={label}
+      onClick={onClick}
+      className={`grid size-9 place-items-center rounded-md ${
+        active ? "bg-zinc-100 text-zinc-900" : "text-zinc-600 hover:bg-zinc-50"
+      }`}
+    >
+      <svg viewBox="0 0 16 16" className="size-4" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+        {children}
+      </svg>
+    </button>
   );
 }

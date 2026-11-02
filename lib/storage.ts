@@ -11,9 +11,11 @@ import {
   ROLES,
   UNIT_OPTIONS,
   newExperiment,
+  suggestFractionLabel,
   uid,
   type Experiment,
   type GradientPoint,
+  type IsolatedFractionRole,
   type MoleculeMode,
   type ProductInfo,
   type PurificationGradient,
@@ -173,6 +175,10 @@ function normaliseReference(raw: Partial<Reference> | null | undefined): Referen
   return { id: typeof raw.id === "string" ? raw.id : uid(), title, doi, url };
 }
 
+function fractionRole(value: unknown): IsolatedFractionRole | undefined {
+  return value === "target" || value === "recovered-sm" || value === "side" ? value : undefined;
+}
+
 function normaliseProduct(raw: Partial<ProductInfo> | null | undefined): ProductInfo {
   const p = raw ?? {};
   const mw = num(p.mw);
@@ -180,6 +186,7 @@ function normaliseProduct(raw: Partial<ProductInfo> | null | undefined): Product
   const ratio = looseNumber(p.stoichRatio);
   const elutionStartCv = looseNumber(p.elutionStartCv);
   const elutionEndCv = looseNumber(p.elutionEndCv);
+  const isolatedRole = fractionRole(p.isolatedRole);
   return {
     name: typeof p.name === "string" ? p.name : "",
     mw: mw !== null && mw > 0 ? mw : null,
@@ -187,6 +194,7 @@ function normaliseProduct(raw: Partial<ProductInfo> | null | undefined): Product
     massUnit: PRODUCT_MASS_UNITS.includes(p.massUnit as never)
       ? (p.massUnit as ProductInfo["massUnit"])
       : DEFAULT_PRODUCT.massUnit,
+    ...(isolatedRole ? { isolatedRole } : {}),
     ...(ratio !== null && ratio > 0 && ratio !== 1 ? { stoichRatio: ratio } : {}),
     ...(elutionStartCv !== null && elutionStartCv >= 0 ? { elutionStartCv } : {}),
     ...(elutionEndCv !== null && elutionEndCv >= 0 ? { elutionEndCv } : {}),
@@ -201,6 +209,7 @@ function normaliseSecondary(raw: unknown): SecondaryProduct | null {
   const ratio = looseNumber(r.stoichRatio);
   const elutionStartCv = looseNumber(r.elutionStartCv);
   const elutionEndCv = looseNumber(r.elutionEndCv);
+  const isolatedRole = fractionRole(r.isolatedRole);
   const product: SecondaryProduct = {
     id: typeof r.id === "string" && r.id ? r.id : uid(),
     name: typeof r.name === "string" ? r.name : "",
@@ -210,6 +219,7 @@ function normaliseSecondary(raw: unknown): SecondaryProduct | null {
       ? (r.massUnit as SecondaryProduct["massUnit"])
       : "mg",
     stoichRatio: ratio !== null && ratio > 0 ? ratio : 1,
+    ...(isolatedRole ? { isolatedRole } : {}),
     ...(elutionStartCv !== null && elutionStartCv >= 0 ? { elutionStartCv } : {}),
     ...(elutionEndCv !== null && elutionEndCv >= 0 ? { elutionEndCv } : {}),
   };
@@ -325,11 +335,25 @@ function normaliseStructuredScheme(raw: unknown): StructuredReactionScheme | und
   if (typeof s.reactantCdxml === "string" && s.reactantCdxml.trim() !== "") {
     out.reactantCdxml = s.reactantCdxml;
   }
+  if (
+    typeof s.reactantDisplayWidth === "number" &&
+    Number.isFinite(s.reactantDisplayWidth) &&
+    s.reactantDisplayWidth > 0
+  ) {
+    out.reactantDisplayWidth = Math.round(s.reactantDisplayWidth);
+  }
   if (typeof s.productImage === "string" && s.productImage.startsWith("data:image/")) {
     out.productImage = s.productImage;
   }
   if (typeof s.productCdxml === "string" && s.productCdxml.trim() !== "") {
     out.productCdxml = s.productCdxml;
+  }
+  if (
+    typeof s.productDisplayWidth === "number" &&
+    Number.isFinite(s.productDisplayWidth) &&
+    s.productDisplayWidth > 0
+  ) {
+    out.productDisplayWidth = Math.round(s.productDisplayWidth);
   }
   if (typeof s.solvent === "string" && s.solvent.trim() !== "") {
     out.solvent = s.solvent;
@@ -346,6 +370,11 @@ function normaliseStructuredScheme(raw: unknown): StructuredReactionScheme | und
   if (typeof s.extraArrowNotes === "string" && s.extraArrowNotes.trim() !== "") {
     out.extraArrowNotes = s.extraArrowNotes;
   }
+  if (typeof s.productLabel === "string" && s.productLabel.trim() !== "") {
+    out.productLabel = s.productLabel.trim();
+  }
+  const productMw = looseNumber(s.productMw);
+  if (productMw !== null && productMw > 0) out.productMw = productMw;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -368,17 +397,23 @@ export function normaliseExperiment(raw: Partial<Experiment>): Experiment | null
     ? raw.secondaryProducts
         .map(normaliseSecondary)
         .filter((p): p is SecondaryProduct => p !== null)
-        .map((p, i) => (p.name.trim() === "" ? { ...p, name: `${raw.id}-F${i + 2}` } : p))
     : [];
   const product = normaliseProduct(raw.product);
-  const trimmedName = product.name.trim();
-  const idUpper = raw.id.toUpperCase();
-  if (secondary.length > 0) {
-    if (trimmedName === "" || trimmedName.toUpperCase() === idUpper) {
-      product.name = `${raw.id}-F1`;
+  const experimentId = raw.id.trim();
+  // Only an empty fraction gets the default id. A name already stored — including the
+  // experiment code — is the chemist's text and is not rewritten.
+  if (product.name.trim() === "") {
+    product.name = experimentId ? `${experimentId}-F1` : "F1";
+  }
+  const usedFractionNames = [product.name];
+  for (const fraction of secondary) {
+    if (fraction.name.trim() !== "") {
+      usedFractionNames.push(fraction.name);
+      continue;
     }
-  } else if (trimmedName === "" || trimmedName.toUpperCase() === `${idUpper}-F1`) {
-    product.name = raw.id;
+    fraction.name = suggestFractionLabel(raw.id, usedFractionNames);
+    if (!fraction.isolatedRole) fraction.isolatedRole = "side";
+    usedFractionNames.push(fraction.name);
   }
 
   const purificationGradient = normalisePurificationGradient(raw.purificationGradient);
@@ -890,6 +925,10 @@ function flushToBrowser(): boolean {
 }
 
 /** Persist pending changes now. Resolves to false if they could not be stored. */
+export function flushPendingSaves(): Promise<boolean> {
+  return flush();
+}
+
 function flush(): Promise<boolean> {
   if (persistTimer) {
     clearTimeout(persistTimer);

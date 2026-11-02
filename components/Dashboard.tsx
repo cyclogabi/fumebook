@@ -1,5 +1,6 @@
 "use client";
 
+import { LabPostIt } from "./LabWidgetsBar";
 import { formatDate } from "./ExperimentEditor";
 import { sortExperiments } from "./Sidebar";
 import { yieldSummary } from "@/lib/stoich";
@@ -43,6 +44,10 @@ export default function Dashboard({ experiments, onOpen, onNew, onParse, onImpor
         <Stat label="This month" value={thisMonth} />
         <Stat label="TLC plates" value={plates} />
       </dl>
+
+      <div className="mt-6">
+        <LabPostIt />
+      </div>
 
       <h2 className="mb-2 mt-8 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
         All experiments

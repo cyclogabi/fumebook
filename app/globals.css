@@ -34,6 +34,10 @@ body {
   /* Blueprint (loaded with the NMR room) restyles `body`; pin the app's values. */
   font-size: 1rem;
   line-height: 1.5;
+  /* WebKit (Safari / macOS WKWebView) drops background colors unless this is set
+     before print, not only inside `@media print`. */
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
 }
 
 /* ---- Print: clean A4 document ------------------------------------------ */

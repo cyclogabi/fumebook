@@ -56,4 +56,6 @@ export interface ExperimentData {
   /** Canonical SMILES of the right-zone structure, when Indigo can produce one. */
   productSmiles?: string;
   aiReactionData?: AiReactionRecord;
+  /** Opt-in lab widgets shown above this experiment. Empty or missing keeps the page clear. */
+  enabledWidgets?: string[];
 }

@@ -421,6 +421,132 @@ mod chemdraw {
         }
     }
 
+    fn utf16_clipboard_text(text: &str) -> Vec<u8> {
+        let mut bytes = utf16le(text);
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes
+    }
+
+    /// ChemDraw's MDLCT block: each line is a length byte followed by that many bytes.
+    fn mdlct_bytes(molfile: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        for line in molfile.split('\n') {
+            let line = line.trim_end_matches('\r');
+            let raw = line.as_bytes();
+            let len = raw.len().min(255);
+            out.push(len as u8);
+            out.extend_from_slice(&raw[..len]);
+        }
+        out
+    }
+
+    /// A bottom-up 32-bit `CF_DIB` (BITMAPINFOHEADER + BGRA pixels) from PNG bytes.
+    fn png_bytes_to_dib(png: &[u8]) -> Result<Vec<u8>, String> {
+        let img = image::load_from_memory(png)
+            .map_err(|e| e.to_string())?
+            .to_rgba8();
+        let width = img.width() as i32;
+        let height = img.height() as i32;
+        if width <= 0 || height <= 0 {
+            return Err("Clipboard image has no pixels.".into());
+        }
+        let mut dib = Vec::with_capacity(40 + (width as usize) * (height as usize) * 4);
+        dib.extend_from_slice(&40u32.to_le_bytes());
+        dib.extend_from_slice(&width.to_le_bytes());
+        dib.extend_from_slice(&height.to_le_bytes());
+        dib.extend_from_slice(&1u16.to_le_bytes());
+        dib.extend_from_slice(&32u16.to_le_bytes());
+        dib.extend_from_slice(&0u32.to_le_bytes());
+        let size_image = (width as u32) * (height as u32) * 4;
+        dib.extend_from_slice(&size_image.to_le_bytes());
+        dib.extend_from_slice(&0i32.to_le_bytes());
+        dib.extend_from_slice(&0i32.to_le_bytes());
+        dib.extend_from_slice(&0u32.to_le_bytes());
+        dib.extend_from_slice(&0u32.to_le_bytes());
+        for y in (0..height).rev() {
+            for x in 0..width {
+                let pixel = img.get_pixel(x as u32, y as u32);
+                dib.push(pixel[2]);
+                dib.push(pixel[1]);
+                dib.push(pixel[0]);
+                dib.push(pixel[3]);
+            }
+        }
+        Ok(dib)
+    }
+
+    /// Exact PNG or BMP file bytes from a registered clipboard format (`PNG`, `image/png`, `BMP`).
+    /// Standard formats such as `CF_DIB` are left for the EMF renderer and `arboard`.
+    #[cfg(windows)]
+    pub fn read_raster_clipboard_bytes() -> Option<Vec<u8>> {
+        use clipboard_win::{raw, Clipboard};
+
+        let _clip = Clipboard::new_attempts(10).ok()?;
+        for format in raw::EnumFormats::new() {
+            if format < 0xC000 {
+                continue;
+            }
+            let name = raw::format_name_big(format).unwrap_or_default();
+            let lname = name.to_ascii_lowercase();
+            if !lname.contains("png") && !lname.contains("bmp") {
+                continue;
+            }
+            let size = raw::size(format).map_or(0, |size| size.get());
+            if size < 8 || size >= MAX_BLOCK {
+                continue;
+            }
+            let mut bytes = Vec::with_capacity(size);
+            if raw::get_vec(format, &mut bytes).is_err() {
+                continue;
+            }
+            if bytes.starts_with(b"\x89PNG") || bytes.starts_with(b"BM") {
+                return Some(bytes);
+            }
+        }
+        None
+    }
+
+    /// Put a structure image and its CDXML / Molfile / SMILES on the clipboard together,
+    /// so Word and PowerPoint paste the picture and ChemDraw pastes the structure.
+    #[cfg(windows)]
+    pub fn write_image_and_text(png_bytes: &[u8], text: &str) -> Result<(), String> {
+        use clipboard_win::{raw, Clipboard};
+
+        let _clip = Clipboard::new_attempts(10).map_err(|e| e.to_string())?;
+        raw::empty().map_err(|e| e.to_string())?;
+
+        if !png_bytes.is_empty() {
+            let dib = png_bytes_to_dib(png_bytes)?;
+            // CF_DIB = 8. Word and PowerPoint paste this bitmap.
+            raw::set_without_clear(8, &dib).map_err(|e| e.to_string())?;
+            if let Some(fmt) = raw::register_format("PNG") {
+                raw::set_without_clear(fmt.get(), png_bytes).map_err(|e| e.to_string())?;
+            }
+        }
+
+        if !text.is_empty() {
+            raw::set_without_clear(13, &utf16_clipboard_text(text))
+                .map_err(|e| e.to_string())?;
+            if text.contains("<CDXML") {
+                if let Some(fmt) = raw::register_format("CDXML") {
+                    let mut bytes = text.as_bytes().to_vec();
+                    bytes.push(0);
+                    raw::set_without_clear(fmt.get(), &bytes).map_err(|e| e.to_string())?;
+                }
+            } else if text.contains("M  END") {
+                if let Some(fmt) = raw::register_format("MDLCT") {
+                    raw::set_without_clear(fmt.get(), &mdlct_bytes(text))
+                        .map_err(|e| e.to_string())?;
+                }
+            } else if let Some(fmt) = raw::register_format("SMILES") {
+                let mut bytes = text.as_bytes().to_vec();
+                bytes.push(0);
+                raw::set_without_clear(fmt.get(), &bytes).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -637,50 +763,11 @@ fn read_chemdraw_clipboard() -> Option<String> {
     }
 }
 
-#[tauri::command]
-fn read_clipboard_image_base64() -> Result<String, String> {
-    let arboard_rgba: Result<(u32, u32, Vec<u8>), String> = (|| {
-        let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
-        let image_data = clipboard.get_image().map_err(|e| e.to_string())?;
-        let width: u32 = image_data
-            .width
-            .try_into()
-            .map_err(|_| "Invalid image width".to_string())?;
-        let height: u32 = image_data
-            .height
-            .try_into()
-            .map_err(|_| "Invalid image height".to_string())?;
-        Ok((width, height, image_data.bytes.into_owned()))
-    })();
-
-    let (width, height, rgba_bytes) = match arboard_rgba {
-        Ok(data) => data,
-        Err(err) => {
-            #[cfg(target_os = "windows")]
-            {
-                if let Some(emf_rgba) = chemdraw::render_clipboard_emf_to_rgba() {
-                    println!(
-                        "[ChemDraw Clipboard] Rendered CF_ENHMETAFILE to {}x{} RGBA PNG",
-                        emf_rgba.0, emf_rgba.1
-                    );
-                    emf_rgba
-                } else {
-                    return Err(err);
-                }
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                return Err(err);
-            }
-        }
-    };
-
+fn rgba_to_png_data_url(width: u32, height: u32, rgba_bytes: Vec<u8>) -> Result<String, String> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     let dynamic_image = image::DynamicImage::ImageRgba8(
-        image::RgbaImage::from_raw(width, height, rgba_bytes)
-            .ok_or("Failed to construct image")?,
+        image::RgbaImage::from_raw(width, height, rgba_bytes).ok_or("Failed to construct image")?,
     );
-
     dynamic_image
         .write_to(&mut buffer, image::ImageOutputFormat::Png)
         .map_err(|e| e.to_string())?;
@@ -689,6 +776,99 @@ fn read_clipboard_image_base64() -> Result<String, String> {
         "data:image/png;base64,{}",
         STANDARD.encode(buffer.into_inner())
     ))
+}
+
+fn png_file_to_data_url(bytes: &[u8]) -> Result<String, String> {
+    if bytes.starts_with(b"\x89PNG") {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        return Ok(format!("data:image/png;base64,{}", STANDARD.encode(bytes)));
+    }
+    let img = image::load_from_memory(bytes)
+        .map_err(|e| e.to_string())?
+        .to_rgba8();
+    let (width, height) = img.dimensions();
+    rgba_to_png_data_url(width, height, img.into_raw())
+}
+
+fn decode_png_base64(raw: &str) -> Result<Vec<u8>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let b64 = trimmed.rsplit(',').next().unwrap_or(trimmed);
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    STANDARD
+        .decode(b64.trim())
+        .map_err(|e| format!("Could not read the structure image: {e}"))
+}
+
+/// The picture ChemDraw (or another app) put on the clipboard, as a PNG data URL.
+///
+/// Windows order: exact `PNG`/`BMP` bytes, then `CF_ENHMETAFILE` (colored cartoons such as
+/// cyclodextrin ring fills), then the bitmap `arboard` can see. A monochrome DIB must not
+/// hide the colored metafile, and this picture is never redrawn by Indigo.
+#[tauri::command]
+fn read_clipboard_image_base64() -> Result<String, String> {
+    #[cfg(windows)]
+    if let Some(bytes) = chemdraw::read_raster_clipboard_bytes() {
+        println!(
+            "[ChemDraw Clipboard] Using exact clipboard raster ({} bytes)",
+            bytes.len()
+        );
+        return png_file_to_data_url(&bytes);
+    }
+
+    #[cfg(windows)]
+    if let Some((width, height, rgba)) = chemdraw::render_clipboard_emf_to_rgba() {
+        println!("[ChemDraw Clipboard] Rendered CF_ENHMETAFILE to {width}x{height} RGBA PNG");
+        return rgba_to_png_data_url(width, height, rgba);
+    }
+
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    let image_data = clipboard.get_image().map_err(|e| e.to_string())?;
+    let width: u32 = image_data
+        .width
+        .try_into()
+        .map_err(|_| "Invalid image width".to_string())?;
+    let height: u32 = image_data
+        .height
+        .try_into()
+        .map_err(|_| "Invalid image height".to_string())?;
+    rgba_to_png_data_url(width, height, image_data.bytes.into_owned())
+}
+
+/// Copy a structure drawing out of the notebook: PNG (for Word / PowerPoint) plus
+/// CDXML, Molfile, or SMILES (for ChemDraw).
+#[tauri::command]
+fn write_structure_clipboard(png_base64: String, text: String) -> Result<(), String> {
+    let png_bytes = decode_png_base64(&png_base64)?;
+    #[cfg(windows)]
+    {
+        chemdraw::write_image_and_text(&png_bytes, &text)
+    }
+    #[cfg(not(windows))]
+    {
+        if !png_bytes.is_empty() {
+            let img = image::load_from_memory(&png_bytes)
+                .map_err(|e| e.to_string())?
+                .to_rgba8();
+            let (width, height) = img.dimensions();
+            let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+            clipboard
+                .set_image(arboard::ImageData {
+                    width: width as usize,
+                    height: height as usize,
+                    bytes: std::borrow::Cow::Owned(img.into_raw()),
+                })
+                .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        if !text.is_empty() {
+            let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+            clipboard.set_text(text).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
 }
 
 /// Why `path` may not be handed to the system opener, or `None` if it is fine.
@@ -728,6 +908,27 @@ fn wait_for_cdxml_unlocked(path: &str) {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(delay));
+    }
+}
+
+/// Open a native "Save As…" dialog and write an SVG file at the chosen path.
+/// Returns `true` when the file was saved, `false` when the user cancelled.
+///
+/// Uses the `rfd` crate directly, the same way other native file dialogs are opened,
+/// so the Save dialog does not depend on the dialog plugin.
+#[tauri::command]
+async fn save_svg_file(default_name: String, svg_content: String) -> Result<bool, String> {
+    let path = rfd::FileDialog::new()
+        .set_file_name(&default_name)
+        .add_filter("SVG", &["svg"])
+        .save_file();
+    match path {
+        Some(file_path) => {
+            std::fs::write(&file_path, svg_content.as_bytes())
+                .map_err(|e| format!("Could not save SVG: {e}"))?;
+            Ok(true)
+        }
+        None => Ok(false),
     }
 }
 
@@ -795,6 +996,213 @@ mod open_tests {
     }
 }
 
+/// Talk to Ollama from the Rust process.
+///
+/// The installed Windows app loads the UI from `http://tauri.localhost` or
+/// `https://tauri.localhost`. A browser `fetch` from that origin to
+/// `http://localhost:11434` or a Tailscale address is blocked by Ollama's CORS
+/// check (`OLLAMA_ORIGINS`), by WebView2 mixed-content rules, and by this app's
+/// Content-Security-Policy. These commands make the same HTTP calls outside the
+/// webview, so the model list and protocol parse work in the `.msi` build.
+const OLLAMA_MAX_BODY: usize = 32 * 1024 * 1024;
+
+fn ollama_client(timeout: std::time::Duration) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .user_agent("fumebook")
+        .timeout(timeout)
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        // A machine-wide HTTP proxy must not sit between the app and a local or Tailscale Ollama.
+        .no_proxy()
+        .build()
+        .map_err(|err| format!("Could not start the Ollama client: {err}"))
+}
+
+/// `{host_url}/{endpoint}`, with the host limited to `http` and `https`.
+fn ollama_api_url(host_url: &str, endpoint: &str) -> Result<reqwest::Url, String> {
+    let trimmed = host_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err("Enter an Ollama host URL.".into());
+    }
+    let mut base = reqwest::Url::parse(trimmed).map_err(|err| format!("Invalid Ollama host URL: {err}"))?;
+    match base.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(format!(
+                "Ollama host must start with http:// or https:// (got {other})."
+            ));
+        }
+    }
+    if !base.username().is_empty() || base.password().is_some() {
+        return Err("The Ollama host URL cannot include a username or password.".into());
+    }
+    base.set_query(None);
+    base.set_fragment(None);
+    let joined = format!(
+        "{}/{}",
+        base.as_str().trim_end_matches('/'),
+        endpoint.trim_start_matches('/')
+    );
+    reqwest::Url::parse(&joined).map_err(|err| format!("Invalid Ollama URL: {err}"))
+}
+
+fn ollama_transport_error(err: &reqwest::Error, host: &str) -> String {
+    if err.is_timeout() {
+        format!("Ollama at {host} did not respond in time.")
+    } else if err.is_connect() {
+        format!(
+            "Could not connect to Ollama at {host}. Check that it is running and this computer can reach that address."
+        )
+    } else {
+        format!("Could not reach Ollama at {host}: {err}")
+    }
+}
+
+fn ollama_status_message(status: reqwest::StatusCode, body: &str) -> String {
+    let trimmed = body.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(message) = value.get("error").and_then(|item| item.as_str()) {
+            let message = message.trim();
+            if !message.is_empty() {
+                return message.to_owned();
+            }
+        }
+    }
+    if trimmed.is_empty() {
+        format!("Ollama replied {}.", status.as_u16())
+    } else {
+        let snippet: String = trimmed.chars().take(300).collect();
+        format!("Ollama replied {}: {snippet}", status.as_u16())
+    }
+}
+
+async fn read_ollama_response(response: reqwest::Response) -> Result<String, String> {
+    let status = response.status();
+    if let Some(length) = response.content_length() {
+        if length > OLLAMA_MAX_BODY as u64 {
+            return Err("Ollama response is too large.".into());
+        }
+    }
+    let bytes = response.bytes().await.map_err(|err| {
+        if err.is_timeout() {
+            "Ollama did not finish sending a response in time.".to_owned()
+        } else {
+            format!("Could not read the Ollama response: {err}")
+        }
+    })?;
+    if bytes.len() > OLLAMA_MAX_BODY {
+        return Err("Ollama response is too large.".into());
+    }
+    let text = String::from_utf8(bytes.to_vec())
+        .map_err(|_| "Ollama returned a response that is not text.".to_string())?;
+    if !status.is_success() {
+        return Err(ollama_status_message(status, &text));
+    }
+    if text.trim().is_empty() {
+        return Err("Ollama returned an empty response.".into());
+    }
+    Ok(text)
+}
+
+/// Optional local Python helper. A standalone Mac install usually has nothing on port 8000,
+/// so any failure is a quiet `false` rather than an error the webview would log.
+#[tauri::command]
+async fn local_ai_health() -> bool {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(800))
+        .connect_timeout(std::time::Duration::from_millis(400))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+    for url in ["http://127.0.0.1:8000/health", "http://localhost:8000/health"] {
+        match client.get(url).send().await {
+            Ok(response) if response.status().is_success() => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// `GET {host_url}/api/tags`. The raw JSON is what the model dropdown parses.
+#[tauri::command]
+async fn ollama_list_models(host_url: String) -> Result<String, String> {
+    let host = host_url.trim().trim_end_matches('/').to_owned();
+    let url = ollama_api_url(&host, "api/tags")?;
+    let response = ollama_client(std::time::Duration::from_secs(30))?
+        .get(url)
+        .send()
+        .await
+        .map_err(|err| ollama_transport_error(&err, &host))?;
+    read_ollama_response(response).await
+}
+
+/// `POST {host_url}/api/chat`. Vision and OCR prompts can take a while, so the
+/// client waits up to 180 seconds and returns the raw JSON body.
+#[tauri::command]
+async fn ollama_chat(host_url: String, payload: String) -> Result<String, String> {
+    let host = host_url.trim().trim_end_matches('/').to_owned();
+    if payload.trim().is_empty() {
+        return Err("Ollama chat payload is empty.".into());
+    }
+    let url = ollama_api_url(&host, "api/chat")?;
+    let response = ollama_client(std::time::Duration::from_secs(180))?
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::ACCEPT, "application/json")
+        .body(payload)
+        .send()
+        .await
+        .map_err(|err| ollama_transport_error(&err, &host))?;
+    read_ollama_response(response).await
+}
+
+#[cfg(test)]
+mod ollama_tests {
+    use super::{ollama_api_url, ollama_status_message};
+
+    #[test]
+    fn tags_and_chat_urls_keep_the_host() {
+        assert_eq!(
+            ollama_api_url("http://localhost:11434/", "api/tags").unwrap().as_str(),
+            "http://localhost:11434/api/tags"
+        );
+        assert_eq!(
+            ollama_api_url("http://100.64.1.2:11434", "api/chat").unwrap().as_str(),
+            "http://100.64.1.2:11434/api/chat"
+        );
+        assert_eq!(
+            ollama_api_url("http://[::1]:11434", "api/tags").unwrap().as_str(),
+            "http://[::1]:11434/api/tags"
+        );
+        assert_eq!(
+            ollama_api_url("http://localhost:11434/?x=1#frag", "api/tags").unwrap().as_str(),
+            "http://localhost:11434/api/tags"
+        );
+    }
+
+    #[test]
+    fn only_http_hosts_are_accepted() {
+        assert!(ollama_api_url("", "api/tags").is_err());
+        assert!(ollama_api_url("file:///C:/Windows", "api/tags").is_err());
+        assert!(ollama_api_url("javascript:alert(1)", "api/tags").is_err());
+        assert!(ollama_api_url("http://user:pass@localhost:11434", "api/tags").is_err());
+    }
+
+    #[test]
+    fn http_errors_prefer_ollamas_message() {
+        let status = reqwest::StatusCode::NOT_FOUND;
+        assert_eq!(
+            ollama_status_message(status, r#"{"error":"model 'qwen2.5vl:7b' not found"}"#),
+            "model 'qwen2.5vl:7b' not found"
+        );
+        assert_eq!(ollama_status_message(status, ""), "Ollama replied 404.");
+    }
+}
+
 fn load_embedded_window_icon() -> Option<tauri::image::Image<'static>> {
     let bytes = include_bytes!("../icons/icon.ico");
     let img = image::load_from_memory(bytes).ok()?.into_rgba8();
@@ -822,7 +1230,12 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             read_chemdraw_clipboard,
             read_clipboard_image_base64,
-            open_in_chemdraw
+            write_structure_clipboard,
+            open_in_chemdraw,
+            save_svg_file,
+            ollama_list_models,
+            ollama_chat,
+            local_ai_health
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

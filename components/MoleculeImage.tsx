@@ -202,6 +202,8 @@ export default function MoleculeImage({ experimentId, hasImage, onHasImageChange
           <img
             src={url}
             alt="Molecule"
+            loading="eager"
+            decoding="sync"
             className="mx-auto block max-h-[110mm] max-w-full object-contain print:mx-auto print:max-h-36"
           />
           <div className="absolute right-2 top-2 flex gap-1.5 print:hidden">
@@ -245,7 +247,7 @@ export default function MoleculeImage({ experimentId, hasImage, onHasImageChange
             {loading ? "Loading image…" : busy ? "Saving image…" : "Drop a picture of the molecule here"}
           </span>
           <span className="text-xs text-zinc-400">
-            or click to browse (PNG, JPEG, SVG…), or paste a copied picture with Ctrl+V
+            or click to browse (PNG, JPEG, SVG…), or paste a copied picture with Ctrl+V / Cmd+V
           </span>
         </div>
       )}

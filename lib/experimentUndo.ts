@@ -24,8 +24,10 @@ function structuralKey(experiment: Experiment): string {
       ? {
           reactantImage: experiment.structuredScheme.reactantImage ?? "",
           reactantCdxml: experiment.structuredScheme.reactantCdxml ?? "",
+          reactantDisplayWidth: experiment.structuredScheme.reactantDisplayWidth ?? null,
           productImage: experiment.structuredScheme.productImage ?? "",
           productCdxml: experiment.structuredScheme.productCdxml ?? "",
+          productDisplayWidth: experiment.structuredScheme.productDisplayWidth ?? null,
         }
       : null,
     reagents: experiment.reagents.map((row) => ({

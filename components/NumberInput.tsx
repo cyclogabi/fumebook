@@ -20,6 +20,8 @@ export default function NumberInput({
   ariaLabel,
   readOnly = false,
   className,
+  title,
+  dimmed = false,
 }: {
   value: number | null;
   onCommit: (value: number | null) => void;
@@ -27,6 +29,9 @@ export default function NumberInput({
   readOnly?: boolean;
   /** Replaces the default table-cell styling (include alignment). */
   className?: string;
+  title?: string;
+  /** Shown value comes from a default (the scheme MW) rather than this row. */
+  dimmed?: boolean;
 }) {
   const [draft, setDraft] = useState<string | null>(null);
   const formatted = value === null ? "" : formatNumber(value);
@@ -37,6 +42,7 @@ export default function NumberInput({
       type="text"
       inputMode="decimal"
       aria-label={ariaLabel}
+      title={title}
       value={shown}
       readOnly={readOnly}
       placeholder="–"
@@ -54,7 +60,7 @@ export default function NumberInput({
         const parsed = Number(text.replace(",", "."));
         if (Number.isFinite(parsed)) onCommit(parsed);
       }}
-      className={`${className ?? `${cellInput} text-right`} ${
+      className={`${className ?? `${cellInput} text-right`} ${dimmed ? "text-zinc-400" : ""} ${
         readOnly ? "cursor-default text-zinc-500 hover:border-transparent focus:border-transparent" : ""
       }`}
     />

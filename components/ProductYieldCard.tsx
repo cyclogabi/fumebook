@@ -2,7 +2,8 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import NumberInput, { cellInput } from "@/components/NumberInput";
-import { suggestDistinctLibraryName, useLibrary } from "@/lib/library";
+import { detectFormat, suggestDistinctLibraryName, useLibrary } from "@/lib/library";
+import { extractCanonicalSmilesFailSafe } from "@/components/MoleculeSection";
 import {
   formatMoles,
   formatNumber,
@@ -17,12 +18,14 @@ import {
 import {
   PRODUCT_MASS_UNITS,
   newSecondaryProduct,
+  suggestFractionLabel,
+  type IsolatedFractionRole,
   type ProductInfo,
   type ProductMassUnit,
   type ReagentRow,
   type SecondaryProduct,
 } from "@/lib/types";
-import { GOOD_YIELD_PERCENT, computeYield } from "@/lib/yield";
+import { GOOD_YIELD_PERCENT } from "@/lib/yield";
 
 interface Props {
   experimentId?: string;
@@ -31,10 +34,16 @@ interface Props {
   onChange: (patch: Partial<ProductInfo>) => void;
   secondaryProducts?: SecondaryProduct[];
   onSecondaryChange?: (fn: (current: SecondaryProduct[]) => SecondaryProduct[]) => void;
-  /** Optional primary product CDXML structure from the reaction scheme. */
+  /** Optional primary product CDXML, molfile, or SMILES stored on the reaction scheme. */
   productCdxml?: string;
   /** Optional primary product rendered SVG/PNG image data URL from the reaction scheme. */
   productImage?: string;
+  /** SMILES already extracted for the reaction-scheme product, when one exists. */
+  productSmiles?: string;
+  /** Molecular weight of the drawn reaction-scheme target, g/mol. Not a fraction's MW. */
+  schemeMw?: number | null;
+  /** Write fraction 1 and the other rows together when one of them is linked to the scheme. */
+  onFractionsCommit?: (next: { product: ProductInfo; secondaryProducts: SecondaryProduct[] }) => void;
 }
 
 const MASS_DECIMALS: Record<ProductMassUnit, number> = { mg: 1, g: 4 };
@@ -43,7 +52,7 @@ const OVER_100_WARNING =
   "Total conversion exceeds 100% — check MW, stoichiometry ratio, or residual solvent.";
 
 const ROW_GRID =
-  "grid grid-cols-[minmax(6.5rem,1.3fr)_4.75rem_7.75rem_3.25rem_6.75rem_4.75rem_4.75rem_1.5rem] items-center gap-2";
+  "grid min-w-[880px] grid-cols-[minmax(220px,1.6fr)_4.75rem_7.75rem_3.25rem_6.75rem_4.75rem_4.75rem_1.5rem] items-center gap-2";
 
 function isDefaultPrimaryName(name: string, experimentId: string): boolean {
   const trimmed = name.trim().toUpperCase();
@@ -67,6 +76,7 @@ function isBlankSecondary(
   index: number,
 ): boolean {
   return (
+    p.isolatedRole !== "target" &&
     looseNumber(p.mw) === null &&
     looseNumber(p.mass) === null &&
     looseNumber(p.elutionStartCv) === null &&
@@ -76,10 +86,8 @@ function isBlankSecondary(
 }
 
 /**
- * Compact single-line product & yield rows (screen & print).
- * Defaults to the experiment ID (`GH055`) when there is a single product, and
- * automatically switches to fraction naming (`GH055-F1`, `GH055-F2`, ...) when
- * additional products are added.
+ * Isolated fractions and their yields. Fraction 1 defaults to `<experiment>-F1`.
+ * A row with no molecular weight of its own uses the scheme product MW for yield.
  */
 export default function ProductYieldCard({
   experimentId = "",
@@ -90,15 +98,22 @@ export default function ProductYieldCard({
   onSecondaryChange,
   productCdxml,
   productImage,
+  productSmiles,
+  schemeMw = null,
 }: Props) {
   const {
     compounds: library,
     add: addLibraryCompound,
     update: updateLibraryCompound,
   } = useLibrary();
-  const [savedLibraryFlash, setSavedLibraryFlash] = useState(false);
+  const [savedLibraryName, setSavedLibraryName] = useState<string | null>(null);
+  const [savedRowKey, setSavedRowKey] = useState<string | null>(null);
   const [savePromptOpen, setSavePromptOpen] = useState(false);
+  const [saveRowKey, setSaveRowKey] = useState("primary");
   const [saveName, setSaveName] = useState("");
+  const [saveAliases, setSaveAliases] = useState("");
+  const [saveIupac, setSaveIupac] = useState("");
+  const [saveCas, setSaveCas] = useState("");
   const [saveMwText, setSaveMwText] = useState("");
   const [saveDensityText, setSaveDensityText] = useState("");
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -108,14 +123,11 @@ export default function ProductYieldCard({
   const primaryEndCv = looseNumber(product.elutionEndCv);
   const primaryColor = productColorAt(0);
   const idPrefix = experimentId.trim();
-  const defaultPrimaryName =
-    secondaryProducts.length > 0
-      ? idPrefix
-        ? `${idPrefix}-F1`
-        : "F1"
-      : idPrefix || "F1";
+  const defaultPrimaryName = idPrefix ? `${idPrefix}-F1` : "F1";
+  const linkedSchemeMw = schemeMw !== null && schemeMw > 0 ? schemeMw : null;
 
-  // Seed default experiment ID name once per experiment if loaded with an empty name.
+  // An empty fraction 1 starts as GH055-F1. A name already stored is left alone,
+  // and the scheme-target caption is never copied into this row.
   const seededForId = useRef<string | null>(null);
   useEffect(() => {
     if (!idPrefix || seededForId.current === idPrefix) return;
@@ -125,8 +137,13 @@ export default function ProductYieldCard({
     }
   }, [idPrefix, name, defaultPrimaryName, onChange]);
 
-  const result = computeYield(rows, mw, isolatedMass);
-  const summary = summariseProducts(rows, product, secondaryProducts, idPrefix);
+  const summary = summariseProducts(
+    rows,
+    product,
+    secondaryProducts,
+    idPrefix,
+    linkedSchemeMw,
+  );
   const primaryMetrics = summary.items[0];
   const secondaryMetrics = summary.items.slice(1);
 
@@ -137,6 +154,7 @@ export default function ProductYieldCard({
     isolatedMass !== null ||
     primaryStartCv !== null ||
     primaryEndCv !== null ||
+    product.isolatedRole === "target" ||
     !isDefaultPrimaryName(name, idPrefix);
   const hasFilledAdditional = secondaryProducts.some(
     (p, i) => !isBlankSecondary(p, idPrefix, i),
@@ -145,29 +163,14 @@ export default function ProductYieldCard({
 
   const over100 = summary.conversionPercent !== null && summary.conversionPercent > 100;
 
-  const hint = (() => {
-    if (result.limitingN === null) {
-      return "Mark a reagent as Limiting (with mass or mmol) to calculate yield.";
-    }
-    if (mw === null && isolatedMass !== null) {
-      return "Enter product MW to calculate yield.";
-    }
-    if (result.theoreticalMg !== null) {
-      const shownTheoretical = fromCanonical(result.theoreticalMg / primaryRatio, massUnit);
-      return `Theoretical (${formatNumber(primaryRatio)}:1): ${formatNumber(shownTheoretical)} ${massUnit}`;
-    }
-    return null;
-  })();
+  const hint = linkedSchemeMw
+    ? `MW uses the scheme product (${formatNumber(linkedSchemeMw)} g/mol) until you type a different value on a fraction.`
+    : "Enter a molecular weight on a fraction, or draw the scheme product, to calculate yield.";
 
   const handleAddProduct = () => {
     if (!onSecondaryChange) return;
-    if (secondaryProducts.length === 0 && isDefaultPrimaryName(name, idPrefix)) {
-      onChange({ name: idPrefix ? `${idPrefix}-F1` : "F1" });
-    }
     onSecondaryChange((list) => {
-      const nextLabel = idPrefix
-        ? `${idPrefix}-F${list.length + 2}`
-        : `F${list.length + 2}`;
+      const nextLabel = suggestFractionLabel(idPrefix, [name, ...list.map((item) => item.name)]);
       return [...list, newSecondaryProduct(massUnit, nextLabel)];
     });
   };
@@ -180,26 +183,83 @@ export default function ProductYieldCard({
 
   const removeSecondary = (id: string) => {
     if (!onSecondaryChange) return;
-    if (
-      secondaryProducts.length === 1 &&
-      idPrefix &&
-      name.trim().toUpperCase() === `${idPrefix.toUpperCase()}-F1`
-    ) {
-      onChange({ name: idPrefix });
-    }
     onSecondaryChange((list) => list.filter((item) => item.id !== id));
   };
 
   const displayPrimaryName = name.trim() || defaultPrimaryName;
-  const canSaveProductToLibrary = Boolean(
-    productImage ||
-      productCdxml?.trim() ||
-      (mw !== null && mw > 0) ||
-      secondaryProducts.some((p) => {
-        const m = looseNumber(p.mw);
-        return m !== null && m > 0;
-      }),
-  );
+  const schemeMwTitle = linkedSchemeMw
+    ? `Scheme molecular weight (${formatNumber(linkedSchemeMw)} g/mol). Type a number to override this fraction.`
+    : undefined;
+
+  function secondaryFractionName(item: SecondaryProduct, index: number): string {
+    return item.name.trim() || (idPrefix ? `${idPrefix}-F${index + 2}` : `F${index + 2}`);
+  }
+
+  function saveRowFor(key: string): {
+    key: string;
+    name: string;
+    role: IsolatedFractionRole | undefined;
+    mw: number | null;
+  } | null {
+    if (key === "primary") {
+      return { key, name: displayPrimaryName, role: product.isolatedRole, mw };
+    }
+    const index = secondaryProducts.findIndex((item) => item.id === key);
+    if (index < 0) return null;
+    const item = secondaryProducts[index];
+    return {
+      key,
+      name: secondaryFractionName(item, index),
+      role: item.isolatedRole,
+      mw: looseNumber(item.mw),
+    };
+  }
+
+  function schemeDrawing(): {
+    hasDrawing: boolean;
+    structure?: string;
+    cdxml?: string;
+    image?: string;
+    smiles?: string;
+    source: string;
+  } {
+    const raw = (productCdxml ?? "").trim();
+    const format = raw ? detectFormat(raw) : null;
+    const cdxml = raw && /<CDXML[\s>]/i.test(raw) ? raw : undefined;
+    const molfile = format === "mol" ? raw : "";
+    const smilesFromRaw = format === "smiles" ? raw : "";
+    const smiles = (productSmiles ?? "").trim() || smilesFromRaw;
+    const structure = cdxml || molfile || smiles;
+    const image =
+      productImage && productImage.trim().startsWith("data:image/")
+        ? productImage.trim()
+        : undefined;
+    return {
+      hasDrawing: Boolean(structure || image),
+      structure: structure || undefined,
+      cdxml,
+      image,
+      smiles: smiles || undefined,
+      source: cdxml || molfile || raw,
+    };
+  }
+
+  function inheritsSchemeStructure(role: IsolatedFractionRole | undefined): boolean {
+    if (!schemeDrawing().hasDrawing) return false;
+    if (role === "target") return true;
+    const claimed =
+      product.isolatedRole === "target" ||
+      secondaryProducts.some((item) => item.isolatedRole === "target");
+    return !claimed;
+  }
+
+  function preferredSaveKey(): string {
+    if (product.isolatedRole === "target") return "primary";
+    return secondaryProducts.find((item) => item.isolatedRole === "target")?.id ?? "primary";
+  }
+
+  const openSaveRow = saveRowFor(saveRowKey);
+  const openInheritsScheme = openSaveRow ? inheritsSchemeStructure(openSaveRow.role) : false;
 
   const existingLibraryMatch = useMemo(() => {
     const trimmed = saveName.trim().toLowerCase();
@@ -208,24 +268,59 @@ export default function ProductYieldCard({
   }, [library, saveName]);
 
   const distinctNewName = useMemo(
-    () => suggestDistinctLibraryName(saveName.trim() || displayPrimaryName, library ?? []),
-    [displayPrimaryName, library, saveName],
+    () => suggestDistinctLibraryName(saveName.trim() || openSaveRow?.name || "Compound", library ?? []),
+    [library, openSaveRow?.name, saveName],
   );
 
-  function openSaveToLibraryPrompt() {
-    setSaveError(null);
-    setSaveName(displayPrimaryName);
-    setSaveMwText(mw !== null && mw > 0 ? String(mw) : "");
+  function openSaveToLibraryPrompt(key = preferredSaveKey()) {
+    const row = saveRowFor(key);
+    if (!row) return;
+    setSaveRowKey(row.key);
+    setSaveName(row.name);
+    const inherit = inheritsSchemeStructure(row.role);
+    const suggestedMw =
+      row.role === "target" && linkedSchemeMw
+        ? linkedSchemeMw
+        : row.mw !== null && row.mw > 0
+          ? row.mw
+          : inherit && linkedSchemeMw
+            ? linkedSchemeMw
+            : null;
+    setSaveMwText(suggestedMw !== null ? String(suggestedMw) : "");
     setSaveDensityText("");
+    const existing = (library ?? []).find(
+      (compound) => compound.name.trim().toLowerCase() === row.name.trim().toLowerCase(),
+    );
+    setSaveAliases(existing?.aliases?.join(", ") ?? "");
+    setSaveIupac(existing?.iupacName ?? "");
+    setSaveCas(existing?.casNumber ?? "");
+    const claimed =
+      product.isolatedRole === "target" ||
+      secondaryProducts.some((item) => item.isolatedRole === "target");
+    if (!inherit && !(row.mw !== null && row.mw > 0) && !linkedSchemeMw) {
+      setSaveError(
+        claimed
+          ? `${row.name} is not linked to the scheme and has no molecular weight. Link it, or enter its MW, before saving.`
+          : `Draw the product on the reaction scheme, or enter a molecular weight for ${row.name}, before saving.`,
+      );
+    } else {
+      setSaveError(null);
+    }
     setSavePromptOpen(true);
   }
 
-  function handleSavePrimaryAsNew(targetName: string) {
-    setSaveError(null);
+  function buildFractionLibraryInput(targetName: string):
+    | {
+        ok: true;
+        input: Parameters<typeof addLibraryCompound>[0];
+        source: string;
+      }
+    | { ok: false; error: string } {
+    const trimmedName = targetName.trim();
+    if (!trimmedName) return { ok: false, error: "Give the compound a name." };
     const parsedMw = saveMwText.trim() === "" ? undefined : looseNumber(saveMwText);
     if (saveMwText.trim() !== "" && (parsedMw === null || parsedMw === undefined || parsedMw <= 0)) {
-      setSaveError("Molecular weight must be a positive number.");
-      return;
+      return { ok: false, error: "Molecular weight must be a positive number." };
     }
     const parsedDensity =
       saveDensityText.trim() === "" ? undefined : looseNumber(saveDensityText);
@@ -233,67 +328,95 @@ export default function ProductYieldCard({
       saveDensityText.trim() !== "" &&
       (parsedDensity === null || parsedDensity === undefined || parsedDensity <= 0)
     ) {
-      setSaveError("Density must be a positive number.");
-      return;
+      return { ok: false, error: "Density must be a positive number." };
     }
-    const res = addLibraryCompound({
-      name: targetName.trim(),
-      mw: parsedMw,
-      density: parsedDensity,
-      cdxml: productCdxml?.trim() || undefined,
-      structure: productCdxml?.trim() || undefined,
-      imageDataUrl: productImage,
-    });
-    if (!res.ok) {
-      setSaveError(res.error);
-      return;
+    const row = saveRowFor(saveRowKey);
+    const inherit = row ? inheritsSchemeStructure(row.role) : false;
+    const drawing = inherit ? schemeDrawing() : null;
+    const mwValue =
+      parsedMw ??
+      (row?.role === "target" && linkedSchemeMw ? linkedSchemeMw : undefined) ??
+      (inherit && linkedSchemeMw ? linkedSchemeMw : undefined);
+    if (!drawing?.hasDrawing && mwValue === undefined && !saveCas.trim() && !saveIupac.trim() && !saveAliases.trim()) {
+      return {
+        ok: false,
+        error: row
+          ? `${row.name} has no structure or molecular weight to save. Draw the scheme product, link this fraction, or enter its MW.`
+          : "Draw the product on the reaction scheme, or enter a molecular weight, before saving.",
+      };
     }
-    setSavePromptOpen(false);
-    setSavedLibraryFlash(true);
-    setTimeout(() => setSavedLibraryFlash(false), 3000);
+    return {
+      ok: true,
+      source: drawing?.source ?? "",
+      input: {
+        name: trimmedName,
+        mw: mwValue,
+        density: parsedDensity,
+        structure: drawing?.structure,
+        cdxml: drawing?.cdxml,
+        imageDataUrl: drawing?.image,
+        smiles: drawing?.smiles ?? null,
+        aliases: saveAliases,
+        iupacName: saveIupac,
+        casNumber: saveCas,
+      },
+    };
   }
 
-  function handleUpdateExistingPrimary(existingId: string) {
-    setSaveError(null);
-    const parsedMw = saveMwText.trim() === "" ? undefined : looseNumber(saveMwText);
-    if (saveMwText.trim() !== "" && (parsedMw === null || parsedMw === undefined || parsedMw <= 0)) {
-      setSaveError("Molecular weight must be a positive number.");
-      return;
-    }
-    const parsedDensity =
-      saveDensityText.trim() === "" ? undefined : looseNumber(saveDensityText);
-    if (
-      saveDensityText.trim() !== "" &&
-      (parsedDensity === null || parsedDensity === undefined || parsedDensity <= 0)
-    ) {
-      setSaveError("Density must be a positive number.");
-      return;
-    }
-    const res = updateLibraryCompound(existingId, {
-      name: saveName.trim(),
-      mw: parsedMw,
-      density: parsedDensity,
-      cdxml: productCdxml?.trim() || undefined,
-      structure: productCdxml?.trim() || undefined,
-      imageDataUrl: productImage,
+  function rememberSavedFraction(compoundId: string, compoundName: string, source: string, smiles?: string) {
+    setSavePromptOpen(false);
+    setSavedLibraryName(compoundName);
+    setSavedRowKey(saveRowKey);
+    window.setTimeout(() => {
+      setSavedLibraryName((current) => (current === compoundName ? null : current));
+      setSavedRowKey((current) => (current === saveRowKey ? null : current));
+    }, 3000);
+    const raw = source.trim();
+    if (smiles?.trim() || !raw || detectFormat(raw) === "smiles") return;
+    void extractCanonicalSmilesFailSafe(raw).then((next) => {
+      if (!next) return;
+      updateLibraryCompound(compoundId, { name: compoundName, smiles: next });
     });
+  }
+
+  function handleSaveFractionAsNew(targetName: string) {
+    const built = buildFractionLibraryInput(targetName);
+    if (!built.ok) {
+      setSaveError(built.error);
+      return;
+    }
+    const res = addLibraryCompound(built.input);
     if (!res.ok) {
       setSaveError(res.error);
       return;
     }
-    setSavePromptOpen(false);
-    setSavedLibraryFlash(true);
-    setTimeout(() => setSavedLibraryFlash(false), 3000);
+    setSaveError(null);
+    rememberSavedFraction(res.compound.id, res.compound.name, built.source, res.compound.smiles);
+  }
+
+  function handleUpdateExistingFraction(existingId: string) {
+    const built = buildFractionLibraryInput(saveName);
+    if (!built.ok) {
+      setSaveError(built.error);
+      return;
+    }
+    const res = updateLibraryCompound(existingId, built.input);
+    if (!res.ok) {
+      setSaveError(res.error);
+      return;
+    }
+    setSaveError(null);
+    rememberSavedFraction(res.compound.id, res.compound.name, built.source, res.compound.smiles);
   }
 
   return (
     <section className={`print:break-inside-avoid ${isEmpty ? "print:hidden" : ""}`}>
       <h2 className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-zinc-500 print:mb-1">
-        Isolated product &amp; yield
+        Isolated fractions &amp; yield
       </h2>
 
       {/* Screen: compact single-line horizontal product rows */}
-      <div className="rounded-lg border border-zinc-200 bg-zinc-50/40 px-3 py-2 print:hidden">
+      <div className="overflow-x-auto rounded-lg border border-zinc-200 bg-zinc-50/40 px-3 py-2 print:hidden">
         {/* Column headers */}
         <div className={`mb-1 ${ROW_GRID} text-[10px] font-medium uppercase tracking-wider text-zinc-400`}>
           <span>Product</span>
@@ -319,7 +442,7 @@ export default function ProductYieldCard({
         <div className="divide-y divide-zinc-200/60">
           {/* Primary product row */}
           <div className={`${ROW_GRID} py-1 first:pt-0 last:pb-0`}>
-            <div className="flex min-w-0 items-center gap-1.5">
+            <div className="flex min-w-[220px] items-center gap-1.5">
               <span
                 className="size-2.5 shrink-0 rounded-full"
                 style={{ backgroundColor: primaryColor.hex }}
@@ -330,15 +453,27 @@ export default function ProductYieldCard({
                 type="text"
                 value={name}
                 placeholder={defaultPrimaryName}
-                aria-label="Product name"
-                onChange={(e) => onChange({ name: e.target.value })}
-                className={`${cellInput} text-left font-medium`}
+                aria-label="Fraction 1 name"
+                onChange={(e) => onChange({ name: e.target.value, libraryMatch: undefined })}
+                className={`${cellInput} min-w-[180px] flex-1 text-left font-medium`}
               />
+              <FractionLibraryButton
+                label={displayPrimaryName}
+                saved={savedRowKey === "primary"}
+                onClick={() => openSaveToLibraryPrompt("primary")}
+              />
+              {product.libraryMatch && (
+                <span className="shrink-0 whitespace-nowrap rounded-full bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700 ring-1 ring-emerald-200 print:hidden">
+                  Matched in Library ✓
+                </span>
+              )}
             </div>
 
             <NumberInput
               ariaLabel="Product MW"
-              value={mw}
+              value={mw !== null && mw > 0 ? mw : linkedSchemeMw}
+              dimmed={(mw === null || mw <= 0) && linkedSchemeMw !== null}
+              title={(mw === null || mw <= 0) ? schemeMwTitle : undefined}
               onCommit={(v) => onChange({ mw: v !== null && v > 0 ? v : null })}
             />
 
@@ -396,7 +531,14 @@ export default function ProductYieldCard({
             </div>
 
             <div className="flex justify-end">
-              <YieldBadge percent={primaryMetrics.percent} />
+              <YieldBadge
+                percent={primaryMetrics.percent}
+                title={
+                  (mw === null || mw <= 0) && linkedSchemeMw
+                    ? `Yield uses the scheme MW (${formatNumber(linkedSchemeMw)} g/mol)`
+                    : undefined
+                }
+              />
             </div>
 
             <span aria-hidden className="w-6" />
@@ -410,7 +552,10 @@ export default function ProductYieldCard({
               experimentId={idPrefix}
               product={p}
               metrics={secondaryMetrics[i]}
+              schemeMw={linkedSchemeMw}
               onChange={(patch) => patchSecondary(p.id, patch)}
+              onSaveLibrary={() => openSaveToLibraryPrompt(p.id)}
+              librarySaved={savedRowKey === p.id}
               onRemove={() => removeSecondary(p.id)}
             />
           ))}
@@ -428,28 +573,33 @@ export default function ProductYieldCard({
                 + Add Product
               </button>
             )}
-            {canSaveProductToLibrary && (
-              <button
-                type="button"
-                onClick={() => {
-                  if (savePromptOpen) {
-                    setSavePromptOpen(false);
-                  } else {
-                    openSaveToLibraryPrompt();
-                  }
-                }}
-                className={`inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] font-medium transition-colors ${
-                  savedLibraryFlash
-                    ? "border-emerald-300 bg-emerald-50 text-emerald-700"
-                    : savePromptOpen
-                      ? "border-fume-400 bg-fume-50 text-fume-800"
-                      : "border-zinc-200 bg-white text-zinc-700 hover:border-fume-300 hover:bg-fume-50 hover:text-fume-800"
-                }`}
-                title={`Save ${displayPrimaryName} (MW and structure) to your Personal Compound Library`}
-              >
-                {savedLibraryFlash ? "Saved to Library ✓" : "+ Save to Library"}
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={() => {
+                if (savePromptOpen) {
+                  setSavePromptOpen(false);
+                } else {
+                  openSaveToLibraryPrompt();
+                }
+              }}
+              className={`inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] font-medium transition-colors ${
+                savedLibraryName
+                  ? "border-emerald-300 bg-emerald-50 text-emerald-700"
+                  : savePromptOpen
+                    ? "border-fume-400 bg-fume-50 text-fume-800"
+                    : "border-zinc-200 bg-white text-zinc-700 hover:border-fume-300 hover:bg-fume-50 hover:text-fume-800"
+              }`}
+              title={
+                savedLibraryName
+                  ? `${savedLibraryName} was saved to the Personal Library`
+                  : `Save ${
+                      (savePromptOpen ? openSaveRow?.name : saveRowFor(preferredSaveKey())?.name) ??
+                      displayPrimaryName
+                    } to your Personal Compound Library`
+              }
+            >
+              {savedLibraryName ? `Saved ${savedLibraryName} to Library ✓` : "+ Save to Library"}
+            </button>
             {hint && <span className="text-zinc-400">{hint}</span>}
           </div>
 
@@ -484,7 +634,7 @@ export default function ProductYieldCard({
           <div className="mt-2 rounded-md border border-fume-200 bg-white p-2.5 text-xs shadow-2xs print:hidden">
             <div className="mb-1.5 flex items-center justify-between">
               <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
-                Save Product to Personal Compound Library
+                Save {openSaveRow?.name ?? "fraction"} to Personal Compound Library
               </span>
               <button
                 type="button"
@@ -505,16 +655,16 @@ export default function ProductYieldCard({
                   if (e.key === "Enter") {
                     e.preventDefault();
                     if (existingLibraryMatch) {
-                      handleSavePrimaryAsNew(distinctNewName);
+                      handleSaveFractionAsNew(distinctNewName);
                     } else {
-                      handleSavePrimaryAsNew(saveName);
+                      handleSaveFractionAsNew(saveName);
                     }
                   } else if (e.key === "Escape") {
                     setSavePromptOpen(false);
                   }
                 }}
-                placeholder="Name"
-                aria-label="Product compound name for library"
+                placeholder="Display name / nickname"
+                aria-label="Product display name"
                 autoFocus
                 className="w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 placeholder:text-zinc-400 focus:border-fume-500 focus:outline-none"
               />
@@ -537,6 +687,40 @@ export default function ProductYieldCard({
                 className="w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 placeholder:text-zinc-400 focus:border-fume-500 focus:outline-none"
               />
             </div>
+            <input
+              type="text"
+              value={saveAliases}
+              onChange={(e) => setSaveAliases(e.target.value)}
+              placeholder="Aliases, comma-separated"
+              aria-label="Synonyms and aliases"
+              className="mt-2 w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 placeholder:text-zinc-400 focus:border-fume-500 focus:outline-none"
+            />
+            <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <input
+                type="text"
+                value={saveIupac}
+                onChange={(e) => setSaveIupac(e.target.value)}
+                placeholder="IUPAC / systematic name"
+                aria-label="IUPAC or systematic name"
+                className="w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 placeholder:text-zinc-400 focus:border-fume-500 focus:outline-none"
+              />
+              <input
+                type="text"
+                value={saveCas}
+                onChange={(e) => setSaveCas(e.target.value)}
+                placeholder="CAS number"
+                aria-label="CAS number"
+                spellCheck={false}
+                className="w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 placeholder:text-zinc-400 focus:border-fume-500 focus:outline-none"
+              />
+            </div>
+
+            {openInheritsScheme && !saveError && (
+              <p className="mt-1.5 text-[11px] text-zinc-500">
+                Structure and 2D preview come from the reaction-scheme product.
+                {linkedSchemeMw ? ` Molecular weight ${formatNumber(linkedSchemeMw)} g/mol.` : ""}
+              </p>
+            )}
 
             {saveError && (
               <p role="alert" className="mt-1.5 text-[11px] text-red-600">
@@ -553,14 +737,14 @@ export default function ProductYieldCard({
                 <div className="flex flex-wrap items-center gap-1.5">
                   <button
                     type="button"
-                    onClick={() => handleSavePrimaryAsNew(distinctNewName)}
+                    onClick={() => handleSaveFractionAsNew(distinctNewName)}
                     className="rounded bg-fume-600 px-2.5 py-0.5 text-[11px] font-semibold text-white hover:bg-fume-700"
                   >
                     Save as &ldquo;{distinctNewName}&rdquo;
                   </button>
                   <button
                     type="button"
-                    onClick={() => handleUpdateExistingPrimary(existingLibraryMatch.id)}
+                    onClick={() => handleUpdateExistingFraction(existingLibraryMatch.id)}
                     className="rounded border border-amber-300 bg-white px-2.5 py-0.5 text-[11px] font-medium text-amber-900 hover:bg-amber-100"
                   >
                     Update existing
@@ -578,7 +762,7 @@ export default function ProductYieldCard({
                 </button>
                 <button
                   type="button"
-                  onClick={() => handleSavePrimaryAsNew(saveName)}
+                  onClick={() => handleSaveFractionAsNew(saveName)}
                   className="rounded bg-fume-600 px-3 py-0.5 text-[11px] font-semibold text-white hover:bg-fume-700"
                 >
                   Save to Library
@@ -605,7 +789,7 @@ export default function ProductYieldCard({
             <PrintProductLine
               name={displayPrimaryName}
               colorHex={primaryColor.hex}
-              mw={mw}
+              mw={mw !== null && mw > 0 ? mw : linkedSchemeMw}
               massValue={shownMass}
               massUnit={massUnit}
               elutionStartCv={primaryStartCv}
@@ -616,7 +800,12 @@ export default function ProductYieldCard({
           {secondaryProducts.map((p, i) => {
             if (isBlankSecondary(p, idPrefix, i)) return null;
             const metrics = secondaryMetrics[i];
-            const fallback = idPrefix ? `${idPrefix}-F${i + 2}` : `F${i + 2}`;
+            const fallback =
+              p.name.trim() ||
+              suggestFractionLabel(idPrefix, [
+                name,
+                ...secondaryProducts.slice(0, i).map((item) => item.name),
+              ]);
             const unit: ProductMassUnit = p.massUnit ?? "mg";
             const color = productColorAt(i + 1);
             return (
@@ -624,7 +813,7 @@ export default function ProductYieldCard({
                 key={p.id}
                 name={p.name.trim() || fallback}
                 colorHex={color.hex}
-                mw={looseNumber(p.mw)}
+                mw={looseNumber(p.mw) ?? linkedSchemeMw}
                 massValue={looseNumber(p.mass)}
                 massUnit={unit}
                 elutionStartCv={looseNumber(p.elutionStartCv)}
@@ -789,11 +978,12 @@ function UnitToggle({
   );
 }
 
-function YieldBadge({ percent }: { percent: number | null }) {
+function YieldBadge({ percent, title }: { percent: number | null; title?: string }) {
   const high = percent !== null && percent > GOOD_YIELD_PERCENT;
   return (
     <div
       aria-label="Percentage yield"
+      title={title}
       className={`shrink-0 rounded-full border px-2.5 py-0.5 text-right text-xs font-bold tabular-nums transition-colors print:px-2 print:py-0.5 print:text-xs ${
         percent === null
           ? "border-zinc-200 bg-white text-zinc-400"
@@ -807,22 +997,74 @@ function YieldBadge({ percent }: { percent: number | null }) {
   );
 }
 
+function FractionLibraryButton({
+  label,
+  saved,
+  onClick,
+}: {
+  label: string;
+  saved: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={saved ? `${label} saved to the Personal Library` : `Save ${label} to the Personal Library`}
+      aria-label={saved ? `${label} saved to Library` : `Save ${label} to Library`}
+      className={`grid size-6 shrink-0 place-items-center rounded print:hidden ${
+        saved
+          ? "bg-emerald-50 text-emerald-700"
+          : "text-zinc-400 hover:bg-fume-50 hover:text-fume-700"
+      }`}
+    >
+      {saved ? (
+        <span className="text-[10px] font-semibold" aria-hidden>
+          ✓
+        </span>
+      ) : (
+        <svg
+          viewBox="0 0 16 16"
+          className="size-3.5"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.6"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden
+        >
+          <path d="M4 2.5h8a1 1 0 0 1 1 1v10l-5-3-5 3v-10a1 1 0 0 1 1-1Z" />
+          <path d="M8 5v4M6 7h4" />
+        </svg>
+      )}
+    </button>
+  );
+}
+
 function SecondaryProductRow({
   index,
   experimentId,
   product,
   metrics,
+  schemeMw,
   onChange,
+  onSaveLibrary,
+  librarySaved = false,
   onRemove,
 }: {
   index: number;
   experimentId: string;
   product: SecondaryProduct;
   metrics?: ProductMetrics;
+  schemeMw: number | null;
   onChange: (patch: Partial<SecondaryProduct>) => void;
+  onSaveLibrary: () => void;
+  librarySaved?: boolean;
   onRemove: () => void;
 }) {
-  const label = experimentId ? `${experimentId}-F${index + 2}` : `F${index + 2}`;
+  const label =
+    product.name.trim() ||
+    (experimentId ? `${experimentId}-F${index + 2}` : `F${index + 2}`);
   const mwNum = looseNumber(product.mw);
   const massNum = looseNumber(product.mass);
   const ratioNum = looseNumber(product.stoichRatio);
@@ -847,7 +1089,7 @@ function SecondaryProductRow({
 
   return (
     <div className={`${ROW_GRID} py-1 first:pt-0 last:pb-0`}>
-      <div className="flex min-w-0 items-center gap-1.5">
+      <div className="flex min-w-[220px] items-center gap-1.5">
         <span
           className="size-2.5 shrink-0 rounded-full"
           style={{ backgroundColor: color.hex }}
@@ -858,15 +1100,22 @@ function SecondaryProductRow({
           type="text"
           value={product.name}
           placeholder={label}
-          aria-label={`${label} name`}
+          aria-label={`${label} fraction id`}
           onChange={(e) => onChange({ name: e.target.value })}
-          className={`${cellInput} text-left font-medium`}
+          className={`${cellInput} min-w-[180px] flex-1 text-left font-medium`}
         />
+        <FractionLibraryButton label={label} saved={librarySaved} onClick={onSaveLibrary} />
       </div>
 
       <NumberInput
         ariaLabel={`${label} MW`}
-        value={mwNum}
+        value={mwNum !== null && mwNum > 0 ? mwNum : schemeMw}
+        dimmed={(mwNum === null || mwNum <= 0) && schemeMw !== null}
+        title={
+          (mwNum === null || mwNum <= 0) && schemeMw
+            ? `Scheme molecular weight (${formatNumber(schemeMw)} g/mol). Type a number to override this fraction.`
+            : undefined
+        }
         onCommit={(v) => onChange({ mw: v !== null && v > 0 ? v : "" })}
       />
 
@@ -915,7 +1164,14 @@ function SecondaryProductRow({
       </div>
 
       <div className="flex justify-end">
-        <YieldBadge percent={metrics?.percent ?? null} />
+        <YieldBadge
+          percent={metrics?.percent ?? null}
+          title={
+            (mwNum === null || mwNum <= 0) && schemeMw
+              ? `Yield uses the scheme MW (${formatNumber(schemeMw)} g/mol)`
+              : undefined
+          }
+        />
       </div>
 
       <button

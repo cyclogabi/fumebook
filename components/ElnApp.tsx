@@ -7,8 +7,9 @@ import ExperimentEditor from "./ExperimentEditor";
 import ImportConflictModal from "./ImportConflictModal";
 import LibraryModal, { type LibraryDraft } from "./LibraryModal";
 import OnboardingModal from "./OnboardingModal";
+import { LabTimerEngine } from "./LabWidgetsBar";
 import ParseProtocolModal from "./ParseProtocolModal";
-import Sidebar from "./Sidebar";
+import Sidebar, { SidebarToggleButton } from "./Sidebar";
 import Toast, { type ToastMessage } from "./Toast";
 import {
   backupFilename,
@@ -25,14 +26,17 @@ import {
   type ValidBackup,
 } from "@/lib/backup";
 import { installClipboardBridge } from "@/lib/clipboard";
+import { probeLocalAi } from "@/lib/localAi";
 import { pickJsonFile, saveJsonFile, saveJsonToBackupsFolder } from "@/lib/fileDialogs";
-import { mergeLibraryCompounds } from "@/lib/library";
+import { getLibraryCompounds, mergeLibraryCompounds } from "@/lib/library";
+import { applyParsedLibrary } from "@/lib/libraryMatch";
 import { toReagentRows } from "@/lib/protocol";
 import type { ParsedProtocol } from "@/lib/protocolSchema";
 import { readInitials, saveProfile, useSavedInitials, useSavedStartNumber } from "@/lib/initials";
-import { useExperiments } from "@/lib/storage";
-import { ID_PREFIX, nextExperimentId, type Experiment } from "@/lib/types";
+import { flushPendingSaves, useExperiments } from "@/lib/storage";
+import { ID_PREFIX, nextExperimentId, type Experiment, type StructuredReactionScheme } from "@/lib/types";
 
+const SIDEBAR_KEY = "fumebook_sidebar_collapsed_v1";
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 const messageOf = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -63,6 +67,8 @@ export default function ElnApp() {
   const { experiments, storageError, create, update, remove, replaceAll } = useExperiments();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [wideScreen, setWideScreen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [parseOpen, setParseOpen] = useState(false);
   const [libraryOpen, setLibraryOpen] = useState(false);
@@ -77,12 +83,69 @@ export default function ElnApp() {
   const busyRef = useRef(false);
 
   const initials = useSavedInitials();
+
+  useEffect(() => {
+    setSidebarCollapsed(localStorage.getItem(SIDEBAR_KEY) === "1");
+    const media = window.matchMedia("(min-width: 1024px)");
+    const apply = () => setWideScreen(media.matches);
+    apply();
+    media.addEventListener("change", apply);
+    return () => media.removeEventListener("change", apply);
+  }, []);
+
+  const sidebarExpanded = wideScreen ? !sidebarCollapsed : drawerOpen;
+
+  const toggleSidebar = useCallback(() => {
+    if (window.matchMedia("(min-width: 1024px)").matches) {
+      setSidebarCollapsed((collapsed) => {
+        const next = !collapsed;
+        localStorage.setItem(SIDEBAR_KEY, next ? "1" : "0");
+        return next;
+      });
+      return;
+    }
+    setDrawerOpen((open) => !open);
+  }, []);
+
+  useEffect(() => {
+    function onKey(event: KeyboardEvent) {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
+      const key = event.key.toLowerCase();
+      // Cmd+S / Ctrl+S: the notebook is already autosaved. Stop WebKit's "Save Page" dialog
+      // and write anything still waiting on the short persist timer.
+      if (key === "s" || event.code === "KeyS") {
+        event.preventDefault();
+        void flushPendingSaves().catch(() => {});
+        return;
+      }
+      // Cmd+P / Ctrl+P: the system print sheet (Save as PDF on macOS).
+      if (!event.shiftKey && (key === "p" || event.code === "KeyP")) {
+        event.preventDefault();
+        window.print();
+        return;
+      }
+      if (event.shiftKey) return;
+      const toggle = key === "b" || key === "\\" || event.code === "Backslash";
+      if (!toggle) return;
+      const target = event.target;
+      if (target instanceof Element && target.closest("dialog, [role='dialog']")) return;
+      event.preventDefault();
+      toggleSidebar();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [toggleSidebar]);
   const startNumber = useSavedStartNumber();
   const needsInitials = initials === "";
 
   // Desktop: send every navigator.clipboard call (Ketcher paste, NMRium copy) through Tauri.
   useEffect(() => {
     installClipboardBridge();
+  }, []);
+
+  // A standalone Mac install often has no local Python helper. The probe must not reject.
+  useEffect(() => {
+    probeLocalAi();
   }, []);
 
   const loaded = experiments !== null;
@@ -370,20 +433,117 @@ export default function ElnApp() {
     select(created.id);
   }
 
-  function handleParsed(parsed: ParsedProtocol, sourceText: string) {
+  /** The scheme pills store Ar, N₂, and Air. Models usually write N2. */
+  function notebookAtmosphere(value: string | null | undefined): string | undefined {
+    const raw = value?.trim();
+    if (!raw) return undefined;
+    const key = raw.toLowerCase().replace(/₂/g, "2").replace(/[^a-z0-9]/g, "");
+    if (key === "ar" || key === "argon") return "Ar";
+    if (key === "n2" || key === "nitrogen" || key === "dinitrogen") return "N₂";
+    if (key === "air") return "Air";
+    return raw;
+  }
+
+  async function handleParsed(parsed: ParsedProtocol, sourceText: string) {
     const reagents = toReagentRows(parsed);
     if (reagents.length === 0) {
       notify("error", "No usable reagents were found in that text.");
       return;
     }
     const created = create();
-    // Keep the source text in the Procedure so the extracted values can be checked against it.
-    update(created.id, { reagents, procedureText: sourceText });
+    const linked = applyParsedLibrary(reagents, parsed.productName, getLibraryCompounds());
+    const modelProcedure = parsed.procedure?.trim() ?? "";
+    const pasted = sourceText.trim();
+    const procedureText = modelProcedure || pasted;
+    const title = parsed.title?.trim() ?? "";
+    const characterization = parsed.characterization?.trim() ?? "";
+    const scheme: StructuredReactionScheme = { ...linked.scheme };
+    const solvent = parsed.solvent?.trim();
+    const temperature = parsed.temperature?.trim();
+    const duration = parsed.time?.trim();
+    const atmosphere = notebookAtmosphere(parsed.atmosphere);
+    if (solvent) scheme.solvent = solvent;
+    if (temperature) scheme.temperature = temperature;
+    if (duration) scheme.duration = duration;
+    if (atmosphere) scheme.atmosphere = atmosphere;
+
+    let reactantSmiles = linked.reactantSmiles;
+    let productSmiles = linked.productSmiles;
+    const nextReagents = linked.reagents.map((row) => ({ ...row }));
+    let drawnFromPubChem = 0;
+    try {
+      const { drawFromNameOrSmiles, renderStructureToVectorSvg } = await import("@/components/MoleculeSection");
+      const paintSaved = async (structure: string | undefined) => {
+        const saved = structure?.trim();
+        if (!saved) return null;
+        try {
+          const rendered = await renderStructureToVectorSvg(saved);
+          return rendered.svgDataUrl;
+        } catch {
+          return null;
+        }
+      };
+      const limiting =
+        nextReagents.find((row) => row.role === "Limiting") ??
+        nextReagents.find((row) => row.role !== "Solvent");
+      if (limiting && !scheme.reactantImage) {
+        const painted = await paintSaved(scheme.reactantCdxml);
+        if (painted) {
+          scheme.reactantImage = painted;
+        } else if (!scheme.reactantCdxml) {
+          const drawn = await drawFromNameOrSmiles(limiting.smiles?.trim() || limiting.name);
+          if (drawn) {
+            scheme.reactantImage = drawn.imageDataUrl;
+            if (drawn.structureText) scheme.reactantCdxml = drawn.structureText;
+            reactantSmiles = drawn.smiles;
+            limiting.smiles = drawn.smiles;
+            if ((limiting.mw === null || limiting.mw <= 0) && drawn.mw) limiting.mw = drawn.mw;
+            drawnFromPubChem += 1;
+          }
+        }
+      }
+      const productName = (scheme.productLabel || parsed.productName || "").trim();
+      if (productName && !scheme.productLabel) scheme.productLabel = productName;
+      if (productName && !scheme.productImage) {
+        const painted = await paintSaved(scheme.productCdxml);
+        if (painted) {
+          scheme.productImage = painted;
+        } else if (!scheme.productCdxml) {
+          const drawn = await drawFromNameOrSmiles(productSmiles?.trim() || productName);
+          if (drawn) {
+            scheme.productImage = drawn.imageDataUrl;
+            if (drawn.structureText) scheme.productCdxml = drawn.structureText;
+            productSmiles = drawn.smiles;
+            if (
+              (scheme.productMw === undefined || scheme.productMw === null || scheme.productMw <= 0) &&
+              drawn.mw
+            ) {
+              scheme.productMw = drawn.mw;
+            }
+            drawnFromPubChem += 1;
+          }
+        }
+      }
+    } catch (err) {
+      console.warn("Structure drawing after parse failed:", err);
+    }
+
+    update(created.id, {
+      reagents: nextReagents,
+      procedureText,
+      ...(title ? { title } : {}),
+      ...(characterization ? { commentsText: characterization } : {}),
+      ...(reactantSmiles ? { reactantSmiles } : {}),
+      ...(productSmiles ? { productSmiles } : {}),
+      ...(Object.keys(scheme).length > 0 ? { structuredScheme: scheme } : {}),
+    });
     setParseOpen(false);
     select(created.id);
+    const matched = linked.matchCount > 0 ? ` ${linked.matchCount} matched the Personal Library.` : "";
+    const drawn = drawnFromPubChem > 0 ? " Structures were drawn from PubChem." : "";
     notify(
       "success",
-      `Created ${created.id} with ${plural(reagents.length, "reagent")}. Please check the values.`,
+      `Created ${created.id} with ${plural(nextReagents.length, "reagent")}.${matched}${drawn} Please check the values.`,
     );
   }
 
@@ -404,16 +564,7 @@ export default function ElnApp() {
       >
         {/* Header */}
         <header className="sticky top-0 z-40 flex h-14 shrink-0 items-center gap-3 border-b border-zinc-200 bg-white px-4 print:hidden">
-          <button
-            type="button"
-            onClick={() => setDrawerOpen((o) => !o)}
-            aria-label="Toggle experiment list"
-            className="rounded-md p-1.5 text-zinc-600 hover:bg-zinc-100 lg:hidden"
-          >
-            <svg viewBox="0 0 20 20" className="size-5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
-              <path d="M3 5h14M3 10h14M3 15h14" />
-            </svg>
-          </button>
+          <SidebarToggleButton expanded={sidebarExpanded} onClick={toggleSidebar} />
 
           <button
             type="button"
@@ -447,7 +598,7 @@ export default function ElnApp() {
               onClick={() => setParseOpen(true)}
               disabled={!loaded}
               title="Paste experimental text from a paper and fill in the reagents automatically"
-              className="rounded-md border border-zinc-300 bg-white px-3.5 py-1.5 text-sm font-medium text-zinc-700 shadow-sm transition-colors hover:bg-zinc-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-fume-500 disabled:opacity-50"
+              className="shrink-0 whitespace-nowrap rounded-md border border-zinc-300 bg-white px-3.5 py-1.5 text-sm font-medium text-zinc-700 shadow-sm transition-colors hover:bg-zinc-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-fume-500 disabled:opacity-50"
             >
               ✨ Parse Protocol
             </button>
@@ -455,7 +606,7 @@ export default function ElnApp() {
               type="button"
               onClick={handleNew}
               disabled={!loaded}
-              className="flex items-center justify-center gap-2 rounded-md bg-fume-600 px-3.5 py-1.5 text-sm font-medium text-white shadow-sm hover:bg-fume-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-fume-500 disabled:opacity-50"
+              className="flex shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-md bg-fume-600 px-3.5 py-1.5 text-sm font-medium text-white shadow-sm hover:bg-fume-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-fume-500 disabled:opacity-50"
             >
               + New Experiment
             </button>
@@ -474,8 +625,10 @@ export default function ElnApp() {
               experiments={experiments}
               selectedId={selected?.id ?? null}
               open={drawerOpen}
+              collapsed={sidebarCollapsed}
               onSelect={select}
               onClose={() => setDrawerOpen(false)}
+              onNew={handleNew}
               onExportBackup={handleExportAll}
               onImportBackup={openImport}
               onImportExperiment={handleImportExperiment}
@@ -484,11 +637,10 @@ export default function ElnApp() {
           )}
 
           <main className="min-w-0 flex-1 px-4 py-6 sm:px-8 sm:py-8 print:p-0">
+            {loaded && <LabTimerEngine />}
             {!loaded ? (
               <p className="text-sm text-zinc-400">Loading notebook…</p>
             ) : selected ? (
-              // key: reset editor-local state (focus, drafts) when switching experiments, and
-              // reload pictures / NMR / scheme after an import changed them on disk
               <ExperimentEditor
                 key={`${selected.id}:${importEpoch}`}
                 experiment={selected}
@@ -496,6 +648,8 @@ export default function ElnApp() {
                 onDelete={handleDelete}
                 onExport={handleExportOne}
                 onOpenLibrary={openLibrary}
+                sidebarExpanded={sidebarExpanded}
+                onToggleSidebar={toggleSidebar}
               />
             ) : (
               <Dashboard

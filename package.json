@@ -16,7 +16,7 @@
     "@zakodium/nmrium-core-plugins": "^0.7.110",
     "ketcher-react": "^3.18.0",
     "ketcher-standalone": "^3.18.0",
-    "next": "16.4.0",
+    "next": "^16.4.3",
     "nmrium": "^3.1.0",
     "react": "19.3.0",
     "react-dom": "19.3.0",
@@ -30,8 +30,11 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
-    "eslint-config-next": "16.4.0",
+    "eslint-config-next": "^16.4.3",
     "tailwindcss": "^4",
     "typescript": "^5"
+  },
+  "allowScripts": {
+    "sharp@0.35.5": true
   }
 }

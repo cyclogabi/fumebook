@@ -8,6 +8,7 @@ import {
 } from "@/components/MoleculeSection";
 import { imageFileToPng } from "@/lib/images";
 import {
+  compoundMatchesQuery,
   describeProperties,
   detectFormat,
   structureFromFile,
@@ -108,6 +109,9 @@ function LibraryDialog({
       : "",
   );
   const [notes, setNotes] = useState("");
+  const [aliases, setAliases] = useState("");
+  const [iupacName, setIupacName] = useState("");
+  const [casNumber, setCasNumber] = useState("");
   const [addBusy, setAddBusy] = useState(false);
   const [addDragging, setAddDragging] = useState(false);
   const [savedBanner, setSavedBanner] = useState<string | null>(null);
@@ -122,6 +126,9 @@ function LibraryDialog({
   const [editMwText, setEditMwText] = useState("");
   const [editDensityText, setEditDensityText] = useState("");
   const [editNotes, setEditNotes] = useState("");
+  const [editAliases, setEditAliases] = useState("");
+  const [editIupac, setEditIupac] = useState("");
+  const [editCas, setEditCas] = useState("");
   const [editStructure, setEditStructure] = useState("");
   const [editCdxml, setEditCdxml] = useState<string | undefined>(undefined);
   const [editImageDataUrl, setEditImageDataUrl] = useState<string | undefined>(undefined);
@@ -153,6 +160,9 @@ function LibraryDialog({
     if (existing.cdxml) setAddCdxml(existing.cdxml);
     if (existing.imageDataUrl) setAddImageDataUrl(existing.imageDataUrl);
     if (existing.notes) setNotes(existing.notes);
+    setAliases(existing.aliases?.join(", ") ?? "");
+    setIupacName(existing.iupacName ?? "");
+    setCasNumber(existing.casNumber ?? "");
     if (!mwText && existing.mw !== undefined) setMwText(String(existing.mw));
     if (!densityText && existing.density !== undefined) setDensityText(String(existing.density));
   }, [compounds, densityText, initialDraft, mwText]);
@@ -197,9 +207,7 @@ function LibraryDialog({
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!compounds) return [];
-    return q
-      ? compounds.filter((c) => c.name.toLowerCase().includes(q) || c.notes.toLowerCase().includes(q))
-      : compounds;
+    return q ? compounds.filter((c) => compoundMatchesQuery(c, q)) : compounds;
   }, [compounds, query]);
 
   const detected = structure.trim() ? detectFormat(structure, fileName) : null;
@@ -211,6 +219,9 @@ function LibraryDialog({
     setEditMwText(c.mw !== undefined ? String(c.mw) : "");
     setEditDensityText(c.density !== undefined ? String(c.density) : "");
     setEditNotes(c.notes ?? "");
+    setEditAliases(c.aliases?.join(", ") ?? "");
+    setEditIupac(c.iupacName ?? "");
+    setEditCas(c.casNumber ?? "");
     setEditStructure(c.structure ?? c.cdxml ?? "");
     setEditCdxml(c.cdxml);
     setEditImageDataUrl(c.imageDataUrl);
@@ -330,6 +341,9 @@ function LibraryDialog({
         mw: nextMw ?? null,
         density: density ?? null,
         notes: editNotes,
+        aliases: editAliases,
+        iupacName: editIupac,
+        casNumber: editCas,
         structure: editClearStructure ? "" : trimmedStruct,
         cdxml: editClearStructure ? undefined : nextCdxml,
         imageDataUrl: editClearStructure ? undefined : nextImage,
@@ -378,6 +392,9 @@ function LibraryDialog({
       cdxml: nextCdxml,
       imageDataUrl: nextImage,
       notes,
+      aliases,
+      iupacName,
+      casNumber,
       mw: nextMw,
       density,
       fileName,
@@ -397,6 +414,9 @@ function LibraryDialog({
     setMwText("");
     setDensityText("");
     setNotes("");
+    setAliases("");
+    setIupacName("");
+    setCasNumber("");
   }
 
   async function handlePasteStructureForAdd() {
@@ -523,8 +543,30 @@ function LibraryDialog({
               setName(e.target.value);
               setSavedBanner(null);
             }}
-            placeholder="Name"
-            aria-label="Compound name"
+            placeholder="Display name / nickname, e.g. α-CD"
+            aria-label="Display name or nickname"
+            className="w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm placeholder:text-zinc-400 focus:border-fume-500 focus:outline-none"
+          />
+          <input
+            value={aliases}
+            onChange={(e) => setAliases(e.target.value)}
+            placeholder="Synonyms / aliases, comma-separated"
+            aria-label="Synonyms and aliases"
+            className="w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm placeholder:text-zinc-400 focus:border-fume-500 focus:outline-none"
+          />
+          <input
+            value={iupacName}
+            onChange={(e) => setIupacName(e.target.value)}
+            placeholder="IUPAC / systematic name"
+            aria-label="IUPAC or systematic name"
+            className="w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm placeholder:text-zinc-400 focus:border-fume-500 focus:outline-none"
+          />
+          <input
+            value={casNumber}
+            onChange={(e) => setCasNumber(e.target.value)}
+            placeholder="CAS number, e.g. 10016-20-3"
+            aria-label="CAS number"
+            spellCheck={false}
             className="w-full rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm placeholder:text-zinc-400 focus:border-fume-500 focus:outline-none"
           />
 
@@ -583,7 +625,7 @@ function LibraryDialog({
                 <p className="text-xs font-medium text-zinc-700">
                   {addBusy
                     ? "Reading structure from clipboard…"
-                    : "Click here and press Ctrl+V to paste structure from ChemDraw"}
+                    : "Click here and press Ctrl+V or Cmd+V to paste structure from ChemDraw"}
                 </p>
                 <p className="text-[11px] text-zinc-400">
                   Captures editable CDXML + crisp structure image, or drop a .cdxml / .mol / image file
@@ -618,7 +660,7 @@ function LibraryDialog({
               disabled={addBusy}
               className="rounded-md border border-fume-300 bg-white px-2.5 py-1 font-medium text-fume-800 hover:bg-fume-50 disabled:opacity-50"
             >
-              {addBusy ? "Pasting…" : "Paste from ChemDraw (Ctrl+V)"}
+              {addBusy ? "Pasting…" : "Paste from ChemDraw (Ctrl+V or Cmd+V)"}
             </button>
             <button
               type="button"
@@ -684,8 +726,8 @@ function LibraryDialog({
               type="search"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search…"
-              aria-label="Search the library"
+              placeholder="Name, alias, IUPAC, CAS"
+              aria-label="Search the library by name, alias, IUPAC, or CAS"
               className="w-44 rounded-md border border-zinc-200 bg-zinc-50 px-2.5 py-1 text-sm placeholder:text-zinc-400 focus:border-fume-500 focus:bg-white focus:outline-none"
             />
           </div>
@@ -719,12 +761,13 @@ function LibraryDialog({
 
                       <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
                         <label className="block text-xs text-zinc-600 sm:col-span-1">
-                          Name
+                          Display name / nickname
                           <input
                             type="text"
                             value={editName}
                             onChange={(e) => setEditName(e.target.value)}
-                            aria-label="Edit compound name"
+                            aria-label="Edit display name"
+                            placeholder="α-CD"
                             className="mt-0.5 w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 focus:border-fume-500 focus:outline-none"
                           />
                         </label>
@@ -749,6 +792,43 @@ function LibraryDialog({
                             onChange={(e) => setEditDensityText(e.target.value)}
                             placeholder="Density (g/mL)"
                             aria-label="Edit density (g/mL)"
+                            className="mt-0.5 w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 focus:border-fume-500 focus:outline-none"
+                          />
+                        </label>
+                      </div>
+
+                      <label className="block text-xs text-zinc-600">
+                        Synonyms / aliases
+                        <input
+                          type="text"
+                          value={editAliases}
+                          onChange={(e) => setEditAliases(e.target.value)}
+                          placeholder="alpha-cyclodextrin, a-CD, cyclohexaamylose"
+                          aria-label="Edit synonyms and aliases"
+                          className="mt-0.5 w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 focus:border-fume-500 focus:outline-none"
+                        />
+                      </label>
+                      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                        <label className="block text-xs text-zinc-600">
+                          IUPAC / systematic name
+                          <input
+                            type="text"
+                            value={editIupac}
+                            onChange={(e) => setEditIupac(e.target.value)}
+                            placeholder="Cyclohexaamylose"
+                            aria-label="Edit IUPAC name"
+                            className="mt-0.5 w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 focus:border-fume-500 focus:outline-none"
+                          />
+                        </label>
+                        <label className="block text-xs text-zinc-600">
+                          CAS number
+                          <input
+                            type="text"
+                            value={editCas}
+                            onChange={(e) => setEditCas(e.target.value)}
+                            placeholder="10016-20-3"
+                            aria-label="Edit CAS number"
+                            spellCheck={false}
                             className="mt-0.5 w-full rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 focus:border-fume-500 focus:outline-none"
                           />
                         </label>
@@ -900,6 +980,15 @@ function LibraryDialog({
                             {c.structure && (
                               <span className="shrink-0 rounded bg-zinc-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
                                 {FORMAT_LABELS[c.format]}
+                              </span>
+                            )}
+                            {(c.casNumber || (c.aliases && c.aliases.length > 0)) && (
+                              <span className="shrink-0 rounded bg-zinc-50 px-1.5 py-0.5 text-[10px] font-medium text-zinc-500 ring-1 ring-zinc-200">
+                                {c.casNumber ? `CAS ${c.casNumber}` : ""}
+                                {c.casNumber && c.aliases && c.aliases.length > 0 ? " · " : ""}
+                                {c.aliases && c.aliases.length > 0
+                                  ? `${c.aliases.length} ${c.aliases.length === 1 ? "alias" : "aliases"}`
+                                  : ""}
                               </span>
                             )}
                           </span>

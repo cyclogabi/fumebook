@@ -694,6 +694,8 @@ export default function ReactionCanvas({ value, onChange, fileName, toolbar, exp
           <img
             src={previewUrl}
             alt="Reaction scheme"
+            loading="eager"
+            decoding="sync"
             className="mx-auto block max-h-36 max-w-full object-contain print:mx-auto print:max-h-36"
           />
         </div>

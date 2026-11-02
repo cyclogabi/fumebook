@@ -9,6 +9,51 @@ interface Props {
   onRemove: (index: number) => void;
 }
 
+function readBlobAsDataUrl(file: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result;
+      if (typeof result === "string" && result.startsWith("data:image/")) resolve(result);
+      else reject(new Error("The file is not an image."));
+    };
+    reader.onerror = () => reject(reader.error ?? new Error("Could not read the image."));
+    reader.readAsDataURL(file);
+  });
+}
+
+/** Store a real image URL. A failed downscale keeps the original data URL instead of a blank card. */
+async function imageFileToStoredUrl(file: File): Promise<string> {
+  const raw = await readBlobAsDataUrl(file);
+  if (raw.length < 1_500_000) return raw;
+  try {
+    const scaled = await fileToDataUrl(file);
+    if (scaled.startsWith("data:image/")) return scaled;
+  } catch {
+    // The original data URL still shows the plate.
+  }
+  return raw;
+}
+
+function imageFilesFromList(files: File[]): File[] {
+  return files.filter(
+    (file) => file.type.startsWith("image/") || /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(file.name),
+  );
+}
+
+function imageFilesFromClipboard(data: DataTransfer | null): File[] {
+  if (!data) return [];
+  const fromFiles = imageFilesFromList(Array.from(data.files));
+  if (fromFiles.length > 0) return fromFiles;
+  const fromItems: File[] = [];
+  for (const item of Array.from(data.items)) {
+    if (!item.type || item.type.indexOf("image") === -1) continue;
+    const file = item.getAsFile();
+    if (file) fromItems.push(file);
+  }
+  return fromItems;
+}
+
 /**
  * TLC plates: drop, paste (Ctrl+V anywhere on the page) or browse for images.
  * Plates are shown side by side as vertical 2:3 cards.
@@ -20,15 +65,17 @@ export default function TlcDropzone({ images, onAdd, onRemove }: Props) {
   const [error, setError] = useState<string | null>(null);
 
   async function addFiles(files: File[]) {
-    const imageFiles = files.filter((f) => f.type.startsWith("image/"));
+    const imageFiles = imageFilesFromList(files);
     if (imageFiles.length === 0) {
       if (files.length > 0) setError("Only image files can be added.");
       return;
     }
     setBusy(true);
     setError(null);
-    const results = await Promise.allSettled(imageFiles.map(fileToDataUrl));
-    const ok = results.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
+    const results = await Promise.allSettled(imageFiles.map(imageFileToStoredUrl));
+    const ok = results.flatMap((result) =>
+      result.status === "fulfilled" && result.value.startsWith("data:image/") ? [result.value] : [],
+    );
     if (ok.length > 0) onAdd(ok);
     if (ok.length < imageFiles.length) {
       setError(`${imageFiles.length - ok.length} image(s) could not be read (unsupported format?).`);
@@ -40,9 +87,7 @@ export default function TlcDropzone({ images, onAdd, onRemove }: Props) {
   useEffect(() => {
     function onPaste(e: ClipboardEvent) {
       if (e.defaultPrevented) return; // the molecule picture box already took it
-      const files = Array.from(e.clipboardData?.files ?? []).filter((f) =>
-        f.type.startsWith("image/"),
-      );
+      const files = imageFilesFromClipboard(e.clipboardData);
       if (files.length === 0) return; // plain-text paste: leave untouched
       e.preventDefault();
       void addFiles(files);
@@ -87,7 +132,7 @@ export default function TlcDropzone({ images, onAdd, onRemove }: Props) {
           {busy ? "Processing images…" : "Drop TLC plate images here"}
         </span>
         <span className="text-xs text-zinc-400">
-          or click to browse, or paste with Ctrl+V
+          or click to browse, or paste with Ctrl+V / Cmd+V
         </span>
         <input
           ref={inputRef}
@@ -112,14 +157,16 @@ export default function TlcDropzone({ images, onAdd, onRemove }: Props) {
         <ul className="mt-3 flex flex-wrap gap-3 print:mt-0 print:gap-2">
           {images.map((src, i) => (
             <li
-              key={i}
-              className="group relative aspect-[2/3] w-36 break-inside-avoid overflow-hidden rounded-md border border-zinc-200 bg-zinc-50 print:aspect-auto print:h-28 print:max-h-28 print:w-auto print:rounded-none print:border-zinc-300"
+              key={`${i}-${src.slice(0, 48)}`}
+              className="group relative w-36 min-w-[140px] shrink-0 break-inside-avoid overflow-hidden rounded-md border border-zinc-200 bg-white print:w-[140px] print:min-w-[140px] print:shrink-0 print:rounded-none print:border-zinc-300"
             >
               {/* eslint-disable-next-line @next/next/no-img-element -- user-provided data URLs */}
               <img
                 src={src}
                 alt={`TLC plate ${i + 1}`}
-                className="size-full object-contain print:h-full print:max-h-28 print:w-auto"
+                loading="eager"
+                decoding="sync"
+                className="relative block h-48 w-full object-contain print:block print:h-[200px] print:w-[140px] print:max-w-none"
               />
               <button
                 type="button"

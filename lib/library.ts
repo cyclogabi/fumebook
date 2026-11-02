@@ -37,6 +37,12 @@ export interface LibraryCompound {
   imageDataUrl?: string;
   /** Canonical SMILES, stored so a reagent loaded from this compound carries it without a second conversion. */
   smiles?: string;
+  /** Systematic or IUPAC name, including a long name pasted from ChemDraw or a paper. */
+  iupacName?: string;
+  /** Other names the literature uses for this compound. */
+  aliases?: string[];
+  /** CAS Registry Number, e.g. "10016-20-3". */
+  casNumber?: string;
 }
 
 export type CompoundInput = {
@@ -58,6 +64,12 @@ export type CompoundInput = {
    * Omitted: derive it from a SMILES structure, or keep the previous value when the structure did not change.
    */
   smiles?: string | null;
+  /** `null` or `""` clears a stored IUPAC name. Omitted: leave the previous value. */
+  iupacName?: string | null;
+  /** Comma-separated text or a list. `null` or an empty list clears stored aliases. */
+  aliases?: string[] | string | null;
+  /** `null` or `""` clears a stored CAS number. */
+  casNumber?: string | null;
 };
 
 const APP_DIR_NAME = "Fumebook";
@@ -181,6 +193,207 @@ function positiveNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
+const GREEK_WORDS: Record<string, string> = {
+  α: "alpha",
+  β: "beta",
+  γ: "gamma",
+  δ: "delta",
+  ε: "epsilon",
+  ω: "omega",
+  µ: "u",
+  μ: "u",
+};
+
+/** Short paper tokens that should compare equal to the name stored in full. */
+const TOKEN_EXPANSIONS: Record<string, string> = {
+  cd: "cyclodextrin",
+  dcm: "dichloromethane",
+  thf: "tetrahydrofuran",
+  dmf: "dimethylformamide",
+  dmso: "dimethylsulfoxide",
+  meoh: "methanol",
+  etoh: "ethanol",
+  acn: "acetonitrile",
+  mecn: "acetonitrile",
+  etoac: "ethylacetate",
+};
+
+const CAS_PATTERN = /\b\d{2,7}-\d{2}-\d\b/;
+
+function optionalText(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const text = value.trim();
+  return text || undefined;
+}
+
+/** Split a comma, semicolon, or newline list into unique aliases. */
+export function parseAliasList(value: string | readonly string[] | null | undefined): string[] {
+  const parts = Array.isArray(value) ? value : typeof value === "string" ? value.split(/[,;\n]/) : [];
+  const seen = new Set<string>();
+  const aliases: string[] = [];
+  for (const part of parts) {
+    const alias = String(part).trim();
+    const key = alias.toLowerCase();
+    if (!alias || seen.has(key)) continue;
+    seen.add(key);
+    aliases.push(alias);
+    if (aliases.length >= 40) break;
+  }
+  return aliases;
+}
+
+function identifiersFromInput(
+  input: Pick<CompoundInput, "iupacName" | "aliases" | "casNumber">,
+  previous?: LibraryCompound,
+): Pick<LibraryCompound, "iupacName" | "aliases" | "casNumber"> {
+  const iupacName = input.iupacName === undefined ? previous?.iupacName : optionalText(input.iupacName);
+  const casNumber = input.casNumber === undefined ? previous?.casNumber : optionalText(input.casNumber);
+  const aliases = input.aliases === undefined ? previous?.aliases : parseAliasList(input.aliases);
+  return {
+    ...(iupacName ? { iupacName } : {}),
+    ...(casNumber ? { casNumber } : {}),
+    ...(aliases && aliases.length > 0 ? { aliases } : {}),
+  };
+}
+
+function chemicalTokens(value: string): string[] {
+  return value
+    .toLowerCase()
+    .replace(/[αβγδεωµμ]/g, (ch) => ` ${GREEK_WORDS[ch] ?? ch} `)
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((token) => TOKEN_EXPANSIONS[token] ?? token);
+}
+
+/** Lower case, Greek letters spelled out, hyphens, spaces, and parentheses removed. */
+export function normaliseChemicalKey(value: string): string {
+  return chemicalTokens(value).join("");
+}
+
+function casKey(value: string): string {
+  return value.toLowerCase().replace(/\s+/g, "");
+}
+
+function compoundCas(compound: LibraryCompound): string | undefined {
+  const explicit = compound.casNumber?.trim();
+  if (explicit) return casKey(explicit);
+  const fromNotes = compound.notes.match(CAS_PATTERN)?.[0];
+  return fromNotes ? casKey(fromNotes) : undefined;
+}
+
+function exactKeys(compound: LibraryCompound): string[] {
+  const labels = [compound.name, compound.iupacName, ...(compound.aliases ?? [])].filter(
+    (item): item is string => Boolean(item?.trim()),
+  );
+  const keys = new Set<string>();
+  for (const label of labels) {
+    for (const part of label.split(/[()[\]{},;/|]+/)) {
+      const key = normaliseChemicalKey(part);
+      if (key.length >= 2) keys.add(key);
+    }
+    const whole = normaliseChemicalKey(label);
+    if (whole.length >= 2) keys.add(whole);
+  }
+  return [...keys];
+}
+
+function longIdentifierKeys(compound: LibraryCompound): string[] {
+  const labels = [compound.iupacName, ...(compound.aliases ?? [])].filter(
+    (item): item is string => Boolean(item?.trim()),
+  );
+  const keys = new Set<string>();
+  for (const label of labels) {
+    const key = normaliseChemicalKey(label);
+    if (key.length > 5) keys.add(key);
+  }
+  return [...keys];
+}
+
+function queryKeys(queryName: string): string[] {
+  const keys = new Set<string>();
+  for (const part of queryName.split(/[()[\]{},;/|]+/)) {
+    const key = normaliseChemicalKey(part);
+    if (key.length >= 2) keys.add(key);
+  }
+  const whole = normaliseChemicalKey(queryName);
+  if (whole.length >= 2) keys.add(whole);
+  return [...keys];
+}
+
+/**
+ * Find a Personal Library compound for a name, CAS number, or molecular weight.
+ * Greek and Latin spellings compare equal (`α` and `alpha`), as do hyphens and spaces.
+ */
+export function findMatchingLibraryCompound(
+  queryName: string,
+  queryCas?: string,
+  queryMw?: number,
+  compounds: readonly LibraryCompound[] = getLibraryCompounds(),
+): LibraryCompound | null {
+  const name = queryName.trim();
+  const casCandidate = queryCas?.trim() || (CAS_PATTERN.test(name) ? name : "");
+  const cas = casCandidate ? casKey(casCandidate) : "";
+  if (cas && CAS_PATTERN.test(cas)) {
+    const byCas = compounds.find((compound) => compoundCas(compound) === cas);
+    if (byCas) return byCas;
+  }
+
+  const wanted = name ? queryKeys(name) : [];
+  if (wanted.length > 0) {
+    const byName = compounds.find((compound) => wanted.some((key) => exactKeys(compound).includes(key)));
+    if (byName) return byName;
+  }
+
+  const longWanted = wanted.filter((key) => key.length > 5);
+  if (longWanted.length > 0) {
+    const bySubstring = compounds.find((compound) =>
+      longIdentifierKeys(compound).some((key) =>
+        longWanted.some((part) => key.includes(part) || part.includes(key)),
+      ),
+    );
+    if (bySubstring) return bySubstring;
+  }
+
+  if (typeof queryMw !== "number" || !Number.isFinite(queryMw) || queryMw <= 0 || !name) return null;
+  const prefix = chemicalTokens(name)[0] ?? "";
+  if (prefix.length < 4) return null;
+  const hits = compounds.filter((compound) => {
+    if (typeof compound.mw !== "number" || Math.abs(compound.mw - queryMw) > 0.6) return false;
+    return [compound.name, compound.iupacName, ...(compound.aliases ?? [])]
+      .filter((item): item is string => Boolean(item?.trim()))
+      .some((item) => chemicalTokens(item)[0] === prefix);
+  });
+  if (hits.length === 1) return hits[0];
+  if (hits.length < 2) return null;
+  hits.sort((a, b) => Math.abs((a.mw ?? 0) - queryMw) - Math.abs((b.mw ?? 0) - queryMw));
+  const best = hits[0];
+  const next = hits[1];
+  if (
+    best.mw !== undefined &&
+    next.mw !== undefined &&
+    Math.abs(best.mw - queryMw) + 0.05 < Math.abs(next.mw - queryMw)
+  ) {
+    return best;
+  }
+  return null;
+}
+
+/** True when `query` appears in the display name, IUPAC name, aliases, CAS number, or notes. */
+export function compoundMatchesQuery(compound: LibraryCompound, query: string): boolean {
+  const q = query.trim().toLowerCase();
+  if (!q) return true;
+  const fields = [
+    compound.name,
+    compound.iupacName,
+    compound.casNumber,
+    compound.notes,
+    ...(compound.aliases ?? []),
+  ];
+  return fields.some((field) => field?.toLowerCase().includes(q));
+}
+
 /**
  * Library compounds matching what is typed in a reagent-name field: names that start with the text
  * first, then names or notes that contain it. Empty text matches nothing.
@@ -196,8 +409,10 @@ export function searchLibrary(
   const contains: LibraryCompound[] = [];
   for (const c of compounds) {
     const name = c.name.toLowerCase();
-    if (name.startsWith(q)) starts.push(c);
-    else if (name.includes(q) || c.notes.toLowerCase().includes(q)) contains.push(c);
+    const aliasStarts = (c.aliases ?? []).some((alias) => alias.toLowerCase().startsWith(q));
+    const casStarts = c.casNumber?.toLowerCase().startsWith(q) ?? false;
+    if (name.startsWith(q) || aliasStarts || casStarts) starts.push(c);
+    else if (compoundMatchesQuery(c, q)) contains.push(c);
   }
   return [...starts, ...contains].slice(0, limit);
 }
@@ -281,6 +496,18 @@ function normaliseCompound(raw: unknown): LibraryCompound | null {
     compound.structure,
   );
   if (smiles) compound.smiles = smiles;
+  const iupacName = optionalText(r.iupacName);
+  const casNumber = optionalText(r.casNumber);
+  const aliases = parseAliasList(
+    Array.isArray(r.aliases)
+      ? r.aliases.filter((item): item is string => typeof item === "string")
+      : typeof r.aliases === "string"
+        ? r.aliases
+        : [],
+  );
+  if (iupacName) compound.iupacName = iupacName;
+  if (casNumber) compound.casNumber = casNumber;
+  if (aliases.length > 0) compound.aliases = aliases;
   return enrichStructureFields(compound);
 }
 
@@ -467,10 +694,20 @@ export function useLibrary() {
       const density = positiveNumber(input.density);
 
       const notes = (input.notes ?? "").trim();
+      const identifiers = identifiersFromInput(input);
 
       if (!name) return { ok: false, error: "Give the compound a name." };
-      if (!structure && !cdxml && !imageDataUrl && mw === undefined && !notes) {
-        return { ok: false, error: "Paste a structure or enter a molecular weight." };
+      if (
+        !structure &&
+        !cdxml &&
+        !imageDataUrl &&
+        mw === undefined &&
+        !notes &&
+        !identifiers.iupacName &&
+        !identifiers.casNumber &&
+        !identifiers.aliases
+      ) {
+        return { ok: false, error: "Paste a structure, a CAS number, or enter a molecular weight." };
       }
       const format = detectFormat(structure || cdxml || "", input.fileName);
       if (structure && format === "cdxml" && !/<CDXML[\s>]/i.test(structure)) {
@@ -496,6 +733,7 @@ export function useLibrary() {
         ...(cdxml ? { cdxml } : {}),
         ...(imageDataUrl ? { imageDataUrl } : {}),
         ...(smiles ? { smiles } : {}),
+        ...identifiers,
       });
       const next = [...(getSnapshot() ?? []), compound].sort(byName);
       cache = next;
@@ -598,6 +836,7 @@ export function useLibrary() {
         ...(nextCdxml ? { cdxml: nextCdxml } : {}),
         ...(nextImage ? { imageDataUrl: nextImage } : {}),
         ...(smiles ? { smiles } : {}),
+        ...identifiersFromInput(input, prev),
       });
 
       const next = current.map((c, i) => (i === existingIdx ? updated : c)).sort(byName);
@@ -656,7 +895,13 @@ export function useLibrary() {
           prev.smiles,
           structureReplaced,
         );
-        const { smiles: _previousSmiles, ...prevWithoutSmiles } = prev;
+        const {
+          smiles: _previousSmiles,
+          iupacName: _previousIupac,
+          aliases: _previousAliases,
+          casNumber: _previousCas,
+          ...prevWithoutSmiles
+        } = prev;
         const updated: LibraryCompound = enrichStructureFields({
           ...prevWithoutSmiles,
           name,
@@ -668,6 +913,7 @@ export function useLibrary() {
           ...(nextCdxml ? { cdxml: nextCdxml } : {}),
           ...(nextImage ? { imageDataUrl: nextImage } : {}),
           ...(smiles ? { smiles } : {}),
+          ...identifiersFromInput(input, prev),
         });
         const next = current.map((c, i) => (i === existingIdx ? updated : c)).sort(byName);
         cache = next;
@@ -676,8 +922,17 @@ export function useLibrary() {
         return { ok: true, compound: updated };
       }
 
-      if (!structure && !cdxml && !imageDataUrl && mw === undefined) {
-        return { ok: false, error: "Draw a structure or enter a molecular weight first." };
+      const createdIdentifiers = identifiersFromInput(input);
+      if (
+        !structure &&
+        !cdxml &&
+        !imageDataUrl &&
+        mw === undefined &&
+        !createdIdentifiers.iupacName &&
+        !createdIdentifiers.casNumber &&
+        !createdIdentifiers.aliases
+      ) {
+        return { ok: false, error: "Draw a structure, enter a CAS number, or enter a molecular weight first." };
       }
 
       const createdFormat = detectFormat(structure || cdxml || "", input.fileName);
@@ -693,6 +948,7 @@ export function useLibrary() {
         ...(cdxml ? { cdxml } : {}),
         ...(imageDataUrl ? { imageDataUrl } : {}),
         ...(createdSmiles ? { smiles: createdSmiles } : {}),
+        ...createdIdentifiers,
       });
       const next = [...current, created].sort(byName);
       cache = next;

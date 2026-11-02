@@ -11,7 +11,17 @@
  * other (non-solvent) row from its equivalents.
  */
 
-import type { Experiment, ProductInfo, ReagentRow, Role, SecondaryProduct, UnitKind, Units } from "./types";
+import {
+  suggestFractionLabel,
+  type Experiment,
+  type IsolatedFractionRole,
+  type ProductInfo,
+  type ReagentRow,
+  type Role,
+  type SecondaryProduct,
+  type UnitKind,
+  type Units,
+} from "./types";
 
 export type EditableField = "mw" | "eq" | "n" | "mass" | "vol" | "density";
 
@@ -41,11 +51,11 @@ export function fromCanonical(value: number, unit: string): number {
   return value / (UNIT_FACTOR[unit] ?? 1);
 }
 
-/** Display with up to 5 significant figures, no trailing zeros. */
+/** Display with at most 2 decimal places and no trailing zeros. */
 export function formatNumber(value: number): string {
   if (!Number.isFinite(value)) return "";
   if (value === 0) return "0";
-  return String(parseFloat(value.toPrecision(5)));
+  return String(parseFloat(value.toFixed(2)));
 }
 
 export function displayValue(
@@ -321,9 +331,11 @@ export function productMetrics(
 }
 
 export interface ProductSummaryItem extends ProductMetrics {
-  /** Fallback fraction identifier: `GH055` (single product) or `GH055-F1`, `GH055-F2`, ... */
+  /** Fallback label: the experiment code, or a fraction id the chemist has not renamed. */
   label: string;
   name: string;
+  /** Explicit role. `"target"` is the fraction linked to the reaction-scheme product. */
+  role?: IsolatedFractionRole;
   /** Has a molecular weight and a mass above zero, so it counts towards the conversion. */
   valid: boolean;
 }
@@ -334,44 +346,49 @@ export interface ProductsSummary {
   conversionPercent: number | null;
 }
 
-/** Every product's metrics plus the total conversion of the limiting reagent. */
+/**
+ * Every isolated fraction's metrics plus the total conversion of the limiting reagent.
+ * `schemeMw` is the molecular weight of the drawn reaction-scheme product. A fraction
+ * uses it when that fraction has no molecular weight of its own.
+ */
 export function summariseProducts(
   rows: ReagentRow[],
   product: ProductInfo,
   secondary: readonly SecondaryProduct[] = [],
   experimentId = "",
+  schemeMw: number | null = null,
 ): ProductsSummary {
   const nLim = limitingN(rows);
   const idPrefix = experimentId.trim();
-  const primaryFallback =
-    secondary.length > 0
-      ? idPrefix
-        ? `${idPrefix}-F1`
-        : "F1"
-      : idPrefix || "F1";
+  const primaryFallback = idPrefix ? `${idPrefix}-F1` : "F1";
   const rawPrimaryName = product.name.trim();
-  const primaryName =
-    rawPrimaryName === "" ||
-    (secondary.length > 0 && idPrefix !== "" && rawPrimaryName.toUpperCase() === idPrefix.toUpperCase())
-      ? primaryFallback
-      : rawPrimaryName;
+  const primaryName = rawPrimaryName || primaryFallback;
+  const linkedMw = positive(schemeMw) ? schemeMw : null;
+  const yieldMw = (ownMw: number | null) => (positive(ownMw) ? ownMw : linkedMw);
 
+  const primaryMw = yieldMw(product.mw);
   const items: ProductSummaryItem[] = [
     {
-      ...productMetrics(product.isolatedMass, product.mw, stoichRatioOf(product), nLim),
+      ...productMetrics(product.isolatedMass, primaryMw, stoichRatioOf(product), nLim),
       label: primaryFallback,
       name: primaryName,
-      valid: positive(product.mw) && positive(product.isolatedMass),
+      role: product.isolatedRole,
+      valid: positive(primaryMw) && positive(product.isolatedMass),
     },
     ...secondary.map((p, i): ProductSummaryItem => {
       const massMg = secondaryMassMg(p);
-      const mw = looseNumber(p.mw);
-      const fallback = idPrefix ? `${idPrefix}-F${i + 2}` : `F${i + 2}`;
+      const ownMw = looseNumber(p.mw);
+      const mw = yieldMw(ownMw);
+      const fallback = suggestFractionLabel(idPrefix, [
+        primaryName,
+        ...secondary.slice(0, i).map((item) => item.name),
+      ]);
       const rawName = p.name.trim();
       return {
         ...productMetrics(massMg, mw, stoichRatioOf(p), nLim),
         label: fallback,
         name: rawName || fallback,
+        role: p.isolatedRole,
         valid: positive(mw) && positive(massMg),
       };
     }),
@@ -398,24 +415,29 @@ export function formatMoles(mmol: number): string {
 }
 
 /**
- * The yield as the dashboard shows it: the primary product's yield, e.g. "58%", or "58% (+18%)"
- * when secondary products add 18 points. `null` when the primary yield cannot be worked out.
+ * The yield as the dashboard shows it. A fraction linked as the scheme target is the headline.
+ * When nothing is linked, the first fraction that has a yield is used so older notebooks keep
+ * their number. Other fractions are the parenthetical extra, e.g. "58% (+18%)".
  */
 export function yieldSummary(experiment: Experiment): string | null {
   const secondary = experiment.secondaryProducts ?? [];
+  const rawSchemeMw = experiment.structuredScheme?.productMw;
+  const schemeMw = typeof rawSchemeMw === "number" && rawSchemeMw > 0 ? rawSchemeMw : null;
   const { items } = summariseProducts(
     experiment.reagents,
     experiment.product,
     secondary,
     experiment.id,
+    schemeMw,
   );
-  const [primary, ...others] = items;
-  if (primary.percent === null) return null;
-  const extra = others.reduce(
-    (sum, item) => (item.valid && item.percent !== null ? sum + item.percent : sum),
-    0,
-  );
-  const base = `${Math.round(primary.percent)}%`;
+  const linked = items.find((item) => item.role === "target");
+  const headline = linked ?? items.find((item) => item.percent !== null);
+  if (!headline || headline.percent === null) return null;
+  const extra = items.reduce((sum, item) => {
+    if (item === headline || !item.valid || item.percent === null) return sum;
+    return sum + item.percent;
+  }, 0);
+  const base = `${Math.round(headline.percent)}%`;
   return extra > 0 ? `${base} (+${Math.round(extra)}%)` : base;
 }
 
@@ -449,7 +471,7 @@ export interface ProductElutionBand {
 
 /**
  * Resolve every product that has a valid elution CV window (`startCv` and `endCv`),
- * paired with its resolved fraction/product name (`GH055` or `GH055-F1`, `GH055-F2`, ...)
+ * paired with the name the chemist typed (`GH055`, `GH055-F2`, `Monol`, ...).
  * and distinct palette color. Falls back to `legacyWindow` if no product has an elution window.
  */
 export function resolveProductElutionBands(
@@ -459,20 +481,9 @@ export function resolveProductElutionBands(
   legacyWindow?: { startCv: number; endCv: number; label?: string },
 ): ProductElutionBand[] {
   const idPrefix = (experimentId ?? "").trim();
-  const primaryFallback =
-    secondary.length > 0
-      ? idPrefix
-        ? `${idPrefix}-F1`
-        : "F1"
-      : idPrefix || "F1";
+  const primaryFallback = idPrefix || "Product";
   const rawPrimaryName = product?.name?.trim() ?? "";
-  const primaryName =
-    rawPrimaryName === "" ||
-    (secondary.length > 0 &&
-      idPrefix !== "" &&
-      rawPrimaryName.toUpperCase() === idPrefix.toUpperCase())
-      ? primaryFallback
-      : rawPrimaryName;
+  const primaryName = rawPrimaryName || primaryFallback;
 
   const bands: ProductElutionBand[] = [];
 
@@ -492,7 +503,10 @@ export function resolveProductElutionBands(
     const start = looseNumber(sec.elutionStartCv);
     const end = looseNumber(sec.elutionEndCv);
     if (start === null || end === null || start < 0 || end < start || end <= 0) return;
-    const fallback = idPrefix ? `${idPrefix}-F${i + 2}` : `F${i + 2}`;
+    const fallback = suggestFractionLabel(idPrefix, [
+      primaryName,
+      ...secondary.slice(0, i).map((item) => item.name),
+    ]);
     bands.push({
       id: sec.id,
       name: sec.name.trim() || fallback,

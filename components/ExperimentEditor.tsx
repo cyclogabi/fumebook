@@ -14,6 +14,8 @@ import RichTextarea from "./RichTextarea";
 import ReagentTable from "./ReagentTable";
 import ReferencesSection from "./ReferencesSection";
 import TlcDropzone from "./TlcDropzone";
+import { LabWidgetMenu, LabWidgetTray } from "./LabWidgetsBar";
+import { SidebarToggleButton } from "./Sidebar";
 import { useExperimentUndo } from "@/lib/experimentUndo";
 import type { ExperimentUpdate } from "@/lib/storage";
 import type { Experiment } from "@/lib/types";
@@ -26,6 +28,8 @@ interface Props {
   onExport: () => void;
   /** Open the Personal Library dialog, optionally pre-filled with a reagent row's name/MW/density. */
   onOpenLibrary: (draft?: LibraryDraft) => void;
+  sidebarExpanded: boolean;
+  onToggleSidebar: () => void;
 }
 
 export function formatDate(iso: string): string {
@@ -41,12 +45,15 @@ export default function ExperimentEditor({
   onDelete,
   onExport,
   onOpenLibrary,
+  sidebarExpanded,
+  onToggleSidebar,
 }: Props) {
   // Only whether the room is open lives here; its workspace is autosaved separately
   // (Documents/Fumebook/attachments/<id>/workspace.nmrium), not in the experiment JSON.
   const [nmrOpen, setNmrOpen] = useState(false);
-  // Lets the reagent table drop a library compound's structure into the sketcher.
+  // Lets the reagent table drop a library compound's structure into the focused scheme box.
   const moleculeRef = useRef<MoleculeSectionHandle>(null);
+  const [schemeZone, setSchemeZone] = useState<"reactant" | "product">("reactant");
   const { compounds: library } = useLibrary();
   const { update, undo, redo, canUndo, canRedo } = useExperimentUndo(experiment, onUpdate);
   const undoRef = useRef(undo);
@@ -111,68 +118,70 @@ export default function ExperimentEditor({
     });
   }
 
+  const enabledWidgets = experiment.enabledWidgets ?? [];
+
+  function toggleWidget(id: string) {
+    const next = enabledWidgets.includes(id)
+      ? enabledWidgets.filter((widget) => widget !== id)
+      : [...enabledWidgets, id];
+    update({ enabledWidgets: next });
+  }
+
+  const barButton =
+    "shrink-0 whitespace-nowrap rounded-md border border-zinc-300 bg-white px-3 py-1.5 text-sm font-medium text-zinc-700 shadow-sm hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-40";
+
   return (
-    <div className="mx-auto w-full max-w-4xl print:max-w-none">
+    <>
+    <style>{`.notebook-stack{max-width:64rem;margin-inline:auto}@media print{.notebook-stack{max-width:none}}`}</style>
+    <div className="notebook-stack mx-auto flex w-full max-w-5xl flex-col print:max-w-none">
       {nmrOpen && <NmrRoom experimentId={experiment.id} onClose={() => setNmrOpen(false)} />}
 
-      {/* Action bar (screen only) */}
-      <div className="mb-3 flex items-center justify-between print:hidden">
-        <div className="flex items-center gap-3">
-          <p className="text-sm text-zinc-500">
+      {/* Action bar (screen only). Labels stay on one line and wrap as whole buttons. */}
+      <div className="mb-4 flex w-full flex-wrap items-center justify-between gap-2 print:hidden">
+        <div className="flex flex-wrap items-center gap-2">
+          <SidebarToggleButton expanded={sidebarExpanded} onClick={onToggleSidebar} />
+          <p className="shrink-0 whitespace-nowrap text-sm text-zinc-500">
             Notebook <span className="mx-1 text-zinc-300">/</span>
             <span className="font-mono font-medium text-zinc-800">{experiment.id}</span>
           </p>
-          <div className="flex items-center gap-1">
-            <button
-              type="button"
-              onClick={undo}
-              disabled={!canUndo}
-              title="Undo (Ctrl+Z)"
-              aria-label="Undo (Ctrl+Z)"
-              className="rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm font-medium text-zinc-700 shadow-sm hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              Undo (↶)
-            </button>
-            <button
-              type="button"
-              onClick={redo}
-              disabled={!canRedo}
-              title="Redo (Ctrl+Y)"
-              aria-label="Redo (Ctrl+Y)"
-              className="rounded-md border border-zinc-300 bg-white px-2.5 py-1.5 text-sm font-medium text-zinc-700 shadow-sm hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              Redo (↷)
-            </button>
-          </div>
+          <button type="button" onClick={undo} disabled={!canUndo} title="Undo (Ctrl+Z or Cmd+Z)" aria-label="Undo (Ctrl+Z or Cmd+Z)" className={barButton}>
+            Undo (↶)
+          </button>
+          <button type="button" onClick={redo} disabled={!canRedo} title="Redo (Ctrl+Y or Cmd+Shift+Z)" aria-label="Redo (Ctrl+Y or Cmd+Shift+Z)" className={barButton}>
+            Redo (↷)
+          </button>
+          <LabWidgetMenu enabled={enabledWidgets} onToggle={toggleWidget} />
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => window.print()}
-            className="rounded-md border border-zinc-300 bg-white px-3 py-1.5 text-sm font-medium text-zinc-700 shadow-sm hover:bg-zinc-50"
-          >
+        <div className="flex flex-wrap items-center gap-2">
+          <button type="button" onClick={() => window.print()} title="Print or save PDF (Ctrl+P or Cmd+P)" className={barButton}>
             Print / Save PDF
           </button>
           <button
             type="button"
             onClick={onExport}
             title={`Save ${experiment.id} (with its molecule picture, TLC photos and NMR spectra) as a .json file`}
-            className="rounded-md border border-zinc-300 bg-white px-3 py-1.5 text-sm font-medium text-zinc-700 shadow-sm hover:bg-zinc-50"
+            className={barButton}
           >
             Export Experiment (.json)
           </button>
           <button
             type="button"
             onClick={onDelete}
-            className="rounded-md border border-transparent px-3 py-1.5 text-sm font-medium text-red-600 hover:bg-red-50"
+            className="shrink-0 whitespace-nowrap rounded-md border border-transparent px-3 py-1.5 text-sm font-medium text-red-600 hover:bg-red-50"
           >
             Delete
           </button>
         </div>
       </div>
 
+      <LabWidgetTray
+        enabled={enabledWidgets}
+        experimentCode={experiment.id}
+        onRemove={(id) => update({ enabledWidgets: enabledWidgets.filter((widget) => widget !== id) })}
+      />
+
       {/* A4 sheet */}
-      <article className="min-h-[297mm] rounded-sm border border-zinc-200 bg-white px-8 py-10 shadow-md sm:px-14 sm:py-14 print:min-h-0 print:rounded-none print:border-0 print:p-0 print:shadow-none">
+      <article className="min-h-[297mm] w-full min-w-0 rounded-sm border border-zinc-200 bg-white px-8 py-10 shadow-md sm:px-14 sm:py-14 print:min-h-0 print:rounded-none print:border-0 print:p-0 print:shadow-none">
         <header className="mb-8 border-b border-zinc-300 pb-4 print:mb-2.5 print:pb-1.5">
           <div className="mb-2 flex items-baseline justify-between text-xs text-zinc-500 print:mb-0.5">
             <span className="font-mono text-sm font-semibold tracking-wide text-zinc-900 print:text-xs">
@@ -207,11 +216,6 @@ export default function ExperimentEditor({
             onStructuredSchemeChange={(structuredScheme) => update({ structuredScheme })}
             reagents={experiment.reagents}
             onReagentsChange={(fn) => update((exp) => ({ reagents: fn(exp.reagents) }))}
-            product={experiment.product}
-            onProductChange={(patch) =>
-              update((exp) => ({ product: { ...exp.product, ...patch } }))
-            }
-            secondaryProducts={experiment.secondaryProducts}
             onOpenLibrary={onOpenLibrary}
             reactantSmiles={experiment.reactantSmiles}
             productSmiles={experiment.productSmiles}
@@ -222,6 +226,7 @@ export default function ExperimentEditor({
               // `update` pushes the open experiment onto the Ctrl+Z stack before replacing it.
               update((exp) => applySavedReaction(exp, template));
             }}
+            onActiveZoneChange={setSchemeZone}
           />
 
           <section className="print:break-inside-avoid">
@@ -235,10 +240,13 @@ export default function ExperimentEditor({
               onRows={(fn) => update((exp) => ({ reagents: fn(exp.reagents) }))}
               onUnits={(units) => update({ units })}
               onColumns={(columns) => update({ columns })}
-              onInsertStructure={async (compound, preferredZone) =>
-                (await moleculeRef.current?.insertCompound(compound, preferredZone)) ??
-                "The sketcher is not ready yet."
-              }
+              activeZone={schemeZone}
+              onInsertStructure={async (compound, preferredZone) => {
+                const handle = moleculeRef.current;
+                if (!handle) return "The sketcher is not ready yet.";
+                // null means the structure was stored. It is not a missing-sketcher failure.
+                return handle.insertCompound(compound, preferredZone ?? schemeZone);
+              }}
               onSaveToLibrary={(reagent) => onOpenLibrary(reagent)}
             />
           </section>
@@ -288,6 +296,18 @@ export default function ExperimentEditor({
             }
             productCdxml={experiment.structuredScheme?.productCdxml}
             productImage={experiment.structuredScheme?.productImage}
+            productSmiles={experiment.productSmiles}
+            schemeMw={
+              typeof experiment.structuredScheme?.productMw === "number"
+                ? experiment.structuredScheme.productMw
+                : null
+            }
+            onFractionsCommit={(next) =>
+              update(() => ({
+                product: next.product,
+                secondaryProducts: next.secondaryProducts,
+              }))
+            }
           />
           <section
             className={
@@ -343,5 +363,6 @@ export default function ExperimentEditor({
         </div>
       </article>
     </div>
+    </>
   );
 }
